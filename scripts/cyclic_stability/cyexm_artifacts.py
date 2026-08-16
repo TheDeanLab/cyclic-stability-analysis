@@ -113,7 +113,6 @@ def resolve_round_artifacts(
     nonlinear_metrics: Path | None = None
     chunk_manifest: Path | None = None
     native_target: Path | None = None
-    moving_crop: Path | None = None
     if round_spec.acquisition_round != 2:
         registration = RegistrationPaths.for_round(
             round_layout.registration, round_spec.workflow_round
@@ -150,14 +149,6 @@ def resolve_round_artifacts(
             and FileIdentity.from_path(candidate) == target_record.request.inputs[1]
         ):
             native_target = candidate
-    if round_spec.acquisition_round != 2:
-        crop_candidate = registration.moving_crop
-        if (
-            crop_candidate.is_file()
-            and ArtifactStore().record_path(crop_candidate).is_file()
-        ):
-            records = (*records, validate_completed_artifact(crop_candidate))
-            moving_crop = crop_candidate
     return RoundArtifacts(
         acquisition_round=acquisition,
         workflow_round=round_spec.workflow_round,
@@ -173,7 +164,9 @@ def resolve_round_artifacts(
         chunk_manifest=chunk_manifest,
         completion_records=records,
         native_target=native_target,
-        moving_crop=moving_crop,
+        # Channel-transform-v1 records name the native source directly.  A stale
+        # registration crop is not a transform input and must never be inferred.
+        moving_crop=None,
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -11,8 +12,11 @@ import tifffile
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.golgi import (
     ENSEMBLE_ENDPOINTS,
+    _artifact_validity_masks,
     _atomic_publish_directory,
     _component_volume_gini,
+    _effective_gradient_roi,
+    _gradient_magnitude,
     _mask_geometry,
     _perinuclear_roi,
     analyze_golgi_arrays,
@@ -22,6 +26,14 @@ from cyclic_stability.golgi import (
 )
 from cyclic_stability.models import CellSpec
 from cyclic_stability.nuclear import NuclearSurface, consensus_nuclear_surface
+from cyexm.registration._request_policy import channel_transform_parameters
+from cyexm.registration.artifacts import (
+    ArtifactStore,
+    CompletionRecord,
+    FileIdentity,
+    StageRequest,
+)
+from cyexm.spatial import ImageGeometry
 from scipy.ndimage import distance_transform_edt
 from synthetic import (
     NUCLEAR_CONFIG,
@@ -36,6 +48,112 @@ def _full_support(rounds: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
     return {
         number: np.ones(image.shape, dtype=bool) for number, image in rounds.items()
     }
+
+
+def _producer_geometry(spacing: tuple[float, float, float]) -> ImageGeometry:
+    return ImageGeometry(
+        shape=(5, 5, 5),
+        origin=(0.0, 0.0, 0.0),
+        spacing=spacing,
+        direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+
+
+class _ValidityBackend:
+    """Minimal producer-compatible backend that records the support reconstruction."""
+
+    def __init__(self, fixed: Path, source: Path, geometry: ImageGeometry) -> None:
+        self.fixed = fixed.resolve()
+        self.source = source.resolve()
+        self.expected_geometry = geometry
+        self.loads: list[tuple[Path, tuple[float, float, float]]] = []
+        self.chain: tuple[Path, Path, str] | None = None
+
+    def load_image(self, path: Path, spacing: tuple[float, float, float]):
+        self.loads.append((path.resolve(), spacing))
+        return {"path": path.resolve(), "data": np.ones((5, 5, 5), dtype=float)}
+
+    def to_array(self, image):
+        return image["data"]
+
+    def from_array(self, array, *, reference):
+        return {"path": reference["path"], "data": array}
+
+    def geometry(self, image):
+        return self.expected_geometry
+
+    def apply_transform_chain(
+        self, *, fixed, moving, affine_path, warp_path, interpolation
+    ):
+        self.chain = (affine_path.resolve(), warp_path.resolve(), interpolation)
+        transformed = np.ones((5, 5, 5), dtype=float)
+        transformed[:, :, 0] = 0.0
+        return {"path": fixed["path"], "data": transformed}
+
+
+def _producer_artifacts(tmp_path: Path, analysis_config):
+    """Create one completion-record-compatible moving target transform."""
+    fixed = tmp_path / "fixed-native.tif"
+    source = tmp_path / "source-native.tif"
+    affine = tmp_path / "affine.mat"
+    warp = tmp_path / "warp.nii.gz"
+    for path in (fixed, source, affine, warp):
+        path.write_bytes(path.name.encode())
+    reference_target = tmp_path / "reference-target.tif"
+    output = tmp_path / "registered-target.tif"
+    tifffile.imwrite(reference_target, np.ones((5, 5, 5), dtype=np.uint16))
+    spacing = (0.1083, 0.1083, 0.3)
+    request = StageRequest.for_files(
+        stage="channel-transform-v1",
+        inputs=(fixed, source, affine, warp),
+        geometry=_producer_geometry(spacing),
+        method="warp-affine",
+        accuracy="not-applicable",
+        native_threads={"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1},
+        upstream=FileIdentity.from_path(warp),
+        parameters=channel_transform_parameters(
+            pixel_size_xyz=spacing, interpolation="nearestNeighbor"
+        ),
+    )
+    ArtifactStore().commit(
+        output,
+        request,
+        lambda path: tifffile.imwrite(path, np.ones((5, 5, 5), dtype=np.uint16)),
+        lambda path: path.is_file(),
+    )
+    record = CompletionRecord.read(ArtifactStore().record_path(output))
+    reference = RoundArtifacts(
+        2,
+        1,
+        tmp_path,
+        fixed,
+        reference_target,
+        reference_target,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        (),
+    )
+    moving = RoundArtifacts(
+        3,
+        3,
+        tmp_path,
+        fixed,
+        fixed,
+        output,
+        affine,
+        warp,
+        None,
+        None,
+        None,
+        None,
+        (record,),
+        native_target=source,
+    )
+    return reference, moving, fixed, source, affine, warp, request
 
 
 def test_gradient_similarity_is_robust_to_global_intensity_scaling(
@@ -66,6 +184,140 @@ def test_gradient_similarity_retains_strongly_downscaled_signal_with_offset(
         analysis_config.ensembles.gaussian_sigma_um,
     )
     assert min(row.correlation for row in rows) > 0.99
+
+
+def test_gradient_similarity_uses_only_stencils_inside_transform_support(
+    analysis_config,
+) -> None:
+    """A linear physical ramp keeps its derivative when padding changes arbitrarily."""
+    shape = (9, 9, 9)
+    x_um = np.indices(shape, dtype=float)[2] * analysis_config.voxel_spacing_xyz_um[0]
+    valid = np.ones(shape, dtype=bool)
+    valid[:, :, :2] = False
+    roi = valid.copy()
+    baseline = multiscale_gradient_similarity(
+        x_um,
+        x_um,
+        roi,
+        analysis_config.voxel_spacing_xyz_um,
+        (0.279,),
+        validity_mask=valid,
+    )
+    gradients = _gradient_magnitude(
+        x_um, valid, analysis_config.voxel_spacing_xyz_um, 1e-9
+    )
+    assert np.allclose(gradients[_effective_gradient_roi(roi, valid)], 1.0)
+    changed = x_um.copy()
+    changed[:, :, :2] = 1e12
+    assert (
+        multiscale_gradient_similarity(
+            x_um,
+            changed,
+            roi,
+            analysis_config.voxel_spacing_xyz_um,
+            (0.279,),
+            validity_mask=valid,
+        )
+        == baseline
+    )
+
+
+def test_gradient_similarity_rejects_thin_transform_support(analysis_config) -> None:
+    """A support too thin for a valid 3-D central stencil cannot score well."""
+    image = synthetic_golgi()
+    valid = np.zeros_like(image, dtype=bool)
+    valid[20:22, 60:70, 60:70] = True
+    with pytest.raises(ValueError, match="support-boundary exclusion"):
+        multiscale_gradient_similarity(
+            image,
+            image,
+            valid,
+            analysis_config.voxel_spacing_xyz_um,
+            (0.279,),
+            validity_mask=valid,
+        )
+
+
+def test_artifact_support_replays_exact_producer_request_and_provenance(
+    analysis_config, tmp_path
+) -> None:
+    """Support is reconstructed with producer spacing and transform order, not analysis defaults."""
+    reference, moving, fixed, source, affine, warp, request = _producer_artifacts(
+        tmp_path, analysis_config
+    )
+    backend = _ValidityBackend(fixed, source, request.geometry)
+    masks, digest, identities = _artifact_validity_masks(
+        {2: reference, 3: moving}, analysis_config, _backend=backend
+    )
+    assert masks[2].all()
+    assert not masks[3][:, :, 0].any()
+    assert backend.loads == [
+        (fixed.resolve(), (0.1083, 0.1083, 0.3)),
+        (source.resolve(), (0.1083, 0.1083, 0.3)),
+    ]
+    assert backend.chain == (affine.resolve(), warp.resolve(), "nearestNeighbor")
+    assert any(digest in identity for identity in identities)
+    assert '"pixel_size_xyz_um":[0.1083,0.1083,0.3]' in identities[0]
+    assert '"st_mtime_ns"' in identities[0]
+
+
+@pytest.mark.parametrize(
+    "failure", ("replaced-transform", "wrong-geometry", "wrong-fixed", "wrong-output")
+)
+def test_artifact_support_rejects_stale_or_nonproducer_completion_evidence(
+    analysis_config, tmp_path, failure: str
+) -> None:
+    """Paths alone cannot attest support after any producer input or record changes."""
+    reference, moving, fixed, source, affine, _warp, request = _producer_artifacts(
+        tmp_path, analysis_config
+    )
+    if failure == "replaced-transform":
+        affine.write_bytes(b"replaced")
+    elif failure == "wrong-geometry":
+        bad_geometry = replace(request.geometry, shape=(4, 5, 5))
+        moving = replace(
+            moving,
+            completion_records=(
+                CompletionRecord(
+                    1,
+                    replace(request, geometry=bad_geometry),
+                    moving.completion_records[0].artifact,
+                ),
+            ),
+        )
+    elif failure == "wrong-fixed":
+        wrong_fixed = tmp_path / "wrong-fixed.tif"
+        wrong_fixed.write_bytes(b"wrong fixed")
+        wrong_request = StageRequest.for_files(
+            stage=request.stage,
+            inputs=(wrong_fixed, source, affine, _warp),
+            geometry=request.geometry,
+            method=request.method,
+            accuracy=request.accuracy,
+            native_threads=request.native_threads,
+            upstream=request.upstream,
+            parameters=request.parameters,
+        )
+        moving = replace(
+            moving,
+            completion_records=(
+                CompletionRecord(
+                    1, wrong_request, moving.completion_records[0].artifact
+                ),
+            ),
+        )
+    else:
+        moving = replace(
+            moving,
+            completion_records=(
+                CompletionRecord(1, request, FileIdentity.from_path(fixed)),
+            ),
+        )
+    backend = _ValidityBackend(fixed, source, request.geometry)
+    with pytest.raises(ValueError):
+        _artifact_validity_masks(
+            {2: reference, 3: moving}, analysis_config, _backend=backend
+        )
 
 
 def test_support_aware_preprocessing_ignores_invalid_region_values(

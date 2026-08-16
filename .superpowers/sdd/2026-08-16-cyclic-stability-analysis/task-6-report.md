@@ -98,9 +98,11 @@ provenance and QC boundary.
 
 - The production cell entry is again exactly four positional arguments. For moving
   rounds it obtains the native target path from the validated registered-target
-  completion request, verifies that immutable input identity, applies the validated
-  persisted crop when present, and transforms a native all-ones image onto the
-  registered round-2 grid via ANTs affine-before-warp nearest-neighbor application.
+  completion request, verifies that immutable input identity, and transforms a
+  native all-ones image onto the registered round-2 grid via ANTs affine-before-warp
+  nearest-neighbor application. A crop is never inferred from a stale registration
+  artifact because the current channel-transform producer names its native source
+  directly and contains no crop input.
   Reference support is exactly its fixed grid. Transform-valid masks, crop/source/
   transform identities, and a deterministic validity digest are retained in result
   input identities; arbitrary caller masks are no longer accepted by production.
@@ -112,3 +114,34 @@ provenance and QC boundary.
   robust background, normalized Gaussian convolution, threshold masks, and gradient
   magnitudes exclude invalid regions before preprocessing. A regression changing
   only invalid support to `1e12` leaves correlations unchanged.
+
+---
+
+## Fix round 3/5 — exact producer replay and derivative-safe support
+
+- Validity reconstruction now selects the completion record whose immutable output
+  identity is the selected registered target, requires the exact
+  `channel-transform-v1` nearest-neighbor `warp-affine` request and canonical
+  producer parameters, verifies every fixed/source/affine/warp identity against its
+  present file, and cross-checks the fixed input against round 2. It loads both
+  native images with the request's recorded `pixel_size_xyz_um`, never the analysis
+  voxel spacing, checks recorded fixed geometry, and replays only the persisted
+  affine-before-warp chain.
+- The validity provenance payload now includes the complete immutable identities,
+  full request/geometry/parameters, and each final mask's shape and byte digest;
+  its canonical digest and payload are included in `MarkerResult.input_identities`.
+  A replacement at the same transform path therefore fails identity validation.
+- Gradient sampling uses an explicit one-voxel 26-neighbour erosion of common-valid
+  support before `numpy.gradient` values are compared. Thus no sampled central
+  stencil crosses transform padding; thin support fails loudly. Masked normalized
+  convolution remains the smoothing policy.
+- New synthetic producer-compatible fake-backend tests assert the exact native
+  spacing, fixed/source load order, nearest-neighbor affine/warp invocation,
+  zero-padding exclusion, provenance fields, and failures for a replaced transform,
+  wrong fixed input, wrong geometry, or wrong output record. A physical linear-ramp
+  half-space test verifies derivative invariance to arbitrary invalid padding and a
+  thin-support rejection.
+- Focused verification: Golgi regressions in two bounded batches (`16 passed` and
+  `15 passed`), artifact/config/morphology coverage (`41 passed`), and exact Ruff
+  check/format all passed. The runner environment lacks `pytest` in plain `uv run`;
+  its repository `scripts/run_tests.py` wrapper supplied the locked test environment.

@@ -4,18 +4,19 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
+from cyexm.registration._request_policy import channel_transform_parameters
 from cyexm.registration.artifacts import FileIdentity
 from cyexm.registration.backend import AntsRegistrationBackend
-from cyexm.registration.crop import read_bounds
 from cyexm.runtime import NativeThreadConfig
 from numpy.typing import NDArray
-from scipy.ndimage import distance_transform_edt, gaussian_filter, label
+from scipy.ndimage import binary_erosion, distance_transform_edt, gaussian_filter, label
 from scipy.spatial import cKDTree
 from skimage.measure import mesh_surface_area
 
@@ -124,7 +125,9 @@ def _gradient_magnitude(
 ) -> NDArray[np.float64]:
     """Background-correct, physically smooth, and differentiate one target volume."""
     background = _support_background(image, validity_mask)
-    corrected = np.clip(image - background.median, 0.0, None)
+    # Gradients are invariant to the robust offset; retaining negative corrected
+    # values avoids fabricating a zero-gradient plateau at the support boundary.
+    corrected = image - background.median
     smoothed = _masked_gaussian(
         corrected, validity_mask, gaussian_sigma_zyx(sigma_um, spacing_xyz_um)
     )
@@ -155,6 +158,25 @@ def _masked_gaussian(
         out=np.zeros_like(numerator),
         where=denominator > np.finfo(np.float64).eps,
     )
+
+
+def _effective_gradient_roi(
+    roi: NDArray[np.bool_], validity_mask: NDArray[np.bool_]
+) -> NDArray[np.bool_]:
+    """Exclude all samples whose three-dimensional gradient stencil touches padding.
+
+    A one-voxel 26-neighbour erosion makes the central-difference policy used by
+    :func:`numpy.gradient` explicit.  Thin support fails rather than acquiring a
+    favourable derivative from a padded neighbour.
+    """
+    effective = roi & binary_erosion(
+        validity_mask, structure=np.ones((3, 3, 3), dtype=bool), border_value=0
+    )
+    if not np.any(effective):
+        raise ValueError(
+            "gradient similarity ROI is empty after support-boundary exclusion"
+        )
+    return effective
 
 
 def multiscale_gradient_similarity(
@@ -190,14 +212,15 @@ def multiscale_gradient_similarity(
         raise ValueError("validity mask must match reference geometry")
     if np.any(support & ~valid):
         raise ValueError("ROI must be contained in the validity mask")
+    effective_roi = _effective_gradient_roi(support, valid)
     rows: list[GradientSimilarityRow] = []
     for raw_sigma in sigma_values_um:
         sigma_um = float(raw_sigma)
         fixed_gradient = _gradient_magnitude(fixed, valid, spacing_xyz_um, sigma_um)[
-            support
+            effective_roi
         ]
         moving_gradient = _gradient_magnitude(moved, valid, spacing_xyz_um, sigma_um)[
-            support
+            effective_roi
         ]
         if np.ptp(fixed_gradient) == 0.0 or np.ptp(moving_gradient) == 0.0:
             raise ValueError("gradient similarity has zero variance in the fixed ROI")
@@ -380,18 +403,31 @@ def _support_threshold_ensemble(
 def _artifact_validity_masks(
     artifacts: Mapping[int, RoundArtifacts],
     config: AnalysisConfig,
+    *,
+    _backend: AntsRegistrationBackend | None = None,
 ) -> tuple[dict[int, NDArray[np.bool_]], str, tuple[str, ...]]:
-    """Recreate fixed-grid support from audited native inputs and persisted transforms."""
+    """Recreate support from the registered-target producer record alone.
+
+    The target-transform completion record is authoritative for native source,
+    fixed grid, recorded XYZ pixel size, and affine-before-warp chain.  Analysis
+    spacing is deliberately not substituted for the producer geometry.
+    """
     reference_artifact = artifacts[REFERENCE_ROUND]
-    backend = AntsRegistrationBackend(NativeThreadConfig(itk_threads=1, blas_threads=1))
-    fixed = backend.load_image(
-        reference_artifact.registered_dapi, config.voxel_spacing_xyz_um
+    backend = _backend or AntsRegistrationBackend(
+        NativeThreadConfig(itk_threads=1, blas_threads=1)
     )
-    fixed_shape = tuple(np.asarray(backend.to_array(fixed)).shape)
+    fixed_shape = tuple(load_volume(reference_artifact.registered_target).shape)
     masks: dict[int, NDArray[np.bool_]] = {
         REFERENCE_ROUND: np.ones(fixed_shape, dtype=bool)
     }
-    identities: list[str] = [str(reference_artifact.registered_dapi)]
+    provenance: dict[str, object] = {
+        "reference": {
+            "registered_target": FileIdentity.from_path(
+                reference_artifact.registered_target
+            ).to_dict()
+        },
+        "moving": [],
+    }
     for round_number, artifact in artifacts.items():
         if round_number == REFERENCE_ROUND:
             continue
@@ -403,22 +439,79 @@ def _artifact_validity_masks(
             raise ValueError(
                 "validated moving artifact lacks exact native target or transform chain"
             )
-        source = artifact.native_target
-        source_identity = FileIdentity.from_path(source)
-        target_record = artifact.completion_records[2]
+        target_record = next(
+            (
+                record
+                for record in artifact.completion_records
+                if record.artifact.path == str(artifact.registered_target.resolve())
+            ),
+            None,
+        )
+        if target_record is None or target_record.artifact != FileIdentity.from_path(
+            artifact.registered_target
+        ):
+            raise ValueError("registered target lacks matching completion provenance")
+        request = target_record.request
         if (
-            len(target_record.request.inputs) != 4
-            or source_identity != target_record.request.inputs[1]
+            request.stage != "channel-transform-v1"
+            or request.method != "warp-affine"
+            or request.accuracy != "not-applicable"
+            or len(request.inputs) != 4
+            or request.parameters.get("interpolation") != "nearestNeighbor"
         ):
             raise ValueError(
-                "native target identity no longer matches registered channel provenance"
+                "registered target is not an exact nearest-neighbor channel transform"
             )
-        identities.extend((str(source), str(artifact.affine), str(artifact.warp)))
-        moving = backend.load_image(source, config.voxel_spacing_xyz_um)
-        if artifact.moving_crop is not None:
-            bounds = read_bounds(artifact.moving_crop, backend.geometry(moving).shape)
-            moving = backend.crop_image(moving, bounds)
-            identities.append(str(artifact.moving_crop))
+        try:
+            spacing = tuple(
+                float(value) for value in request.parameters["pixel_size_xyz_um"]
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "registered target lacks recorded producer pixel size"
+            ) from error
+        if len(spacing) != 3 or any(
+            not math.isfinite(value) or value <= 0.0 for value in spacing
+        ):
+            raise ValueError(
+                "registered target has invalid recorded producer pixel size"
+            )
+        if request.parameters != channel_transform_parameters(
+            pixel_size_xyz=spacing, interpolation="nearestNeighbor"
+        ):
+            raise ValueError(
+                "registered target transform parameters do not match producer policy"
+            )
+        fixed_identity, source_identity, affine_identity, warp_identity = request.inputs
+        for identity in request.inputs:
+            try:
+                current = FileIdentity.from_path(Path(identity.path))
+            except (OSError, RuntimeError, ValueError) as error:
+                raise ValueError(
+                    "registered target input identity is unavailable"
+                ) from error
+            if current != identity:
+                raise ValueError(
+                    "registered target input identity changed after completion"
+                )
+        source = artifact.native_target
+        if (
+            source_identity != FileIdentity.from_path(source)
+            or fixed_identity
+            != FileIdentity.from_path(reference_artifact.registered_dapi)
+            or affine_identity != FileIdentity.from_path(artifact.affine)
+            or warp_identity != FileIdentity.from_path(artifact.warp)
+            or request.upstream != warp_identity
+        ):
+            raise ValueError(
+                "registered target inputs do not match the selected artifact chain"
+            )
+        fixed = backend.load_image(Path(fixed_identity.path), spacing)
+        moving = backend.load_image(source, spacing)
+        if backend.geometry(fixed) != request.geometry:
+            raise ValueError(
+                "registered target fixed geometry differs from its completion request"
+            )
         ones = backend.from_array(
             np.ones(
                 tuple(np.asarray(backend.to_array(moving)).shape), dtype=np.float32
@@ -438,9 +531,35 @@ def _artifact_validity_masks(
                 "transformed validity mask does not match reference geometry"
             )
         masks[round_number] = mask
-        identities.append(str(source_identity))
-    digest = hashlib.sha256("\n".join(sorted(identities)).encode()).hexdigest()
-    return masks, digest, tuple(identities)
+        moving_provenance = provenance["moving"]
+        assert isinstance(moving_provenance, list)
+        moving_provenance.append(
+            {
+                "acquisition_round": round_number,
+                "registered_target": target_record.artifact.to_dict(),
+                "request": request.to_dict(),
+                "fixed": fixed_identity.to_dict(),
+                "source": source_identity.to_dict(),
+                "affine": affine_identity.to_dict(),
+                "warp": warp_identity.to_dict(),
+                "mask": {
+                    "shape_zyx": list(mask.shape),
+                    "sha256": hashlib.sha256(
+                        np.ascontiguousarray(mask, dtype=np.uint8).tobytes()
+                    ).hexdigest(),
+                },
+            }
+        )
+    serialized = json.dumps(provenance, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(serialized.encode()).hexdigest()
+    return (
+        masks,
+        digest,
+        (
+            f"validity-provenance:{serialized}",
+            f"validity-provenance-sha256:{digest}",
+        ),
+    )
 
 
 def _ensemble_row(
