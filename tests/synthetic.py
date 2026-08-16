@@ -50,7 +50,8 @@ def _fake_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
                     "metric": "synthetic",
                     "value": "1",
                 },
-            )
+            ),
+            "provenance": ({"identity": "synthetic"},),
         }
     )
 

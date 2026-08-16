@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -70,3 +71,16 @@ def test_symlinked_attempts_root_is_rejected_without_writing_outside(
     with pytest.raises(ValueError, match="symlink"):
         run_cell_task(task, tmp_path)
     assert not list(outside.iterdir())
+
+
+def test_shrunk_record_cannot_hide_a_deleted_required_output(tmp_path: Path) -> None:
+    task = cell_task(tmp_path)
+    first = run_cell_task(task, tmp_path)
+    record_path = first.attempt_dir / "record.json"
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    deleted = Path(payload["output_identities"].pop()["path"])
+    deleted.unlink()
+    record_path.write_text(json.dumps(payload), encoding="utf-8")
+    second = run_cell_task(task, tmp_path)
+    assert second.attempt_id != first.attempt_id
+    assert second.reused is False

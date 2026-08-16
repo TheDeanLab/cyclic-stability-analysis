@@ -159,14 +159,27 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--cohort must name a configured cohort")
     if profile.mode == "slurm" and args.task_index is None:
         raise ValueError("SLURM execution requires --task-index")
-    if args.cell is not None and not any(
-        cell.cell_id == args.cell and (not cohorts or cell.cohort in cohorts)
-        for cell in config.cells
-    ):
+    selected = None
+    if args.cell is not None:
+        selected = next(
+            (
+                cell
+                for cell in config.cells
+                if cell.cell_id == args.cell and (not cohorts or cell.cohort in cohorts)
+            ),
+            None,
+        )
+    if args.cell is not None and selected is None:
         raise KeyError(
             "--cell does not match a configured cell in the requested cohort"
         )
-    tasks = build_tasks(config, cohorts)
+    if args.pilot_first_accepted:
+        selected = _pilot_cell(config, cohorts)
+    tasks = build_tasks(
+        config,
+        cohorts,
+        cells=(selected,) if selected is not None else None,
+    )
     run_input_identities = tuple(
         FileIdentity.from_path(path)
         for path in (
@@ -185,12 +198,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         for task in tasks
     )
-    if args.cell is not None:
-        tasks = tuple(task for task in tasks if task.cell.cell_id == args.cell)
-    selected = None
-    if args.pilot_first_accepted:
-        selected = _pilot_cell(config, cohorts)
-        tasks = tuple(task for task in tasks if task.cell == selected)
     if args.task_index is not None:
         if profile.mode != "slurm":
             raise ValueError("--task-index requires a slurm execution profile")
@@ -235,7 +242,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if profile.mode == "slurm":
         record = run_cell_task(
-            replace(tasks[0], native_threads=profile.native_threads), run_dir
+            replace(
+                tasks[0],
+                native_threads=profile.native_threads,
+                scratch_root=profile.scratch_root,
+            ),
+            run_dir,
         )
         print(f"{record.status}: {record.key}")
         return 0 if record.status == "complete" else 1

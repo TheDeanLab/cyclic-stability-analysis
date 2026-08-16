@@ -82,7 +82,12 @@ def run_tasks(
             "SLURM mode is an index-only CLI operation; it does not submit jobs"
         )
     configured = tuple(
-        replace(task, native_threads=profile.native_threads) for task in tasks
+        replace(
+            task,
+            native_threads=profile.native_threads,
+            scratch_root=profile.scratch_root,
+        )
+        for task in tasks
     )
     if profile.mode == "sequential":
         records = tuple(_worker(task, run_dir) for task in configured)

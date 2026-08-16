@@ -12,7 +12,9 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import stat
+import threading
 import time
 import traceback
 import uuid
@@ -62,6 +64,7 @@ class CellTask:
     software_identity: str = CYEXM_PIN
     native_threads: int = 1
     force: bool = False
+    scratch_root: Path | None = None
 
     @property
     def key(self) -> str:
@@ -207,7 +210,12 @@ def _current_identities_match(values: tuple[FileIdentity, ...]) -> bool:
 def _read_reusable(task: CellTask, complete: Path) -> TaskRecord | None:
     try:
         pointer = json.loads(complete.read_text(encoding="utf-8"))
-        if set(pointer) != {"attempt_id", "record"}:
+        if set(pointer) != {
+            "attempt_id",
+            "record",
+            "record_identity",
+            "output_manifest_identity",
+        }:
             return None
         attempt_id = str(pointer["attempt_id"])
         if (
@@ -225,6 +233,46 @@ def _read_reusable(task: CellTask, complete: Path) -> TaskRecord | None:
         record = _record_from_payload(
             json.loads(record_path.read_text(encoding="utf-8"))
         )
+        manifest_path = attempt_dir / "output-manifest.json"
+        record_identity = FileIdentity.from_dict(pointer["record_identity"])
+        manifest_identity = FileIdentity.from_dict(pointer["output_manifest_identity"])
+        if (
+            FileIdentity.from_path(record_path) != record_identity
+            or FileIdentity.from_path(manifest_path) != manifest_identity
+        ):
+            return None
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if set(manifest) != {"outputs"} or not isinstance(manifest["outputs"], list):
+            return None
+        expected: list[FileIdentity] = []
+        expected_relative: set[str] = set()
+        for entry in manifest["outputs"]:
+            if not isinstance(entry, Mapping) or set(entry) != {"relative", "identity"}:
+                return None
+            relative = entry["relative"]
+            if not isinstance(relative, str) or Path(relative).is_absolute():
+                return None
+            path = (attempt_dir / relative).resolve(strict=True)
+            if (
+                path.parent != attempt_dir
+                or path.is_symlink()
+                or not stat.S_ISREG(path.stat().st_mode)
+            ):
+                return None
+            expected_relative.add(relative)
+            expected.append(FileIdentity.from_dict(entry["identity"]))
+        actual_relative = {
+            path.relative_to(attempt_dir).as_posix()
+            for path in attempt_dir.iterdir()
+            if path.name not in {"record.json", "output-manifest.json"}
+            and not path.is_symlink()
+            and stat.S_ISREG(path.stat().st_mode)
+        }
+        if (
+            expected_relative != actual_relative
+            or tuple(expected) != record.output_identities
+        ):
+            return None
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
     if (
@@ -264,11 +312,25 @@ def _csv_table(path: Path, rows: tuple[Mapping[str, object], ...]) -> None:
 
 
 def _directory_size(path: Path) -> int:
+    if not path.exists():
+        return 0
     return sum(
         item.stat().st_size
         for item in path.rglob("*")
         if not item.is_symlink() and stat.S_ISREG(item.stat().st_mode)
     )
+
+
+def _sample_resources(
+    process: psutil.Process,
+    scratch_dir: Path,
+    stop: threading.Event,
+    values: dict[str, int],
+) -> None:
+    """Continuously retain bounded operational RSS and scratch high-water marks."""
+    while not stop.wait(0.02):
+        values["rss"] = max(values["rss"], process.memory_info().rss)
+        values["scratch"] = max(values["scratch"], _directory_size(scratch_dir))
 
 
 def _qc_gate(task: CellTask) -> None:
@@ -388,11 +450,28 @@ def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
     attempt_id = uuid.uuid4().hex
     attempt_dir = task_dir / "attempts" / attempt_id
     attempt_dir.mkdir(parents=True, exist_ok=False)
+    scratch_dir = (
+        (task.scratch_root / task.key / attempt_id)
+        if task.scratch_root is not None
+        else attempt_dir / "scratch"
+    )
+    scratch_dir.mkdir(parents=True, exist_ok=False)
     process = psutil.Process()
     before = process.io_counters()
     started = time.time()
     started_monotonic = time.monotonic()
     peak = process.memory_info().rss
+    samples = {"rss": peak, "scratch": 0}
+    stop = threading.Event()
+    sampler = threading.Thread(
+        target=_sample_resources,
+        args=(process, scratch_dir, stop, samples),
+        daemon=True,
+    )
+    previous_temp = {name: os.environ.get(name) for name in ("TMPDIR", "TEMP", "TMP")}
+    for name in previous_temp:
+        os.environ[name] = str(scratch_dir)
+    sampler.start()
     try:
         _qc_gate(task)
         if not _current_identities_match(task.input_identities):
@@ -416,7 +495,10 @@ def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
         ):
             raise ValueError("analyzer did not produce valid task outputs")
         after = process.io_counters()
-        peak = max(peak, process.memory_info().rss)
+        stop.set()
+        sampler.join()
+        peak = max(samples["rss"], process.memory_info().rss)
+        scratch_bytes = max(samples["scratch"], _directory_size(scratch_dir))
         record = TaskRecord(
             task.key,
             attempt_id,
@@ -431,17 +513,43 @@ def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
             peak,
             time.monotonic() - started_monotonic,
             max(0, after.read_bytes - before.read_bytes),
-            _directory_size(attempt_dir),
+            scratch_bytes,
         )
-        _atomic_bytes(attempt_dir / "record.json", _json_bytes(_record_payload(record)))
+        manifest = {
+            "outputs": [
+                {
+                    "relative": path.relative_to(attempt_dir).as_posix(),
+                    "identity": identity.to_dict(),
+                }
+                for path, identity in zip(
+                    output_paths, record.output_identities, strict=True
+                )
+            ]
+        }
+        manifest_path = attempt_dir / "output-manifest.json"
+        _atomic_bytes(manifest_path, _json_bytes(manifest))
+        record_path = attempt_dir / "record.json"
+        _atomic_bytes(record_path, _json_bytes(_record_payload(record)))
         _atomic_bytes(
             task_dir / "complete.json",
-            _json_bytes({"attempt_id": attempt_id, "record": "record.json"}),
+            _json_bytes(
+                {
+                    "attempt_id": attempt_id,
+                    "record": "record.json",
+                    "record_identity": FileIdentity.from_path(record_path).to_dict(),
+                    "output_manifest_identity": FileIdentity.from_path(
+                        manifest_path
+                    ).to_dict(),
+                }
+            ),
         )
+        shutil.rmtree(scratch_dir)
         return record
     except Exception as error:  # noqa: BLE001 - persist analyzer failures, preserve interrupts
+        stop.set()
+        sampler.join()
         after = process.io_counters()
-        peak = max(peak, process.memory_info().rss)
+        peak = max(samples["rss"], process.memory_info().rss)
         failure = {
             "error_type": type(error).__name__,
             "message": str(error),
@@ -464,15 +572,28 @@ def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
             peak,
             time.monotonic() - started_monotonic,
             max(0, after.read_bytes - before.read_bytes),
-            _directory_size(attempt_dir),
+            max(samples["scratch"], _directory_size(scratch_dir)),
         )
+    finally:
+        for name, value in previous_temp.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def build_tasks(
-    config: AnalysisConfig, cohorts: tuple[str, ...]
+    config: AnalysisConfig,
+    cohorts: tuple[str, ...],
+    *,
+    cells: tuple[CellSpec, ...] | None = None,
 ) -> tuple[CellTask, ...]:
     """Build sorted five-round tasks, failing closed when source identities are absent."""
-    selected = [cell for cell in config.cells if not cohorts or cell.cohort in cohorts]
+    selected = (
+        list(cells)
+        if cells is not None
+        else [cell for cell in config.cells if not cohorts or cell.cohort in cohorts]
+    )
     tasks: list[CellTask] = []
     for cell in sorted(selected, key=lambda value: (value.cohort, value.cell_id)):
         if len(cell.rounds) != 5:
