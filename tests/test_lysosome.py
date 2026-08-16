@@ -16,6 +16,7 @@ from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.lysosome import (
     DetectionSet,
     LysosomeObject,
+    _comparison_specs,
     _fixed_lamp_roi,
     _maxima,
     _physical_log_response,
@@ -208,6 +209,39 @@ def test_fixed_lamp_roi_intersects_producer_support_outside_one_consensus_nucleu
     assert not roi[3, 3, 3]
     with pytest.raises(ValueError, match="empty"):
         _fixed_lamp_roi(surface, {2: nucleus})
+
+
+def test_detector_is_invariant_to_arbitrary_values_outside_common_support() -> None:
+    """Transform-invalid padding must not influence background, LoG, or watershed objects."""
+    image = synthetic_lamp_spots()
+    support = np.zeros(image.shape, dtype=bool)
+    support[4:-4, 12:-12, 12:-12] = True
+    baseline = detect_lysosomes(
+        image, support, SPACING, (0.7,), (3.0,), resolution=RESOLUTION
+    )
+    padded = image.copy()
+    padded[~support] = 1e12
+    changed = detect_lysosomes(
+        padded, support, SPACING, (0.7,), (3.0,), resolution=RESOLUTION
+    )
+    assert changed == baseline
+
+
+def test_detector_rejects_support_too_thin_for_physical_derivatives() -> None:
+    """A thin support must fail rather than produce favorable empty detections."""
+    image = synthetic_lamp_spots()
+    support = np.zeros(image.shape, dtype=bool)
+    support[14:16, 20:60, 20:60] = True
+    with pytest.raises(ValueError, match="support-boundary"):
+        detect_lysosomes(image, support, SPACING, (0.7,), (3.0,), resolution=RESOLUTION)
+
+
+def test_adjacency_skips_qc_gaps_but_round_two_relative_does_not() -> None:
+    """A 2-to-4 transition is not adjacent after an excluded acquisition round."""
+    comparisons = _comparison_specs((1, 2, 4, 5))
+    assert ("adjacent", 2, 4) not in comparisons
+    assert ("adjacent", 4, 5) in comparisons
+    assert ("round2-relative", 2, 4) in comparisons
 
 
 @pytest.mark.parametrize(
@@ -405,8 +439,11 @@ def test_excluded_lamp_round_never_opens_its_target(
         "load_volume",
         lambda path: (opened.append(path), original(path))[1],
     )
-    analyze_lamp1_cell(cell, artifacts, config, tmp_path / "output")
+    result = analyze_lamp1_cell(cell, artifacts, config, tmp_path / "output")
     assert artifacts[2].registered_target not in opened
+    assert str(artifacts[2].registered_target) not in result.input_identities
+    assert str(artifacts[2].registered_dapi) not in result.input_identities
+    assert "synthetic-validity" in result.input_identities
 
 
 def test_real_lamp_gate_returns_machine_readable_unavailable(

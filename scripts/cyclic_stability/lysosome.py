@@ -11,7 +11,12 @@ from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import distance_transform_edt, gaussian_filter, maximum_filter
+from scipy.ndimage import (
+    binary_erosion,
+    distance_transform_edt,
+    gaussian_filter,
+    maximum_filter,
+)
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 from skimage.measure import marching_cubes, mesh_surface_area
@@ -19,7 +24,7 @@ from skimage.segmentation import watershed
 
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.golgi import _artifact_validity_masks
-from cyclic_stability.images import load_volume, robust_background
+from cyclic_stability.images import BackgroundSummary, load_volume
 from cyclic_stability.models import (
     AnalysisConfig,
     CellSpec,
@@ -189,6 +194,63 @@ def _physical_log_response(
     return response
 
 
+def _support_background(
+    image: NDArray[np.float64], support: NDArray[np.bool_]
+) -> BackgroundSummary:
+    """Estimate robust background only from finite positive transform-valid samples."""
+    positive = image[support & (image > 0.0)]
+    if positive.size == 0:
+        raise ValueError("support background has no positive voxels")
+    upper = float(np.percentile(positive, 30.0))
+    background = positive[positive <= upper]
+    if background.size == 0:
+        raise ValueError("support background selection is empty")
+    median = float(np.median(background))
+    scale = float(1.4826 * np.median(np.abs(background - median)))
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("support background robust scale must be finite and positive")
+    return BackgroundSummary(median, scale, int(positive.size), int(background.size))
+
+
+def _support_safe_physical_log(
+    image: NDArray[np.float64],
+    support: NDArray[np.bool_],
+    sigma_um: float,
+    spacing_xyz_um: tuple[float, float, float],
+) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+    """Return masked-normalized physical LoG only where its 3-point stencil is safe."""
+    sigma_zyx = gaussian_sigma_zyx(sigma_um, spacing_xyz_um)
+    weights = support.astype(np.float64, copy=False)
+    denominator = gaussian_filter(weights, sigma_zyx, mode="nearest")
+    smoothed = np.divide(
+        gaussian_filter(image * weights, sigma_zyx, mode="nearest"),
+        denominator,
+        out=np.zeros_like(image),
+        where=denominator > np.finfo(np.float64).eps,
+    )
+    safe = binary_erosion(support, structure=np.ones((3, 3, 3), dtype=bool))
+    if not np.any(safe):
+        raise ValueError(
+            "LAMP1 support-boundary exclusion leaves no derivative stencil"
+        )
+    response = np.zeros_like(smoothed)
+    for axis, sigma_vox in enumerate(sigma_zyx):
+        ahead = [slice(None)] * 3
+        center = [slice(None)] * 3
+        behind = [slice(None)] * 3
+        ahead[axis] = slice(2, None)
+        center[axis] = slice(1, -1)
+        behind[axis] = slice(None, -2)
+        destination = [slice(None)] * 3
+        destination[axis] = slice(1, -1)
+        response[tuple(destination)] -= sigma_vox**2 * (
+            smoothed[tuple(ahead)]
+            - 2.0 * smoothed[tuple(center)]
+            + smoothed[tuple(behind)]
+        )
+    return response, safe
+
+
 def _surface_area(
     mask: NDArray[np.bool_], spacing_xyz_um: tuple[float, float, float]
 ) -> float:
@@ -265,15 +327,17 @@ def detect_lysosomes(
     spacing = _spacing(spacing_xyz_um)
     sigmas = _positive_values(sigma_values_um, "sigma_values_um")
     thresholds = _positive_values(detection_sbr, "detection_sbr")
-    background = robust_background(source)
+    background = _support_background(source, structure_roi)
     corrected = source - background.median
     result: list[DetectionSet] = []
     for sigma_um in sigmas:
-        response = _physical_log_response(corrected, sigma_um, spacing)
+        response, derivative_support = _support_safe_physical_log(
+            corrected, structure_roi, sigma_um, spacing
+        )
         for threshold_sbr in thresholds:
             peaks = _maxima(
                 response,
-                structure_roi,
+                derivative_support,
                 threshold_sbr * background.scale,
                 spacing,
                 resolution,
@@ -282,7 +346,7 @@ def detect_lysosomes(
                 DetectionSet(
                     sigma_um,
                     threshold_sbr,
-                    _objects(response, structure_roi, peaks, spacing),
+                    _objects(response, derivative_support, peaks, spacing),
                 )
             )
     return tuple(result)
@@ -456,7 +520,9 @@ def _comparison_specs(rounds: tuple[int, ...]) -> tuple[tuple[str, int, int], ..
     return tuple(
         ("round2-relative", REFERENCE_ROUND, number) for number in ordered
     ) + tuple(
-        ("adjacent", previous, current) for previous, current in pairwise(ordered)
+        ("adjacent", previous, current)
+        for previous, current in pairwise(ordered)
+        if current == previous + 1
     )
 
 
@@ -759,7 +825,8 @@ def analyze_lamp1_cell(
     identities = (
         tuple(
             str(path)
-            for artifact in artifacts
+            for number in accepted
+            for artifact in (by_round[number],)
             for path in (artifact.registered_dapi, artifact.registered_target)
         )
         + validity_identities

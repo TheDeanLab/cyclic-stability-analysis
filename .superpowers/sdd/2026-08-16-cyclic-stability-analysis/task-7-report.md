@@ -77,3 +77,22 @@ atomic stale-output replacement, table schemas/content, and singleton NN handlin
 
 Final review-fix verification: `22 passed` for `tests/test_lysosome.py`; full tests
 completed successfully; exact Ruff check and format checks passed.
+
+## Review-fix amendment 2
+
+LAMP1's supplied common ROI is now preprocessing support, not merely a final mask.
+Background estimation uses only positive support voxels; scale smoothing uses masked
+normalized convolution; and an explicit support-safe three-point physical second
+derivative is evaluated only after the actual derivative stencil is fully inside
+support.  Invalid padding values therefore cannot influence detections, object
+geometry, or output rows, while insufficient support is a hard error.
+
+Adjacent comparisons now require consecutive acquisition numbers after QC filtering:
+an accepted `2,4` pair is retained as round-2-relative but is not called adjacent.
+Input identities now list only accepted-round DAPI/LAMP artifacts plus the exact
+support provenance, so excluded inputs are not represented as contributors.
+
+Regression coverage adds arbitrary high-valued padding invariance, thin-support
+rejection, QC-gap adjacency behavior, and excluded-round provenance. Final focused
+verification: `25 passed`; the full suite and exact Ruff/format checks completed
+successfully.
