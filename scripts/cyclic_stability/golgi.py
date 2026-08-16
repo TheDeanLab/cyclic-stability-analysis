@@ -24,6 +24,7 @@ from cyclic_stability.models import (
     MetricRow,
 )
 from cyclic_stability.morphology import (
+    MaskMember,
     gaussian_sigma_zyx,
     resolution_surface_metrics,
     threshold_ensemble,
@@ -46,6 +47,46 @@ class GradientSimilarityRow:
 
     sigma_um: float
     correlation: float
+
+
+ENSEMBLE_ENDPOINTS = (
+    "absolute_background_corrected_signal",
+    "volume_um3",
+    "component_count",
+    "component_volume_gini",
+    "fragmentation_per_um3",
+    "compactness",
+    "area_to_volume_um_inverse",
+    "nuclear_distance_p25_um",
+    "nuclear_distance_p50_um",
+    "nuclear_distance_p75_um",
+    "jaccard",
+    "fixed_to_moving_boundary_distance_p95",
+    "moving_to_fixed_boundary_distance_p95",
+)
+
+
+def _ensemble_units(config: AnalysisConfig) -> dict[str, str]:
+    """Return the fixed units schema for every non-image ensemble endpoint."""
+    return {
+        "absolute_background_corrected_signal": "a.u.",
+        "volume_um3": "um3",
+        "component_count": "count",
+        "component_volume_gini": "fraction",
+        "fragmentation_per_um3": "1/um3",
+        "compactness": "fraction",
+        "area_to_volume_um_inverse": "1/um",
+        "nuclear_distance_p25_um": "um",
+        "nuclear_distance_p50_um": "um",
+        "nuclear_distance_p75_um": "um",
+        "jaccard": "fraction",
+        "fixed_to_moving_boundary_distance_p95": "resolution-units",
+        "moving_to_fixed_boundary_distance_p95": "resolution-units",
+        **{
+            f"surface_dice_{tolerance:g}": "fraction"
+            for tolerance in config.ensembles.surface_tolerance_resolution_units
+        },
+    }
 
 
 def _volume(image: NDArray[np.generic], name: str) -> NDArray[np.float64]:
@@ -112,9 +153,7 @@ def multiscale_gradient_similarity(
         sigma_um = float(raw_sigma)
         fixed_gradient = _gradient_magnitude(fixed, spacing_xyz_um, sigma_um)[support]
         moving_gradient = _gradient_magnitude(moved, spacing_xyz_um, sigma_um)[support]
-        if np.isclose(np.std(fixed_gradient), 0.0) or np.isclose(
-            np.std(moving_gradient), 0.0
-        ):
+        if np.ptp(fixed_gradient) == 0.0 or np.ptp(moving_gradient) == 0.0:
             raise ValueError("gradient similarity has zero variance in the fixed ROI")
         correlation = float(np.corrcoef(fixed_gradient, moving_gradient)[0, 1])
         if not math.isfinite(correlation):
@@ -128,7 +167,12 @@ def golgi_nucleus_distances(
     nuclear_surface: NuclearSurface,
     spacing_xyz_um: tuple[float, float, float],
 ) -> NDArray[np.float64]:
-    """Return physical XYZ target-voxel distances to the consensus nuclear surface."""
+    """Return physical XYZ distances to the nearest sampled nuclear mesh vertex.
+
+    Target voxels are represented by their voxel centers.  This is a reproducible
+    nearest-vertex approximation to a triangulated surface distance, not an exact
+    point-to-triangle distance; spacing anisotropy is nevertheless preserved.
+    """
     positive = validated_binary_mask(mask, "Golgi mask")
     if positive.ndim != 3 or positive.shape != nuclear_surface.mask_zyx.shape:
         raise ValueError("Golgi mask and nuclear surface must share 3D ZYX geometry")
@@ -197,23 +241,30 @@ def _mask_geometry(
 
 def _perinuclear_roi(
     nuclear_mask: NDArray[np.bool_],
-    rounds: Mapping[int, NDArray[np.generic]],
+    validity_masks: Mapping[int, NDArray[np.bool_]],
     config: AnalysisConfig,
 ) -> NDArray[np.bool_]:
-    """Build one fixed exterior 18 um ROI intersected with all valid target voxels."""
+    """Build one fixed exterior ROI from explicit transform-valid support masks.
+
+    A registered target can contain finite padding outside its transformed source
+    support.  Therefore validity is an input derived from the transform chain, not
+    from target intensities.
+    """
     nucleus = validated_binary_mask(nuclear_mask, "consensus nuclear mask")
     if nucleus.ndim != 3:
         raise ValueError("consensus nuclear mask must be 3D ZYX")
-    if not rounds:
+    if not validity_masks:
         raise ValueError("Golgi ROI requires at least one registered round")
     valid = np.ones(nucleus.shape, dtype=bool)
-    for round_number, image in rounds.items():
-        volume = _volume(image, f"Golgi round {round_number}")
-        if volume.shape != nucleus.shape:
+    for round_number, mask in validity_masks.items():
+        transform_valid = validated_binary_mask(
+            mask, f"validity mask for round {round_number}"
+        )
+        if transform_valid.ndim != 3 or transform_valid.shape != nucleus.shape:
             raise ValueError(
-                "Golgi rounds and consensus nuclear mask must share geometry"
+                "transform validity masks and consensus nuclear mask must share geometry"
             )
-        valid &= np.isfinite(volume)
+        valid &= transform_valid
     sx, sy, sz = _spacing(config)
     exterior_distance = distance_transform_edt(~nucleus, sampling=(sz, sy, sx))
     roi = (
@@ -225,6 +276,36 @@ def _perinuclear_roi(
         raise ValueError("fixed perinuclear ROI is empty")
     roi.setflags(write=False)
     return roi
+
+
+def _common_validity_masks(
+    rounds: Mapping[int, NDArray[np.float64]],
+    validity_masks: Mapping[int, NDArray[np.bool_]] | None,
+) -> dict[int, NDArray[np.bool_]]:
+    """Validate fixed-grid transform support, defaulting only synthetic arrays to all true.
+
+    The default is deliberately restricted to the array kernel: its caller has
+    supplied already fixed-grid arrays and may use it for controlled same-grid
+    synthetic tests.  The production cell entry never takes this default.
+    """
+    if validity_masks is None:
+        return {
+            round_number: np.ones(image.shape, dtype=bool)
+            for round_number, image in rounds.items()
+        }
+    if set(validity_masks) != set(rounds):
+        raise ValueError("transform validity masks must match registered Golgi rounds")
+    result: dict[int, NDArray[np.bool_]] = {}
+    for round_number, raw_mask in validity_masks.items():
+        mask = validated_binary_mask(
+            raw_mask, f"validity mask for round {round_number}"
+        )
+        if mask.ndim != 3 or mask.shape != rounds[round_number].shape:
+            raise ValueError(
+                "transform validity mask geometry must match its Golgi round"
+            )
+        result[round_number] = mask
+    return result
 
 
 def _ensemble_row(
@@ -297,6 +378,7 @@ def analyze_golgi_arrays(
     golgi_rounds: Mapping[int, NDArray],
     dapi_rounds: Mapping[int, NDArray],
     config: AnalysisConfig,
+    validity_masks: Mapping[int, NDArray[np.bool_]] | None = None,
 ) -> MarkerResult:
     """Analyze one cell's registered Golgi arrays with round 2 fixed as reference.
 
@@ -314,10 +396,11 @@ def analyze_golgi_arrays(
         int(number): _volume(image, f"Golgi round {number}")
         for number, image in golgi_rounds.items()
     }
+    common_validity = _common_validity_masks(rounds, validity_masks)
     surface = consensus_nuclear_surface(
         dapi_rounds, config.voxel_spacing_xyz_um, config.nuclear
     )
-    roi = _perinuclear_roi(surface.mask_zyx, rounds, config)
+    roi = _perinuclear_roi(surface.mask_zyx, common_validity, config)
     reference = rounds[REFERENCE_ROUND]
     ensemble_by_round = {
         round_number: threshold_ensemble(
@@ -332,6 +415,14 @@ def analyze_golgi_arrays(
     reference_members = ensemble_by_round[REFERENCE_ROUND]
     ensemble_rows: list[EnsembleRow] = []
     summary_rows: list[MetricRow] = []
+    units = _ensemble_units(config)
+    endpoints = (
+        *ENSEMBLE_ENDPOINTS,
+        *(
+            f"surface_dice_{tolerance:g}"
+            for tolerance in config.ensembles.surface_tolerance_resolution_units
+        ),
+    )
     for round_number in sorted(rounds):
         similarities = multiscale_gradient_similarity(
             reference,
@@ -400,25 +491,6 @@ def analyze_golgi_arrays(
                     reference_member.mask_zyx, member.mask_zyx, config
                 ),
             }
-            units = {
-                "absolute_background_corrected_signal": "a.u.",
-                "volume_um3": "um3",
-                "component_count": "count",
-                "component_volume_gini": "fraction",
-                "fragmentation_per_um3": "1/um3",
-                "compactness": "fraction",
-                "area_to_volume_um_inverse": "1/um",
-                "nuclear_distance_p25_um": "um",
-                "nuclear_distance_p50_um": "um",
-                "nuclear_distance_p75_um": "um",
-                "jaccard": "fraction",
-                "fixed_to_moving_boundary_distance_p95": "resolution-units",
-                "moving_to_fixed_boundary_distance_p95": "resolution-units",
-                **{
-                    f"surface_dice_{tolerance:g}": "fraction"
-                    for tolerance in config.ensembles.surface_tolerance_resolution_units
-                },
-            }
             for endpoint, value in values.items():
                 ensemble_rows.append(
                     _ensemble_row(
@@ -433,14 +505,15 @@ def analyze_golgi_arrays(
                 )
                 if math.isfinite(value):
                     current_values.setdefault(endpoint, []).append(value)
-        for endpoint, values in current_values.items():
+        for endpoint in endpoints:
+            values = current_values.get(endpoint, [])
             summary_rows.append(
                 MetricRow(
                     "golgi",
                     "array",
                     round_number,
                     f"golgi_{endpoint}_median",
-                    float(np.median(values)),
+                    float(np.median(values)) if values else math.nan,
                     units[endpoint],
                     comparison_set,
                     True,
@@ -471,18 +544,33 @@ def _rebind_cell(result: MarkerResult, cell: CellSpec) -> MarkerResult:
 
 
 def _write_diagnostics(
-    output_dir: Path, rounds: Mapping[int, NDArray], result: MarkerResult
+    output_dir: Path,
+    rounds: Mapping[int, NDArray[np.float64]],
+    result: MarkerResult,
+    surface: NuclearSurface,
+    roi: NDArray[np.bool_],
+    threshold_masks: Mapping[int, tuple[MaskMember, ...]],
 ) -> tuple[Path, ...]:
-    """Atomically publish registered overlays and the complete threshold-response table."""
+    """Atomically publish fixed-grid composite overlays and threshold-response curves."""
     staged_paths: tuple[Path, ...] = ()
     staging_root: Path | None = None
 
     def populate(staged: Path) -> None:
         nonlocal staged_paths, staging_root
+        import matplotlib.pyplot as plt
+
         staging_root = staged
         overlay = staged / "golgi-registered-overlays.npz"
         np.savez_compressed(
-            overlay, **{f"round_{number}": image for number, image in rounds.items()}
+            overlay,
+            consensus_nuclear_mask_zyx=surface.mask_zyx,
+            fixed_perinuclear_roi_zyx=roi,
+            **{f"round_{number}_target_zyx": image for number, image in rounds.items()},
+            **{
+                f"round_{number}_sigma_{member.sigma_um:g}_sbr_{member.threshold_sbr:g}_threshold_mask_zyx": member.mask_zyx
+                for number, members in threshold_masks.items()
+                for member in members
+            },
         )
         curves = staged / "golgi-threshold-robustness.csv"
         with curves.open("w", newline="", encoding="utf-8") as handle:
@@ -492,7 +580,48 @@ def _write_diagnostics(
                 [getattr(row, name) for name in EnsembleRow.__dataclass_fields__]
                 for row in result.ensemble_rows
             )
-        staged_paths = (overlay, curves)
+        plt.rcParams.update(
+            {"pdf.fonttype": 42, "ps.fonttype": 42, "svg.fonttype": "none"}
+        )
+        reference = rounds[REFERENCE_ROUND].max(axis=0)
+        roi_mip = roi.max(axis=0)
+        nucleus_mip = surface.mask_zyx.max(axis=0)
+        figure_paths: list[Path] = []
+        union_masks = {
+            number: np.logical_or.reduce([member.mask_zyx for member in members])
+            for number, members in threshold_masks.items()
+        }
+        for round_number, image in sorted(rounds.items()):
+            figure, axes = plt.subplots(1, 2, figsize=(8, 4), layout="constrained")
+            for axis, title, mip, mask in (
+                (
+                    axes[0],
+                    "round 2 reference",
+                    reference,
+                    union_masks[REFERENCE_ROUND],
+                ),
+                (
+                    axes[1],
+                    f"round {round_number}",
+                    image.max(axis=0),
+                    union_masks[round_number],
+                ),
+            ):
+                finite = mip[np.isfinite(mip)]
+                low, high = np.percentile(finite, (1.0, 99.5))
+                axis.imshow(mip, cmap="magma", vmin=low, vmax=high)
+                axis.contour(roi_mip, levels=(0.5,), colors="cyan", linewidths=0.7)
+                axis.contour(nucleus_mip, levels=(0.5,), colors="white", linewidths=0.7)
+                axis.contour(
+                    mask.max(axis=0), levels=(0.5,), colors="lime", linewidths=0.7
+                )
+                axis.set_title(title)
+                axis.set_axis_off()
+            path = staged / f"golgi-overlay-round-{round_number}.png"
+            figure.savefig(path, dpi=200)
+            plt.close(figure)
+            figure_paths.append(path)
+        staged_paths = (overlay, curves, *figure_paths)
 
     _atomic_publish_directory(output_dir, populate)
     assert staging_root is not None
@@ -504,8 +633,16 @@ def analyze_golgi_cell(
     artifacts: tuple[RoundArtifacts, ...],
     config: AnalysisConfig,
     output_dir: Path,
+    validity_masks: Mapping[int, NDArray[np.bool_]] | None = None,
 ) -> MarkerResult:
-    """Load validated registered Golgi inputs and publish one cell's diagnostics."""
+    """Load validated registered Golgi inputs and publish one cell's diagnostics.
+
+    ``RoundArtifacts`` currently identifies registered fixed-grid outputs and their
+    transform files but does not retain the moving native source geometry required
+    to transform a native all-ones support image.  Production callers must therefore
+    pass fixed-grid validity masks generated from the validated affine/warp chain;
+    the entry point fails closed rather than treating finite target padding as valid.
+    """
     if cell.cohort != "golgi":
         raise ValueError("Golgi analysis requires a golgi CellSpec")
     by_round = {artifact.acquisition_round: artifact for artifact in artifacts}
@@ -520,8 +657,33 @@ def analyze_golgi_cell(
     golgi = {
         number: load_volume(by_round[number].registered_target) for number in accepted
     }
-    result = _rebind_cell(analyze_golgi_arrays(golgi, dapi, config), cell)
-    diagnostics = _write_diagnostics(output_dir, golgi, result)
+    if validity_masks is None:
+        raise ValueError(
+            "production Golgi analysis requires explicit transform-validity masks"
+        )
+    if set(validity_masks) != set(accepted):
+        raise ValueError("transform validity masks must match accepted Golgi rounds")
+    common_validity = _common_validity_masks(golgi, validity_masks)
+    result = _rebind_cell(
+        analyze_golgi_arrays(golgi, dapi, config, common_validity), cell
+    )
+    surface = consensus_nuclear_surface(
+        dapi, config.voxel_spacing_xyz_um, config.nuclear
+    )
+    roi = _perinuclear_roi(surface.mask_zyx, common_validity, config)
+    threshold_masks = {
+        round_number: threshold_ensemble(
+            image,
+            roi,
+            config.ensembles.gaussian_sigma_um,
+            config.ensembles.threshold_sbr,
+            config.voxel_spacing_xyz_um,
+        )
+        for round_number, image in golgi.items()
+    }
+    diagnostics = _write_diagnostics(
+        output_dir, golgi, result, surface, roi, threshold_masks
+    )
     return replace(
         result,
         diagnostics=diagnostics,
@@ -537,6 +699,7 @@ def analyze_golgi_cell(
 
 
 __all__ = [
+    "ENSEMBLE_ENDPOINTS",
     "GradientSimilarityRow",
     "analyze_golgi_arrays",
     "analyze_golgi_cell",
