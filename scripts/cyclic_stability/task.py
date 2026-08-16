@@ -1,0 +1,444 @@
+"""Immutable, restart-safe marker-cell task attempts.
+
+This module deliberately imports no scientific/image library at import time.  A
+worker first applies its native-thread policy and only then imports the cohort
+analyzer that may load NumPy, ANTs, or a BLAS implementation.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+import re
+import time
+import traceback
+import uuid
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Literal
+
+import psutil
+from cyexm.registration.artifacts import FileIdentity
+
+from cyclic_stability.models import AnalysisConfig, CellSpec
+
+_SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_THREAD_ENVIRONMENT = (
+    "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+)
+CYEXM_PIN = "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52"
+
+
+@dataclass(frozen=True, slots=True)
+class TaskOutput:
+    """Compact per-cell tables and paths produced by one analyzer."""
+
+    tables: Mapping[str, tuple[Mapping[str, object], ...]]
+    diagnostics: tuple[Path, ...] = ()
+
+
+TaskAnalyzer = Callable[["CellTask", Path], TaskOutput]
+
+
+@dataclass(frozen=True, slots=True)
+class CellTask:
+    """One exact cohort/cell task owning all five acquisition rounds."""
+
+    cell: CellSpec
+    config: AnalysisConfig | None
+    config_digest: str
+    input_identities: tuple[FileIdentity, ...]
+    analyzer: TaskAnalyzer
+    software_identity: str = CYEXM_PIN
+    native_threads: int = 1
+    force: bool = False
+
+    @property
+    def key(self) -> str:
+        """Return the path-safe, exact cohort-cell task identity."""
+        if not _SAFE_COMPONENT.fullmatch(
+            self.cell.cohort
+        ) or not _SAFE_COMPONENT.fullmatch(self.cell.cell_id):
+            raise ValueError("cohort and cell_id must be path-safe components")
+        return f"{self.cell.cohort}-{self.cell.cell_id}"
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRecord:
+    """Completion or failed-attempt record; resource fields are operational only."""
+
+    key: str
+    attempt_id: str
+    attempt_dir: Path
+    config_digest: str
+    input_identities: tuple[FileIdentity, ...]
+    software_identity: str
+    output_identities: tuple[FileIdentity, ...]
+    status: Literal["complete", "failed"]
+    started_at: float
+    completed_at: float
+    peak_rss_bytes: int
+    elapsed_seconds: float
+    process_read_bytes: int
+    scratch_bytes: int
+    reused: bool = False
+
+    @property
+    def software_versions(self) -> tuple[str, ...]:
+        """Return the immutable pinned software identity in record-friendly form."""
+        return (self.software_identity,)
+
+
+def configure_native_threads(native_threads: int) -> None:
+    """Set every supported native runtime thread variable before scientific imports."""
+    if isinstance(native_threads, bool) or native_threads < 1:
+        raise ValueError("native_threads must be a positive integer")
+    value = str(native_threads)
+    for name in _THREAD_ENVIRONMENT:
+        os.environ[name] = value
+
+
+def _atomic_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with temporary.open("wb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _json_bytes(payload: Mapping[str, object]) -> bytes:
+    return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _identity_payload(values: tuple[FileIdentity, ...]) -> list[dict[str, object]]:
+    return [dict(value.to_dict()) for value in values]
+
+
+def _identity_values(value: object) -> tuple[FileIdentity, ...]:
+    if not isinstance(value, list):
+        raise TypeError("identities must be a list")
+    if not all(isinstance(item, Mapping) for item in value):
+        raise TypeError("task identities must be mappings")
+    return tuple(FileIdentity.from_dict(item, name="task identity") for item in value)
+
+
+def _record_payload(record: TaskRecord) -> dict[str, object]:
+    return {
+        "key": record.key,
+        "attempt_id": record.attempt_id,
+        "attempt_dir": str(record.attempt_dir),
+        "config_digest": record.config_digest,
+        "input_identities": _identity_payload(record.input_identities),
+        "software_identity": record.software_identity,
+        "output_identities": _identity_payload(record.output_identities),
+        "status": record.status,
+        "started_at": record.started_at,
+        "completed_at": record.completed_at,
+        "peak_rss_bytes": record.peak_rss_bytes,
+        "elapsed_seconds": record.elapsed_seconds,
+        "process_read_bytes": record.process_read_bytes,
+        "scratch_bytes": record.scratch_bytes,
+    }
+
+
+def _record_from_payload(payload: Mapping[str, object]) -> TaskRecord:
+    required = {
+        "key",
+        "attempt_id",
+        "attempt_dir",
+        "config_digest",
+        "input_identities",
+        "software_identity",
+        "output_identities",
+        "status",
+        "started_at",
+        "completed_at",
+        "peak_rss_bytes",
+        "elapsed_seconds",
+        "process_read_bytes",
+        "scratch_bytes",
+    }
+    if set(payload) != required or payload["status"] not in {"complete", "failed"}:
+        raise ValueError("invalid task completion record")
+    return TaskRecord(
+        key=str(payload["key"]),
+        attempt_id=str(payload["attempt_id"]),
+        attempt_dir=Path(str(payload["attempt_dir"])),
+        config_digest=str(payload["config_digest"]),
+        input_identities=_identity_values(payload["input_identities"]),
+        software_identity=str(payload["software_identity"]),
+        output_identities=_identity_values(payload["output_identities"]),
+        status=payload["status"],
+        started_at=float(payload["started_at"]),
+        completed_at=float(payload["completed_at"]),
+        peak_rss_bytes=int(payload["peak_rss_bytes"]),
+        elapsed_seconds=float(payload["elapsed_seconds"]),
+        process_read_bytes=int(payload["process_read_bytes"]),
+        scratch_bytes=int(payload["scratch_bytes"]),
+    )
+
+
+def _current_identities_match(values: tuple[FileIdentity, ...]) -> bool:
+    try:
+        return all(
+            FileIdentity.from_path(Path(value.path)) == value for value in values
+        )
+    except OSError:
+        return False
+
+
+def _read_reusable(task: CellTask, complete: Path) -> TaskRecord | None:
+    try:
+        pointer = json.loads(complete.read_text(encoding="utf-8"))
+        if set(pointer) != {"attempt_id", "record"}:
+            return None
+        record_path = (
+            complete.parent
+            / "attempts"
+            / str(pointer["attempt_id"])
+            / str(pointer["record"])
+        )
+        record = _record_from_payload(
+            json.loads(record_path.read_text(encoding="utf-8"))
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if (
+        record.status != "complete"
+        or record.key != task.key
+        or record.config_digest != task.config_digest
+        or record.software_identity != task.software_identity
+        or record.input_identities != task.input_identities
+        or not _current_identities_match(task.input_identities)
+        or not _current_identities_match(record.output_identities)
+    ):
+        return None
+    return replace(record, reused=True)
+
+
+def _csv_table(path: Path, rows: tuple[Mapping[str, object], ...]) -> None:
+    columns = tuple(sorted({key for row in rows for key in row}))
+    if not columns:
+        columns = ("status",)
+        rows = ({"status": "empty"},)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in columns})
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _directory_size(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _qc_gate(task: CellTask) -> None:
+    if task.config is None:
+        return
+    decisions = {
+        (item.cohort, item.cell_id, item.acquisition_round): item
+        for item in task.config.qc_decisions
+    }
+    missing = [
+        item.acquisition_round
+        for item in task.cell.rounds
+        if item.acquisition_round != task.config.reference_acquisition_round
+        and (item.cohort, item.cell_id, item.acquisition_round) not in decisions
+    ]
+    if missing:
+        raise ValueError(
+            f"target-blind QC decisions are missing for moving rounds: {missing}"
+        )
+
+
+def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
+    """Compose the existing provenance, marker, and QC analyzers for one cell."""
+    _qc_gate(task)  # Must precede any analyzer import or target-volume opening.
+    if task.config is None:
+        raise ValueError("production marker analysis requires an AnalysisConfig")
+    from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
+    from cyclic_stability.golgi import analyze_golgi_cell
+    from cyclic_stability.lysosome import analyze_lamp1_cell
+    from cyclic_stability.nuclear import analyze_lamin_cell
+
+    artifacts = tuple(resolve_round_artifacts(item) for item in task.cell.rounds)
+    analyzer = {
+        "golgi": analyze_golgi_cell,
+        "lamin": analyze_lamin_cell,
+        "lamp1": analyze_lamp1_cell,
+    }.get(task.cell.cohort)
+    if analyzer is None:
+        raise ValueError(f"unsupported cohort: {task.cell.cohort}")
+    result = analyzer(task.cell, artifacts, task.config, output_dir / "diagnostics")
+    return TaskOutput(
+        tables={
+            "summary": tuple(asdict(item) for item in result.summary_rows),
+            "ensemble": tuple(asdict(item) for item in result.ensemble_rows),
+        },
+        diagnostics=result.diagnostics,
+    )
+
+
+def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
+    """Run one immutable attempt or return an exactly matching complete attempt."""
+    configure_native_threads(task.native_threads)
+    task_dir = run_dir / "tasks" / task.key
+    reusable = None if task.force else _read_reusable(task, task_dir / "complete.json")
+    if reusable is not None:
+        return reusable
+    attempt_id = uuid.uuid4().hex
+    attempt_dir = task_dir / "attempts" / attempt_id
+    attempt_dir.mkdir(parents=True, exist_ok=False)
+    process = psutil.Process()
+    before = process.io_counters()
+    started = time.time()
+    started_monotonic = time.monotonic()
+    peak = process.memory_info().rss
+    try:
+        _qc_gate(task)
+        if not _current_identities_match(task.input_identities):
+            raise ValueError(
+                "one or more immutable task inputs changed before execution"
+            )
+        output = task.analyzer(task, attempt_dir)
+        table_paths: list[Path] = []
+        for name, rows in sorted(output.tables.items()):
+            if not _SAFE_COMPONENT.fullmatch(name):
+                raise ValueError("table names must be path-safe")
+            path = attempt_dir / f"{name}.csv"
+            _csv_table(path, rows)
+            table_paths.append(path)
+        output_paths = tuple(table_paths) + tuple(output.diagnostics)
+        if not output_paths or not all(path.is_file() for path in output_paths):
+            raise ValueError("analyzer did not produce valid task outputs")
+        after = process.io_counters()
+        peak = max(peak, process.memory_info().rss)
+        record = TaskRecord(
+            task.key,
+            attempt_id,
+            attempt_dir,
+            task.config_digest,
+            task.input_identities,
+            task.software_identity,
+            tuple(FileIdentity.from_path(path) for path in output_paths),
+            "complete",
+            started,
+            time.time(),
+            peak,
+            time.monotonic() - started_monotonic,
+            max(0, after.read_bytes - before.read_bytes),
+            _directory_size(attempt_dir),
+        )
+        _atomic_bytes(attempt_dir / "record.json", _json_bytes(_record_payload(record)))
+        _atomic_bytes(
+            task_dir / "complete.json",
+            _json_bytes({"attempt_id": attempt_id, "record": "record.json"}),
+        )
+        return record
+    except Exception as error:  # noqa: BLE001 - persist analyzer failures, preserve interrupts
+        after = process.io_counters()
+        peak = max(peak, process.memory_info().rss)
+        failure = {
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "traceback": traceback.format_exc(),
+            "started_at": started,
+            "failed_at": time.time(),
+        }
+        _atomic_bytes(attempt_dir / "failure.json", _json_bytes(failure))
+        return TaskRecord(
+            task.key,
+            attempt_id,
+            attempt_dir,
+            task.config_digest,
+            task.input_identities,
+            task.software_identity,
+            (),
+            "failed",
+            started,
+            time.time(),
+            peak,
+            time.monotonic() - started_monotonic,
+            max(0, after.read_bytes - before.read_bytes),
+            _directory_size(attempt_dir),
+        )
+
+
+def build_tasks(
+    config: AnalysisConfig, cohorts: tuple[str, ...]
+) -> tuple[CellTask, ...]:
+    """Build sorted five-round tasks, failing closed when source identities are absent."""
+    selected = [cell for cell in config.cells if not cohorts or cell.cohort in cohorts]
+    tasks: list[CellTask] = []
+    for cell in sorted(selected, key=lambda value: (value.cohort, value.cell_id)):
+        if len(cell.rounds) != 5:
+            raise ValueError("every CellTask must own exactly five rounds")
+        # This snapshots paths only; it deliberately performs no target-pixel I/O.
+        # The QC gate in ``run_cell_task`` remains ahead of every target load.
+        from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
+        from cyclic_stability.provenance import channel_tiff_paths
+
+        identities: list[FileIdentity] = []
+        for round_spec in sorted(
+            cell.rounds, key=lambda value: value.acquisition_round
+        ):
+            identities.append(FileIdentity.from_path(round_spec.nd2_path))
+            identities.extend(
+                FileIdentity.from_path(path)
+                for _, path in channel_tiff_paths(round_spec)
+            )
+            artifacts = resolve_round_artifacts(round_spec)
+            identities.extend(
+                FileIdentity.from_path(path)
+                for path in (
+                    artifacts.registered_dapi,
+                    artifacts.registered_tubulin,
+                    artifacts.registered_target,
+                    artifacts.affine,
+                    artifacts.warp,
+                    artifacts.pre_metrics,
+                    artifacts.linear_metrics,
+                    artifacts.nonlinear_metrics,
+                    artifacts.chunk_manifest,
+                )
+                if path is not None
+            )
+        tasks.append(
+            CellTask(
+                cell,
+                config,
+                config.config_digest,
+                tuple(identities),
+                default_marker_analyzer,
+            )
+        )
+    return tuple(tasks)
+
+
+__all__ = [
+    "CYEXM_PIN",
+    "CellTask",
+    "TaskOutput",
+    "TaskRecord",
+    "build_tasks",
+    "configure_native_threads",
+    "default_marker_analyzer",
+    "run_cell_task",
+]

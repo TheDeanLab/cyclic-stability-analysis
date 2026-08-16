@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 from cyclic_stability.images import BackgroundSummary
 from cyclic_stability.lysosome import DetectionSet, LysosomeObject
-from cyclic_stability.models import NuclearConfig, RoundSpec
+from cyclic_stability.models import CellSpec, NuclearConfig, RoundSpec
+from cyclic_stability.task import CellTask, TaskOutput
 from cyclic_stability.units import theoretical_resolution
-from cyexm.registration.artifacts import ArtifactStore, StageRequest
+from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
 from cyexm.spatial import ImageGeometry
 from numpy.typing import NDArray
 
@@ -34,6 +36,66 @@ CORRESPONDENCE_COLUMNS = (
     "workflow_dataset_id",
     "identity_method",
 )
+
+
+def _fake_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
+    """Picklable non-scientific analyzer used to exercise spawned task workers."""
+    del output_dir
+    return TaskOutput(
+        tables={
+            "summary": (
+                {
+                    "cohort": task.cell.cohort,
+                    "cell_id": task.cell.cell_id,
+                    "metric": "synthetic",
+                    "value": "1",
+                },
+            )
+        }
+    )
+
+
+def cell_task(tmp_path: Path, cell_id: str = "Cell1") -> CellTask:
+    """Return a complete fake task with real, immutable source identities."""
+    inputs = tmp_path / "inputs" / cell_id
+    inputs.mkdir(parents=True, exist_ok=True)
+    identities = []
+    for round_number in range(1, 6):
+        path = inputs / f"round-{round_number}.bin"
+        path.write_bytes(f"{cell_id}-{round_number}".encode())
+        identities.append(FileIdentity.from_path(path))
+    rounds = tuple(replace(item, cell_id=cell_id) for item in synthetic_round_specs())
+    cell = CellSpec("golgi", cell_id, rounds)
+    return CellTask(
+        cell=cell,
+        config=None,
+        config_digest="synthetic-config-v1",
+        input_identities=tuple(identities),
+        analyzer=_fake_marker_analyzer,
+        software_identity="synthetic-software-v1",
+    )
+
+
+def synthetic_tasks(tmp_path: Path) -> tuple[CellTask, ...]:
+    """Return independently owned fake tasks for process-equivalence coverage."""
+    return (cell_task(tmp_path, "Cell2"), cell_task(tmp_path, "Cell1"))
+
+
+def profile(mode: str, max_workers: int = 1):
+    """Return a small deterministic execution profile for a supported local mode."""
+    from cyclic_stability.models import ExecutionProfile
+
+    return ExecutionProfile(mode, max_workers, 1, Path("/tmp/cyclic-stability-scratch"))
+
+
+def normalized_table_bytes(record) -> bytes:
+    """Read the deterministic compact task table without operational timestamps."""
+    return record.compact_table.read_bytes()
+
+
+def different_identity() -> FileIdentity:
+    """Return a valid immutable identity unlike a synthetic task input identity."""
+    return FileIdentity.from_path(Path(__file__))
 
 
 ANALYSIS_YAML = """\
