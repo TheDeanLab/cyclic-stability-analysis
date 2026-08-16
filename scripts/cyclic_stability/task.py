@@ -53,6 +53,14 @@ TaskAnalyzer = Callable[["CellTask", Path], TaskOutput]
 
 
 @dataclass(frozen=True, slots=True)
+class PreflightSnapshot:
+    """Picklable validated source/provenance state consumed by one task attempt."""
+
+    rounds: tuple[object, ...]
+    input_identities: tuple[FileIdentity, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CellTask:
     """One exact cohort/cell task owning all five acquisition rounds."""
 
@@ -65,6 +73,7 @@ class CellTask:
     native_threads: int = 1
     force: bool = False
     scratch_root: Path | None = None
+    preflight: PreflightSnapshot | None = None
 
     @property
     def key(self) -> str:
@@ -254,7 +263,7 @@ def _read_reusable(task: CellTask, complete: Path) -> TaskRecord | None:
                 return None
             path = (attempt_dir / relative).resolve(strict=True)
             if (
-                path.parent != attempt_dir
+                attempt_dir not in path.parents
                 or path.is_symlink()
                 or not stat.S_ISREG(path.stat().st_mode)
             ):
@@ -263,8 +272,9 @@ def _read_reusable(task: CellTask, complete: Path) -> TaskRecord | None:
             expected.append(FileIdentity.from_dict(entry["identity"]))
         actual_relative = {
             path.relative_to(attempt_dir).as_posix()
-            for path in attempt_dir.iterdir()
-            if path.name not in {"record.json", "output-manifest.json"}
+            for path in attempt_dir.rglob("*")
+            if path.relative_to(attempt_dir).as_posix()
+            not in {"record.json", "output-manifest.json"}
             and not path.is_symlink()
             and stat.S_ISREG(path.stat().st_mode)
         }
@@ -311,6 +321,30 @@ def _csv_table(path: Path, rows: tuple[Mapping[str, object], ...]) -> None:
         os.fsync(handle.fileno())
 
 
+def _validate_output(path: Path) -> None:
+    """Reopen staged output content before immutable publication."""
+    if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+        raise ValueError(f"output is not a nonempty regular file: {path.name}")
+    if path.suffix == ".csv":
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            if not header or any(len(row) != len(header) for row in reader):
+                raise ValueError(f"invalid CSV schema: {path.name}")
+    elif path.suffix == ".json":
+        json.loads(path.read_text(encoding="utf-8"))
+    elif path.suffix == ".npz":
+        import numpy as np
+
+        with np.load(path, allow_pickle=False) as archive:
+            for value in archive.values():
+                _ = value.shape
+    elif path.suffix in {".png", ".tif", ".tiff", ".pdf", ".svg"}:
+        return
+    else:
+        raise ValueError(f"unrecognized output diagnostic type: {path.name}")
+
+
 def _directory_size(path: Path) -> int:
     if not path.exists():
         return 0
@@ -352,12 +386,49 @@ def _qc_gate(task: CellTask) -> None:
         )
 
 
+def _preflight_task(task: CellTask) -> CellTask:
+    """Validate selected source/Cy-ExM evidence once before reuse or target analysis."""
+    if task.config is None:
+        return task
+    _qc_gate(task)
+    from cyclic_stability.cyexm_artifacts import validate_cell_inputs
+    from cyclic_stability.provenance import channel_tiff_paths
+
+    report = validate_cell_inputs(task.cell)
+    identities: list[FileIdentity] = []
+    for round_spec, artifacts in zip(task.cell.rounds, report.rounds, strict=True):
+        identities.append(FileIdentity.from_path(round_spec.nd2_path))
+        identities.extend(
+            FileIdentity.from_path(path) for _, path in channel_tiff_paths(round_spec)
+        )
+        identities.extend(
+            FileIdentity.from_path(path)
+            for path in (
+                artifacts.registered_dapi,
+                artifacts.registered_tubulin,
+                artifacts.registered_target,
+                artifacts.affine,
+                artifacts.warp,
+                artifacts.pre_metrics,
+                artifacts.linear_metrics,
+                artifacts.nonlinear_metrics,
+                artifacts.chunk_manifest,
+            )
+            if path is not None
+        )
+    snapshot = PreflightSnapshot(report.rounds, tuple(identities))
+    return replace(
+        task,
+        input_identities=(*task.input_identities, *snapshot.input_identities),
+        preflight=snapshot,
+    )
+
+
 def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     """Compose the existing provenance, marker, and QC analyzers for one cell."""
     _qc_gate(task)  # Must precede any analyzer import or target-volume opening.
     if task.config is None:
         raise ValueError("production marker analysis requires an AnalysisConfig")
-    from cyclic_stability.cyexm_artifacts import validate_cell_inputs
     from cyclic_stability.golgi import analyze_golgi_cell
     from cyclic_stability.images import load_volume
     from cyclic_stability.lysosome import analyze_lamp1_cell
@@ -367,9 +438,9 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     from cyclic_stability.registration_qc import analyze_registration_qc
     from cyclic_stability.signal import measure_signal, raw_structure_roi
 
-    # Exact ND2/TIFF and completion provenance are validated before target analysis.
-    validated = validate_cell_inputs(task.cell)
-    artifacts = validated.rounds
+    if task.preflight is None:
+        raise ValueError("production task lacks validated preflight snapshot")
+    artifacts = task.preflight.rounds
     qc = analyze_registration_qc(task.cell, artifacts, output_dir / "target-blind-qc")
     analyzer = {
         "golgi": analyze_golgi_cell,
@@ -422,6 +493,7 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
 def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
     """Run one immutable attempt or return an exactly matching complete attempt."""
     configure_native_threads(task.native_threads)
+    task = _preflight_task(task)
     run_root = run_dir.resolve()
     tasks_root = run_root / "tasks"
     tasks_root.mkdir(parents=True, exist_ok=True)
@@ -494,6 +566,18 @@ def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
             for path in output_paths
         ):
             raise ValueError("analyzer did not produce valid task outputs")
+        manifest_paths = tuple(
+            sorted(
+                (
+                    path
+                    for path in attempt_dir.rglob("*")
+                    if path.is_file() and not path.is_symlink()
+                ),
+                key=lambda path: path.relative_to(attempt_dir).as_posix(),
+            )
+        )
+        for path in manifest_paths:
+            _validate_output(path)
         after = process.io_counters()
         stop.set()
         sampler.join()
@@ -506,7 +590,7 @@ def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
             task.config_digest,
             task.input_identities,
             task.software_identity,
-            tuple(FileIdentity.from_path(path) for path in output_paths),
+            tuple(FileIdentity.from_path(path) for path in manifest_paths),
             "complete",
             started,
             time.time(),
@@ -522,7 +606,7 @@ def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
                     "identity": identity.to_dict(),
                 }
                 for path, identity in zip(
-                    output_paths, record.output_identities, strict=True
+                    manifest_paths, record.output_identities, strict=True
                 )
             ]
         }
@@ -600,7 +684,6 @@ def build_tasks(
             raise ValueError("every CellTask must own exactly five rounds")
         # This snapshots paths only; it deliberately performs no target-pixel I/O.
         # The QC gate in ``run_cell_task`` remains ahead of every target load.
-        from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
         from cyclic_stability.provenance import channel_tiff_paths
 
         identities: list[FileIdentity] = []
@@ -611,22 +694,6 @@ def build_tasks(
             identities.extend(
                 FileIdentity.from_path(path)
                 for _, path in channel_tiff_paths(round_spec)
-            )
-            artifacts = resolve_round_artifacts(round_spec)
-            identities.extend(
-                FileIdentity.from_path(path)
-                for path in (
-                    artifacts.registered_dapi,
-                    artifacts.registered_tubulin,
-                    artifacts.registered_target,
-                    artifacts.affine,
-                    artifacts.warp,
-                    artifacts.pre_metrics,
-                    artifacts.linear_metrics,
-                    artifacts.nonlinear_metrics,
-                    artifacts.chunk_manifest,
-                )
-                if path is not None
             )
         tasks.append(
             CellTask(

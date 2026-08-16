@@ -84,3 +84,12 @@ def test_shrunk_record_cannot_hide_a_deleted_required_output(tmp_path: Path) -> 
     second = run_cell_task(task, tmp_path)
     assert second.attempt_id != first.attempt_id
     assert second.reused is False
+
+
+def test_extra_nested_output_invalidates_reuse(tmp_path: Path) -> None:
+    task = cell_task(tmp_path)
+    first = run_cell_task(task, tmp_path)
+    extra = first.attempt_dir / "diagnostics" / "injected.json"
+    extra.write_text("{}\n", encoding="utf-8")
+    second = run_cell_task(task, tmp_path)
+    assert second.attempt_id != first.attempt_id

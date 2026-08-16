@@ -40,7 +40,9 @@ CORRESPONDENCE_COLUMNS = (
 
 def _fake_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     """Picklable non-scientific analyzer used to exercise spawned task workers."""
-    del output_dir
+    nested = output_dir / "diagnostics" / "provenance.json"
+    nested.parent.mkdir(parents=True, exist_ok=True)
+    nested.write_text('{"synthetic":true}\n', encoding="utf-8")
     return TaskOutput(
         tables={
             "summary": (
@@ -52,7 +54,8 @@ def _fake_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
                 },
             ),
             "provenance": ({"identity": "synthetic"},),
-        }
+        },
+        diagnostics=(nested,),
     )
 
 
