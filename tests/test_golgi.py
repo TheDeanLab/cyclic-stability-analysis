@@ -31,6 +31,13 @@ from synthetic import (
 )
 
 
+def _full_support(rounds: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
+    """Declare intentional all-valid fixed-grid support for synthetic arrays only."""
+    return {
+        number: np.ones(image.shape, dtype=bool) for number, image in rounds.items()
+    }
+
+
 def test_gradient_similarity_is_robust_to_global_intensity_scaling(
     analysis_config,
 ) -> None:
@@ -61,6 +68,70 @@ def test_gradient_similarity_retains_strongly_downscaled_signal_with_offset(
     assert min(row.correlation for row in rows) > 0.99
 
 
+def test_support_aware_preprocessing_ignores_invalid_region_values(
+    analysis_config,
+) -> None:
+    """A huge padded value must not change valid-region background, masks, or gradients."""
+    reference = synthetic_golgi()
+    moving = reference.copy()
+    valid = np.ones(reference.shape, dtype=bool)
+    valid[:, :, :24] = False
+    roi = synthetic_perinuclear_roi() & valid
+    baseline = multiscale_gradient_similarity(
+        reference,
+        moving,
+        roi,
+        analysis_config.voxel_spacing_xyz_um,
+        (0.558,),
+        validity_mask=valid,
+    )
+    moving[:, :, :24] = 1e12
+    changed = multiscale_gradient_similarity(
+        reference,
+        moving,
+        roi,
+        analysis_config.voxel_spacing_xyz_um,
+        (0.558,),
+        validity_mask=valid,
+    )
+    assert changed == baseline
+    rounds = {2: reference, 3: reference.copy()}
+    validity_by_round = {2: valid, 3: valid}
+    baseline_result = analyze_golgi_arrays(
+        rounds,
+        synthetic_dapi_rounds(),
+        analysis_config,
+        validity_masks=validity_by_round,
+    )
+    rounds[3][:, :, :24] = 1e12
+    changed_result = analyze_golgi_arrays(
+        rounds,
+        synthetic_dapi_rounds(),
+        analysis_config,
+        validity_masks=validity_by_round,
+    )
+    assert [row.endpoint for row in changed_result.ensemble_rows] == [
+        row.endpoint for row in baseline_result.ensemble_rows
+    ]
+    assert np.allclose(
+        [row.value for row in changed_result.ensemble_rows],
+        [row.value for row in baseline_result.ensemble_rows],
+        equal_nan=True,
+    )
+    assert np.allclose(
+        [row.value for row in changed_result.summary_rows],
+        [row.value for row in baseline_result.summary_rows],
+        equal_nan=True,
+    )
+
+
+def test_array_kernel_requires_explicit_validity_contract(analysis_config) -> None:
+    """Three positional arrays do not prove that every fixed-grid voxel is valid."""
+    rounds = {2: synthetic_golgi(), 3: synthetic_golgi()}
+    with pytest.raises(TypeError, match="validity_masks"):
+        analyze_golgi_arrays(rounds, synthetic_dapi_rounds(), analysis_config)
+
+
 def test_fragmentation_change_is_reported_for_every_frozen_member(
     analysis_config,
 ) -> None:
@@ -69,6 +140,7 @@ def test_fragmentation_change_is_reported_for_every_frozen_member(
         {2: synthetic_golgi(components=1), 3: synthetic_golgi(components=4)},
         synthetic_dapi_rounds(),
         analysis_config,
+        validity_masks=_full_support({2: synthetic_golgi(), 3: synthetic_golgi()}),
     )
     counts = [
         row.value
@@ -130,6 +202,7 @@ def test_round_two_is_reference_regardless_of_mapping_order(analysis_config) -> 
         {3: moving, 2: reference},
         {3: synthetic_dapi_rounds()[3], 2: synthetic_dapi_rounds()[2]},
         analysis_config,
+        validity_masks=_full_support({2: reference, 3: moving}),
     )
     round_two = [
         row.value
@@ -175,6 +248,7 @@ def test_all_empty_members_keep_every_predeclared_summary_endpoint(
         {2: synthetic_golgi(), 3: synthetic_golgi()},
         synthetic_dapi_rounds(),
         empty_config,
+        validity_masks=_full_support({2: synthetic_golgi(), 3: synthetic_golgi()}),
     )
     summaries = {
         row.endpoint: row.value
@@ -211,6 +285,7 @@ def test_ensemble_rows_preserve_all_coordinates_and_endpoints(analysis_config) -
         {2: synthetic_golgi(), 3: synthetic_golgi()},
         synthetic_dapi_rounds(),
         analysis_config,
+        validity_masks=_full_support({2: synthetic_golgi(), 3: synthetic_golgi()}),
     )
     members = len(analysis_config.ensembles.gaussian_sigma_um) * len(
         analysis_config.ensembles.threshold_sbr
@@ -236,24 +311,35 @@ def test_array_kernel_rejects_missing_round_shape_and_validity_mismatch(
     """A mismatched or absent common-support mask invalidates fixed-grid comparison."""
     dapi = synthetic_dapi_rounds()
     with pytest.raises(ValueError, match="round 2"):
-        analyze_golgi_arrays({3: synthetic_golgi()}, {3: dapi[3]}, analysis_config)
+        analyze_golgi_arrays(
+            {3: synthetic_golgi()},
+            {3: dapi[3]},
+            analysis_config,
+            validity_masks=_full_support({3: synthetic_golgi()}),
+        )
     with pytest.raises(ValueError, match="geometry"):
         analyze_golgi_arrays(
-            {2: synthetic_golgi(), 3: np.ones((9, 9, 9))}, dapi, analysis_config
+            {2: synthetic_golgi(), 3: np.ones((9, 9, 9))},
+            dapi,
+            analysis_config,
+            validity_masks=_full_support({2: synthetic_golgi(), 3: np.ones((9, 9, 9))}),
         )
     with pytest.raises(ValueError, match="validity"):
         analyze_golgi_arrays(
             {2: synthetic_golgi(), 3: synthetic_golgi()},
             dapi,
             analysis_config,
-            {2: np.ones((9, 9, 9), dtype=bool), 3: np.ones((9, 9, 9), dtype=bool)},
+            validity_masks={
+                2: np.ones((9, 9, 9), dtype=bool),
+                3: np.ones((9, 9, 9), dtype=bool),
+            },
         )
 
 
 def test_cell_entry_requires_explicit_common_support_and_publishes_overlays(
     analysis_config, tmp_path
 ) -> None:
-    """Production cell I/O must not silently replace transform support with all true."""
+    """Production API owns support reconstruction and retains its four-argument contract."""
     round_two = next(
         round_spec
         for round_spec in analysis_config.cells[0].rounds
@@ -279,35 +365,14 @@ def test_cell_entry_requires_explicit_common_support_and_publishes_overlays(
         None,
         (),
     )
-    with pytest.raises(ValueError, match="transform-validity"):
-        analyze_golgi_cell(cell, (artifact,), analysis_config, tmp_path / "out")
-    result = analyze_golgi_cell(
-        cell,
-        (artifact,),
-        analysis_config,
-        tmp_path / "out",
-        {2: np.ones(synthetic_golgi().shape, dtype=bool)},
-    )
-    overlay = tmp_path / "out" / "golgi-registered-overlays.npz"
-    with np.load(overlay) as contents:
-        assert {
-            "consensus_nuclear_mask_zyx",
-            "fixed_perinuclear_roi_zyx",
-            "round_2_target_zyx",
-            "round_2_sigma_0.279_sbr_3_threshold_mask_zyx",
-        } <= set(contents.files)
-    assert (tmp_path / "out" / "golgi-overlay-round-2.png").is_file()
-    assert result.cell_id == "SyntheticCell"
-    stale = tmp_path / "out" / "stale.txt"
-    stale.write_text("old diagnostic", encoding="utf-8")
-    analyze_golgi_cell(
-        cell,
-        (artifact,),
-        analysis_config,
-        tmp_path / "out",
-        {2: np.ones(synthetic_golgi().shape, dtype=bool)},
-    )
-    assert not stale.exists()
+    with pytest.raises(TypeError):
+        analyze_golgi_cell(
+            cell,
+            (artifact,),
+            analysis_config,
+            tmp_path / "out",
+            {2: np.ones(synthetic_golgi().shape, dtype=bool)},
+        )
 
 
 def test_atomic_golgi_diagnostic_publisher_restores_previous_tree_on_failure(

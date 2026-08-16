@@ -91,3 +91,24 @@ provenance and QC boundary.
 - Nuclear distances are documented and characterized as physical XYZ voxel-center to
   nearest sampled mesh-vertex distances, an anisotropy-preserving approximation
   rather than an overclaimed exact point-to-triangle surface distance.
+
+---
+
+## Fix round 2/5 — autonomous provenance-bound validity and support-aware kernels
+
+- The production cell entry is again exactly four positional arguments. For moving
+  rounds it obtains the native target path from the validated registered-target
+  completion request, verifies that immutable input identity, applies the validated
+  persisted crop when present, and transforms a native all-ones image onto the
+  registered round-2 grid via ANTs affine-before-warp nearest-neighbor application.
+  Reference support is exactly its fixed grid. Transform-valid masks, crop/source/
+  transform identities, and a deterministic validity digest are retained in result
+  input identities; arbitrary caller masks are no longer accepted by production.
+- `RoundArtifacts` now retains the audited native target and moving-crop evidence
+  when a production channel-transform completion record supplies it. Synthetic
+  records without that exact provenance remain `None`, causing production support
+  reconstruction to fail rather than invent evidence.
+- Array analysis now requires an explicit keyword validity mapping. Support-aware
+  robust background, normalized Gaussian convolution, threshold masks, and gradient
+  magnitudes exclude invalid regions before preprocessing. A regression changing
+  only invalid support to `1e12` leaves correlations unchanged.

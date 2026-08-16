@@ -37,6 +37,8 @@ class RoundArtifacts:
     nonlinear_metrics: Path | None
     chunk_manifest: Path | None
     completion_records: tuple[CompletionRecord, ...]
+    native_target: Path | None = None
+    moving_crop: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +112,8 @@ def resolve_round_artifacts(
     linear_metrics: Path | None = None
     nonlinear_metrics: Path | None = None
     chunk_manifest: Path | None = None
+    native_target: Path | None = None
+    moving_crop: Path | None = None
     if round_spec.acquisition_round != 2:
         registration = RegistrationPaths.for_round(
             round_layout.registration, round_spec.workflow_round
@@ -135,6 +139,25 @@ def resolve_round_artifacts(
             )
         )
     records = tuple(validate_completed_artifact(path) for path in required)
+    target_record = records[2]
+    if (
+        target_record.request.stage == "channel-transform-v1"
+        and len(target_record.request.inputs) == 4
+    ):
+        candidate = Path(target_record.request.inputs[1].path)
+        if (
+            candidate.is_file()
+            and FileIdentity.from_path(candidate) == target_record.request.inputs[1]
+        ):
+            native_target = candidate
+    if round_spec.acquisition_round != 2:
+        crop_candidate = registration.moving_crop
+        if (
+            crop_candidate.is_file()
+            and ArtifactStore().record_path(crop_candidate).is_file()
+        ):
+            records = (*records, validate_completed_artifact(crop_candidate))
+            moving_crop = crop_candidate
     return RoundArtifacts(
         acquisition_round=acquisition,
         workflow_round=round_spec.workflow_round,
@@ -149,6 +172,8 @@ def resolve_round_artifacts(
         nonlinear_metrics=nonlinear_metrics,
         chunk_manifest=chunk_manifest,
         completion_records=records,
+        native_target=native_target,
+        moving_crop=moving_crop,
     )
 
 

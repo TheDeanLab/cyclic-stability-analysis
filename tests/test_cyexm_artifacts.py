@@ -91,6 +91,8 @@ def test_golgi_reference_resolves_acquisition_round_two_from_workflow_round_one(
     assert artifacts.workflow_round == 1
     assert artifacts.registered_target.name == "round_2_647_golgi.tif"
     assert artifacts.affine is None
+    assert artifacts.native_target is None
+    assert artifacts.moving_crop is None
     assert (
         artifacts.workflow_output_root
         == golgi_round_two.execution_profile.parent / "workflow-root"

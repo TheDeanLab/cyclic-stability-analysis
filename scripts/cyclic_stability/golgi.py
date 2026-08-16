@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
+from cyexm.registration.artifacts import FileIdentity
+from cyexm.registration.backend import AntsRegistrationBackend
+from cyexm.registration.crop import read_bounds
+from cyexm.runtime import NativeThreadConfig
 from numpy.typing import NDArray
 from scipy.ndimage import distance_transform_edt, gaussian_filter, label
 from scipy.spatial import cKDTree
 from skimage.measure import mesh_surface_area
 
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
-from cyclic_stability.images import load_volume, robust_background
+from cyclic_stability.images import BackgroundSummary, load_volume, robust_background
 from cyclic_stability.models import (
     AnalysisConfig,
     CellSpec,
@@ -27,7 +32,6 @@ from cyclic_stability.morphology import (
     MaskMember,
     gaussian_sigma_zyx,
     resolution_surface_metrics,
-    threshold_ensemble,
     validated_binary_mask,
 )
 from cyclic_stability.nuclear import (
@@ -114,16 +118,43 @@ def _spacing(config: AnalysisConfig) -> tuple[float, float, float]:
 
 def _gradient_magnitude(
     image: NDArray[np.float64],
+    validity_mask: NDArray[np.bool_],
     spacing_xyz_um: tuple[float, float, float],
     sigma_um: float,
 ) -> NDArray[np.float64]:
     """Background-correct, physically smooth, and differentiate one target volume."""
-    background = robust_background(image)
+    background = _support_background(image, validity_mask)
     corrected = np.clip(image - background.median, 0.0, None)
-    smoothed = gaussian_filter(corrected, gaussian_sigma_zyx(sigma_um, spacing_xyz_um))
+    smoothed = _masked_gaussian(
+        corrected, validity_mask, gaussian_sigma_zyx(sigma_um, spacing_xyz_um)
+    )
     sx, sy, sz = spacing_xyz_um
     gradients = np.gradient(smoothed, sz, sy, sx)
     return np.sqrt(sum(gradient * gradient for gradient in gradients))
+
+
+def _support_background(
+    image: NDArray[np.float64], validity_mask: NDArray[np.bool_]
+) -> BackgroundSummary:
+    """Estimate robust background solely from the common transform-valid support."""
+    return robust_background(np.where(validity_mask, image, 0.0))
+
+
+def _masked_gaussian(
+    image: NDArray[np.float64],
+    validity_mask: NDArray[np.bool_],
+    sigma_zyx: tuple[float, float, float],
+) -> NDArray[np.float64]:
+    """Smooth valid samples with normalized convolution, never padding intensities."""
+    support = validity_mask.astype(np.float64, copy=False)
+    denominator = gaussian_filter(support, sigma_zyx)
+    numerator = gaussian_filter(image * support, sigma_zyx)
+    return np.divide(
+        numerator,
+        denominator,
+        out=np.zeros_like(numerator),
+        where=denominator > np.finfo(np.float64).eps,
+    )
 
 
 def multiscale_gradient_similarity(
@@ -132,6 +163,8 @@ def multiscale_gradient_similarity(
     roi: NDArray[np.bool_],
     spacing_xyz_um: tuple[float, float, float],
     sigma_values_um: tuple[float, ...],
+    *,
+    validity_mask: NDArray[np.bool_] | None = None,
 ) -> tuple[GradientSimilarityRow, ...]:
     """Correlate 3D gradient magnitudes at each frozen physical smoothing scale.
 
@@ -148,11 +181,24 @@ def multiscale_gradient_similarity(
         raise ValueError("gradient similarity ROI is empty")
     if not sigma_values_um:
         raise ValueError("sigma_values_um must be non-empty")
+    valid = (
+        np.ones(fixed.shape, dtype=bool)
+        if validity_mask is None
+        else validated_binary_mask(validity_mask, "validity mask")
+    )
+    if valid.shape != fixed.shape:
+        raise ValueError("validity mask must match reference geometry")
+    if np.any(support & ~valid):
+        raise ValueError("ROI must be contained in the validity mask")
     rows: list[GradientSimilarityRow] = []
     for raw_sigma in sigma_values_um:
         sigma_um = float(raw_sigma)
-        fixed_gradient = _gradient_magnitude(fixed, spacing_xyz_um, sigma_um)[support]
-        moving_gradient = _gradient_magnitude(moved, spacing_xyz_um, sigma_um)[support]
+        fixed_gradient = _gradient_magnitude(fixed, valid, spacing_xyz_um, sigma_um)[
+            support
+        ]
+        moving_gradient = _gradient_magnitude(moved, valid, spacing_xyz_um, sigma_um)[
+            support
+        ]
         if np.ptp(fixed_gradient) == 0.0 or np.ptp(moving_gradient) == 0.0:
             raise ValueError("gradient similarity has zero variance in the fixed ROI")
         correlation = float(np.corrcoef(fixed_gradient, moving_gradient)[0, 1])
@@ -280,19 +326,9 @@ def _perinuclear_roi(
 
 def _common_validity_masks(
     rounds: Mapping[int, NDArray[np.float64]],
-    validity_masks: Mapping[int, NDArray[np.bool_]] | None,
+    validity_masks: Mapping[int, NDArray[np.bool_]],
 ) -> dict[int, NDArray[np.bool_]]:
-    """Validate fixed-grid transform support, defaulting only synthetic arrays to all true.
-
-    The default is deliberately restricted to the array kernel: its caller has
-    supplied already fixed-grid arrays and may use it for controlled same-grid
-    synthetic tests.  The production cell entry never takes this default.
-    """
-    if validity_masks is None:
-        return {
-            round_number: np.ones(image.shape, dtype=bool)
-            for round_number, image in rounds.items()
-        }
+    """Validate explicit fixed-grid transform support for every registered round."""
     if set(validity_masks) != set(rounds):
         raise ValueError("transform validity masks must match registered Golgi rounds")
     result: dict[int, NDArray[np.bool_]] = {}
@@ -306,6 +342,105 @@ def _common_validity_masks(
             )
         result[round_number] = mask
     return result
+
+
+def _support_threshold_ensemble(
+    image: NDArray[np.float64],
+    roi: NDArray[np.bool_],
+    validity_mask: NDArray[np.bool_],
+    config: AnalysisConfig,
+) -> tuple[MaskMember, ...]:
+    """Build the frozen Golgi mask grid using only common-valid source support."""
+    background = _support_background(image, validity_mask)
+    members: list[MaskMember] = []
+    for sigma_um in config.ensembles.gaussian_sigma_um:
+        smoothed = _masked_gaussian(
+            image,
+            validity_mask,
+            gaussian_sigma_zyx(sigma_um, config.voxel_spacing_xyz_um),
+        )
+        for threshold_sbr in config.ensembles.threshold_sbr:
+            mask = (
+                smoothed > background.median + threshold_sbr * background.scale
+            ) & roi
+            mask.setflags(write=False)
+            members.append(
+                MaskMember(
+                    mask,
+                    sigma_um,
+                    threshold_sbr,
+                    background,
+                    config.voxel_spacing_xyz_um,
+                    "nonempty" if np.any(mask) else "empty",
+                )
+            )
+    return tuple(members)
+
+
+def _artifact_validity_masks(
+    artifacts: Mapping[int, RoundArtifacts],
+    config: AnalysisConfig,
+) -> tuple[dict[int, NDArray[np.bool_]], str, tuple[str, ...]]:
+    """Recreate fixed-grid support from audited native inputs and persisted transforms."""
+    reference_artifact = artifacts[REFERENCE_ROUND]
+    backend = AntsRegistrationBackend(NativeThreadConfig(itk_threads=1, blas_threads=1))
+    fixed = backend.load_image(
+        reference_artifact.registered_dapi, config.voxel_spacing_xyz_um
+    )
+    fixed_shape = tuple(np.asarray(backend.to_array(fixed)).shape)
+    masks: dict[int, NDArray[np.bool_]] = {
+        REFERENCE_ROUND: np.ones(fixed_shape, dtype=bool)
+    }
+    identities: list[str] = [str(reference_artifact.registered_dapi)]
+    for round_number, artifact in artifacts.items():
+        if round_number == REFERENCE_ROUND:
+            continue
+        if (
+            artifact.native_target is None
+            or artifact.affine is None
+            or artifact.warp is None
+        ):
+            raise ValueError(
+                "validated moving artifact lacks exact native target or transform chain"
+            )
+        source = artifact.native_target
+        source_identity = FileIdentity.from_path(source)
+        target_record = artifact.completion_records[2]
+        if (
+            len(target_record.request.inputs) != 4
+            or source_identity != target_record.request.inputs[1]
+        ):
+            raise ValueError(
+                "native target identity no longer matches registered channel provenance"
+            )
+        identities.extend((str(source), str(artifact.affine), str(artifact.warp)))
+        moving = backend.load_image(source, config.voxel_spacing_xyz_um)
+        if artifact.moving_crop is not None:
+            bounds = read_bounds(artifact.moving_crop, backend.geometry(moving).shape)
+            moving = backend.crop_image(moving, bounds)
+            identities.append(str(artifact.moving_crop))
+        ones = backend.from_array(
+            np.ones(
+                tuple(np.asarray(backend.to_array(moving)).shape), dtype=np.float32
+            ),
+            reference=moving,
+        )
+        transformed = backend.apply_transform_chain(
+            fixed=fixed,
+            moving=ones,
+            affine_path=artifact.affine,
+            warp_path=artifact.warp,
+            interpolation="nearestNeighbor",
+        )
+        mask = np.asarray(backend.to_array(transformed)) >= 0.5
+        if mask.shape != fixed_shape:
+            raise ValueError(
+                "transformed validity mask does not match reference geometry"
+            )
+        masks[round_number] = mask
+        identities.append(str(source_identity))
+    digest = hashlib.sha256("\n".join(sorted(identities)).encode()).hexdigest()
+    return masks, digest, tuple(identities)
 
 
 def _ensemble_row(
@@ -378,7 +513,8 @@ def analyze_golgi_arrays(
     golgi_rounds: Mapping[int, NDArray],
     dapi_rounds: Mapping[int, NDArray],
     config: AnalysisConfig,
-    validity_masks: Mapping[int, NDArray[np.bool_]] | None = None,
+    *,
+    validity_masks: Mapping[int, NDArray[np.bool_]],
 ) -> MarkerResult:
     """Analyze one cell's registered Golgi arrays with round 2 fixed as reference.
 
@@ -396,19 +532,21 @@ def analyze_golgi_arrays(
         int(number): _volume(image, f"Golgi round {number}")
         for number, image in golgi_rounds.items()
     }
+    if len({image.shape for image in rounds.values()}) != 1:
+        raise ValueError("registered Golgi rounds must share fixed-grid geometry")
     common_validity = _common_validity_masks(rounds, validity_masks)
+    common_support = np.logical_and.reduce(tuple(common_validity.values()))
     surface = consensus_nuclear_surface(
         dapi_rounds, config.voxel_spacing_xyz_um, config.nuclear
     )
     roi = _perinuclear_roi(surface.mask_zyx, common_validity, config)
     reference = rounds[REFERENCE_ROUND]
     ensemble_by_round = {
-        round_number: threshold_ensemble(
+        round_number: _support_threshold_ensemble(
             image,
             roi,
-            config.ensembles.gaussian_sigma_um,
-            config.ensembles.threshold_sbr,
-            config.voxel_spacing_xyz_um,
+            common_support,
+            config,
         )
         for round_number, image in rounds.items()
     }
@@ -430,6 +568,7 @@ def analyze_golgi_arrays(
             roi,
             config.voxel_spacing_xyz_um,
             config.ensembles.gaussian_sigma_um,
+            validity_mask=common_support,
         )
         comparison_set = (
             "round-1-exposure-sensitivity" if round_number == 1 else "matched-settings"
@@ -633,15 +772,12 @@ def analyze_golgi_cell(
     artifacts: tuple[RoundArtifacts, ...],
     config: AnalysisConfig,
     output_dir: Path,
-    validity_masks: Mapping[int, NDArray[np.bool_]] | None = None,
 ) -> MarkerResult:
     """Load validated registered Golgi inputs and publish one cell's diagnostics.
 
-    ``RoundArtifacts`` currently identifies registered fixed-grid outputs and their
-    transform files but does not retain the moving native source geometry required
-    to transform a native all-ones support image.  Production callers must therefore
-    pass fixed-grid validity masks generated from the validated affine/warp chain;
-    the entry point fails closed rather than treating finite target padding as valid.
+    The entry point reconstructs target-independent support from each audited native
+    target input and its persisted affine-before-warp chain using nearest-neighbor
+    interpolation. It never accepts caller-supplied target-support masks.
     """
     if cell.cohort != "golgi":
         raise ValueError("Golgi analysis requires a golgi CellSpec")
@@ -657,27 +793,22 @@ def analyze_golgi_cell(
     golgi = {
         number: load_volume(by_round[number].registered_target) for number in accepted
     }
-    if validity_masks is None:
-        raise ValueError(
-            "production Golgi analysis requires explicit transform-validity masks"
-        )
-    if set(validity_masks) != set(accepted):
-        raise ValueError("transform validity masks must match accepted Golgi rounds")
-    common_validity = _common_validity_masks(golgi, validity_masks)
+    common_validity, validity_digest, validity_identities = _artifact_validity_masks(
+        {number: by_round[number] for number in accepted}, config
+    )
     result = _rebind_cell(
-        analyze_golgi_arrays(golgi, dapi, config, common_validity), cell
+        analyze_golgi_arrays(golgi, dapi, config, validity_masks=common_validity), cell
     )
     surface = consensus_nuclear_surface(
         dapi, config.voxel_spacing_xyz_um, config.nuclear
     )
     roi = _perinuclear_roi(surface.mask_zyx, common_validity, config)
     threshold_masks = {
-        round_number: threshold_ensemble(
+        round_number: _support_threshold_ensemble(
             image,
             roi,
-            config.ensembles.gaussian_sigma_um,
-            config.ensembles.threshold_sbr,
-            config.voxel_spacing_xyz_um,
+            np.logical_and.reduce(tuple(common_validity.values())),
+            config,
         )
         for round_number, image in golgi.items()
     }
@@ -694,7 +825,9 @@ def analyze_golgi_cell(
                 by_round[number].registered_dapi,
                 by_round[number].registered_target,
             )
-        ),
+        )
+        + validity_identities
+        + (f"validity-mask-sha256:{validity_digest}",),
     )
 
 
