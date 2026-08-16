@@ -128,7 +128,7 @@ provenance and QC boundary.
   voxel spacing, checks recorded fixed geometry, and replays only the persisted
   affine-before-warp chain.
 - The validity provenance payload now includes the complete immutable identities,
-  full request/geometry/parameters, and each final mask's shape and byte digest;
+  full request/geometry/parameters, and each moving final mask's shape and byte digest;
   its canonical digest and payload are included in `MarkerResult.input_identities`.
   A replacement at the same transform path therefore fails identity validation.
 - Gradient sampling uses an explicit one-voxel 26-neighbour erosion of common-valid
@@ -145,3 +145,17 @@ provenance and QC boundary.
   `15 passed`), artifact/config/morphology coverage (`41 passed`), and exact Ruff
   check/format all passed. The runner environment lacks `pytest` in plain `uv run`;
   its repository `scripts/run_tests.py` wrapper supplied the locked test environment.
+
+---
+
+## Fix round 4/5 — reference-support provenance completion
+
+- The round-2 reference mask is now a first-class canonical provenance block tied
+  to the selected fixed registered-target `FileIdentity`. Its explicit semantics are
+  `untransformed-fixed-reference-grid-all-valid-v1`; it records the returned Boolean
+  mask's exact ZYX shape, dtype, contiguous C order, and SHA-256 over its actual
+  contiguous bytes. Moving-round blocks use the same complete mask layout and hash
+  fields, so every returned validity mask has provenance evidence.
+- The producer-replay regression asserts the reference shape/dtype/order/hash and
+  proves that replacing the reference target content changes the canonical validity
+  digest. Focused producer-support tests and exact Ruff/format/diff gates passed.

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -259,6 +261,25 @@ def test_artifact_support_replays_exact_producer_request_and_provenance(
     assert any(digest in identity for identity in identities)
     assert '"pixel_size_xyz_um":[0.1083,0.1083,0.3]' in identities[0]
     assert '"st_mtime_ns"' in identities[0]
+    provenance = json.loads(identities[0].removeprefix("validity-provenance:"))
+    reference_mask = provenance["reference"]["mask"]
+    assert provenance["reference"]["semantics"] == (
+        "untransformed-fixed-reference-grid-all-valid-v1"
+    )
+    assert reference_mask == {
+        "shape_zyx": [5, 5, 5],
+        "dtype": np.dtype(bool).str,
+        "order": "C",
+        "sha256": hashlib.sha256(np.ascontiguousarray(masks[2]).tobytes()).hexdigest(),
+    }
+    assert {entry["acquisition_round"] for entry in provenance["moving"]} == {3}
+    tifffile.imwrite(reference.registered_target, np.zeros((5, 5, 5), dtype=np.uint16))
+    _masks, changed_digest, _identities = _artifact_validity_masks(
+        {2: reference, 3: moving},
+        analysis_config,
+        _backend=_ValidityBackend(fixed, source, request.geometry),
+    )
+    assert changed_digest != digest
 
 
 @pytest.mark.parametrize(

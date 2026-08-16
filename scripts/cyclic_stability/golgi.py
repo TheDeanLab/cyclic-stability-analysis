@@ -417,14 +417,15 @@ def _artifact_validity_masks(
         NativeThreadConfig(itk_threads=1, blas_threads=1)
     )
     fixed_shape = tuple(load_volume(reference_artifact.registered_target).shape)
-    masks: dict[int, NDArray[np.bool_]] = {
-        REFERENCE_ROUND: np.ones(fixed_shape, dtype=bool)
-    }
+    reference_mask = np.ones(fixed_shape, dtype=bool)
+    masks: dict[int, NDArray[np.bool_]] = {REFERENCE_ROUND: reference_mask}
     provenance: dict[str, object] = {
         "reference": {
             "registered_target": FileIdentity.from_path(
                 reference_artifact.registered_target
-            ).to_dict()
+            ).to_dict(),
+            "semantics": "untransformed-fixed-reference-grid-all-valid-v1",
+            "mask": _validity_mask_provenance(reference_mask),
         },
         "moving": [],
     }
@@ -542,11 +543,9 @@ def _artifact_validity_masks(
                 "source": source_identity.to_dict(),
                 "affine": affine_identity.to_dict(),
                 "warp": warp_identity.to_dict(),
+                "semantics": "native-all-ones-affine-before-warp-nearest-neighbor-v1",
                 "mask": {
-                    "shape_zyx": list(mask.shape),
-                    "sha256": hashlib.sha256(
-                        np.ascontiguousarray(mask, dtype=np.uint8).tobytes()
-                    ).hexdigest(),
+                    **_validity_mask_provenance(mask),
                 },
             }
         )
@@ -560,6 +559,17 @@ def _artifact_validity_masks(
             f"validity-provenance-sha256:{digest}",
         ),
     )
+
+
+def _validity_mask_provenance(mask: NDArray[np.bool_]) -> dict[str, object]:
+    """Return canonical bytes-and-layout evidence for one returned validity mask."""
+    contiguous = np.ascontiguousarray(mask)
+    return {
+        "shape_zyx": list(contiguous.shape),
+        "dtype": contiguous.dtype.str,
+        "order": "C",
+        "sha256": hashlib.sha256(contiguous.tobytes()).hexdigest(),
+    }
 
 
 def _ensemble_row(
