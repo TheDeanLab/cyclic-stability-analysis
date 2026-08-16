@@ -21,14 +21,40 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor
+from multiprocessing import get_context
 from pathlib import Path
+from typing import Any, TypeVar
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from cyclic_stability.config import load_analysis_config
-from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
-from cyclic_stability.registration_qc import analyze_registration_qc, publish_qc_outputs
+T = TypeVar("T")
+R = TypeVar("R")
+
+
+def _ordered_process_map(
+    worker: Callable[[T], R], items: tuple[T, ...], *, max_workers: int
+) -> tuple[R, ...]:
+    """Apply one bounded process per item while retaining deterministic order."""
+    if isinstance(max_workers, bool) or max_workers < 1:
+        raise ValueError("max_workers must be a positive integer")
+    if max_workers == 1:
+        return tuple(map(worker, items))
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        mp_context=get_context("spawn"),
+    ) as executor:
+        return tuple(executor.map(worker, items, chunksize=1))
+
+
+def _run_qc_job(job: tuple[Any, tuple[Any, ...], Path]) -> Any:
+    """Analyze one independently publishable marker-cell QC unit."""
+    from cyclic_stability.registration_qc import analyze_registration_qc
+
+    cell, artifacts, output_dir = job
+    return analyze_registration_qc(cell, artifacts, output_dir)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -36,26 +62,36 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--analysis-config", type=Path, required=True)
     parser.add_argument("--correspondence", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--max-workers", type=int, default=1)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     """Validate read-only artifacts and write target-blind QC for every loaded cell."""
     args = _parser().parse_args(argv)
+    from cyexm.runtime import NativeThreadConfig, configure_native_threads
+
+    configure_native_threads(NativeThreadConfig(itk_threads=1, blas_threads=1))
+
+    from cyclic_stability.config import load_analysis_config
+    from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
+    from cyclic_stability.registration_qc import publish_qc_outputs
+
     decisions = args.analysis_config.parent / "qc-decisions.csv"
     config = load_analysis_config(args.analysis_config, args.correspondence, decisions)
     validated = tuple(
         (cell, tuple(resolve_round_artifacts(round_spec) for round_spec in cell.rounds))
         for cell in config.cells
     )
-    results = tuple(
-        analyze_registration_qc(
+    jobs = tuple(
+        (
             cell,
             artifacts,
             args.run_dir / "cells" / cell.cohort / cell.cell_id,
         )
         for cell, artifacts in validated
     )
+    results = _ordered_process_map(_run_qc_job, jobs, max_workers=args.max_workers)
     registration_rows = tuple(
         row for result in results for row in result.registration_rows
     )

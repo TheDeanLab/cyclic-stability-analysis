@@ -61,6 +61,16 @@ class WarpSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class _WarpMeasurements:
+    """Full-grid values shared by whole, seam, and interior summaries."""
+
+    displacement: NDArray[np.float64]
+    normalized: NDArray[np.float64]
+    jacobian: NDArray[np.float64]
+    gradient_norm: NDArray[np.float64]
+
+
+@dataclass(frozen=True, slots=True)
 class RegistrationQcResult:
     """Target-blind QC records, overlays, and explicitly undecided moving rounds."""
 
@@ -165,12 +175,11 @@ def _validate_warp(
     return warp
 
 
-def _summarize_warp(
+def _measure_warp(
     warp_zyx_xyz: NDArray[np.float64],
     spacing_xyz_um: tuple[float, float, float],
     resolution: ResolutionReference,
-    mask: NDArray[np.bool_] | None = None,
-) -> WarpSummary:
+) -> _WarpMeasurements:
     warp = _validate_warp(warp_zyx_xyz, spacing_xyz_um)
     gradient = deformation_gradient(warp, spacing_xyz_um)
     displacement = np.linalg.norm(warp, axis=-1)
@@ -181,23 +190,49 @@ def _summarize_warp(
     )
     jacobian = np.linalg.det(gradient)
     gradient_norm = np.linalg.norm(gradient - np.eye(3), ord="fro", axis=(-2, -1))
-    selected = np.ones(warp.shape[:3], dtype=bool) if mask is None else mask
-    if selected.shape != warp.shape[:3] or not selected.any():
+    return _WarpMeasurements(displacement, normalized, jacobian, gradient_norm)
+
+
+def _summarize_measurements(
+    measurements: _WarpMeasurements,
+    mask: NDArray[np.bool_] | None = None,
+) -> WarpSummary:
+    selected = (
+        np.ones(measurements.displacement.shape, dtype=bool) if mask is None else mask
+    )
+    if selected.shape != measurements.displacement.shape or not selected.any():
         raise ValueError("summary mask must select at least one ZYX voxel")
     values = lambda array: array[selected]
-    nonpositive = int(np.count_nonzero(values(jacobian) <= 0.0))
+    nonpositive = int(np.count_nonzero(values(measurements.jacobian) <= 0.0))
     flags = ("nonpositive-jacobian",) if nonpositive else ()
     return WarpSummary(
-        displacement_p50_um=float(np.percentile(values(displacement), 50)),
-        displacement_p95_um=float(np.percentile(values(displacement), 95)),
-        fraction_over_one_resolution=float(np.mean(values(normalized) > 1.0)),
-        jacobian_p05=float(np.percentile(values(jacobian), 5)),
-        jacobian_p50=float(np.percentile(values(jacobian), 50)),
-        jacobian_p95=float(np.percentile(values(jacobian), 95)),
+        displacement_p50_um=float(np.percentile(values(measurements.displacement), 50)),
+        displacement_p95_um=float(np.percentile(values(measurements.displacement), 95)),
+        fraction_over_one_resolution=float(
+            np.mean(values(measurements.normalized) > 1.0)
+        ),
+        jacobian_p05=float(np.percentile(values(measurements.jacobian), 5)),
+        jacobian_p50=float(np.percentile(values(measurements.jacobian), 50)),
+        jacobian_p95=float(np.percentile(values(measurements.jacobian), 95)),
         jacobian_nonpositive_count=nonpositive,
-        gradient_frobenius_p50=float(np.percentile(values(gradient_norm), 50)),
-        gradient_frobenius_p95=float(np.percentile(values(gradient_norm), 95)),
+        gradient_frobenius_p50=float(
+            np.percentile(values(measurements.gradient_norm), 50)
+        ),
+        gradient_frobenius_p95=float(
+            np.percentile(values(measurements.gradient_norm), 95)
+        ),
         flags=flags,
+    )
+
+
+def _summarize_warp(
+    warp_zyx_xyz: NDArray[np.float64],
+    spacing_xyz_um: tuple[float, float, float],
+    resolution: ResolutionReference,
+    mask: NDArray[np.bool_] | None = None,
+) -> WarpSummary:
+    return _summarize_measurements(
+        _measure_warp(warp_zyx_xyz, spacing_xyz_um, resolution), mask
     )
 
 
@@ -586,7 +621,6 @@ def analyze_registration_qc(
                     warp = np.asarray(
                         backend.to_array(backend.read_warp(warp_path)), dtype=np.float64
                     )
-                    whole = summarize_warp(warp, spacing, resolution)
                 except (OSError, RuntimeError, TypeError, ValueError) as error:
                     raise _HardInvalid(
                         f"unreadable or non-finite warp geometry: {error}"
@@ -602,17 +636,24 @@ def analyze_registration_qc(
                     raise _HardInvalid(
                         f"invalid chunk-manifest evidence: {error}"
                     ) from error
-                seam = (
-                    _summarize_warp(warp, spacing, resolution, seam_mask)
-                    if seam_mask.any()
-                    else None
-                )
                 interior_mask = ~seam_mask
-                interior = (
-                    _summarize_warp(warp, spacing, resolution, interior_mask)
-                    if interior_mask.any()
-                    else None
-                )
+                try:
+                    measurements = _measure_warp(warp, spacing, resolution)
+                    whole = _summarize_measurements(measurements)
+                    seam = (
+                        _summarize_measurements(measurements, seam_mask)
+                        if seam_mask.any()
+                        else None
+                    )
+                    interior = (
+                        _summarize_measurements(measurements, interior_mask)
+                        if interior_mask.any()
+                        else None
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError) as error:
+                    raise _HardInvalid(
+                        f"unreadable or non-finite warp geometry: {error}"
+                    ) from error
                 metrics = {
                     "pre": read_metrics(artifact.pre_metrics),
                     "linear": read_metrics(artifact.linear_metrics),

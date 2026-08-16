@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import runpy
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +23,79 @@ from cyclic_stability.registration_qc import (
 )
 from scipy.linalg import polar
 from scipy.spatial.transform import Rotation
+
+
+def test_qc_process_queue_is_bounded_and_preserves_input_order() -> None:
+    """The cell queue must reject unsafe bounds and return deterministic ordering."""
+    script = Path(__file__).parents[1] / "scripts" / "run_registration_qc.py"
+    namespace = runpy.run_path(str(script), run_name="qc_cli_test")
+
+    assert "_ordered_process_map" in namespace
+    ordered_map = namespace["_ordered_process_map"]
+    assert ordered_map(abs, (-3, -1, -2), max_workers=2) == (3, 1, 2)
+    with pytest.raises(ValueError, match="positive integer"):
+        ordered_map(abs, (-1,), max_workers=0)
+
+
+def test_qc_cli_configures_native_threads_before_scientific_imports(
+    tmp_path: Path,
+) -> None:
+    """The standalone CLI must establish its runtime policy before NumPy/ANTs load."""
+    script = Path(__file__).parents[1] / "scripts" / "run_registration_qc.py"
+    probe = textwrap.dedent(
+        f"""
+        import builtins
+        import os
+        import runpy
+        import sys
+
+        native_variables = (
+            "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS",
+            "OMP_NUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+        )
+        for name in native_variables:
+            os.environ.pop(name, None)
+
+        original_import = builtins.__import__
+        saw_analyzer = False
+
+        def checked_import(name, globals=None, locals=None, fromlist=(), level=0):
+            global saw_analyzer
+            if name == "cyclic_stability.registration_qc":
+                saw_analyzer = True
+                missing = [item for item in native_variables if item not in os.environ]
+                if missing:
+                    raise RuntimeError(f"scientific analyzer imported before {{missing}}")
+            return original_import(name, globals, locals, fromlist, level)
+
+        builtins.__import__ = checked_import
+        sys.argv = [
+            str({str(script)!r}),
+            "--analysis-config", str({str(tmp_path / "missing-analysis.yaml")!r}),
+            "--correspondence", str({str(tmp_path / "missing-correspondence.csv")!r}),
+            "--run-dir", str({str(tmp_path / "unused-output")!r}),
+        ]
+        try:
+            runpy.run_path({str(script)!r}, run_name="__main__")
+        except (FileNotFoundError, ValueError):
+            pass
+        if not saw_analyzer:
+            raise RuntimeError("scientific analyzer was never imported")
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_internal_core_boundary_marks_only_its_16_pixel_neighborhood(
@@ -244,8 +321,21 @@ def test_analyzer_reads_only_blinded_channels_and_writes_metrics_and_stages(
         return np.ones((5, 5, 5), dtype=np.float64)
 
     metric_paths: list[Path] = []
+    gradient_calls = 0
+    real_deformation_gradient = registration_qc.deformation_gradient
+
+    def counted_deformation_gradient(
+        warp: np.ndarray, spacing: tuple[float, float, float]
+    ) -> np.ndarray:
+        nonlocal gradient_calls
+        gradient_calls += 1
+        return real_deformation_gradient(warp, spacing)
+
     monkeypatch.setattr(registration_qc, "AntsRegistrationBackend", Backend)
     monkeypatch.setattr(registration_qc, "_load_overlay_volume", read_volume)
+    monkeypatch.setattr(
+        registration_qc, "deformation_gradient", counted_deformation_gradient
+    )
     monkeypatch.setattr(
         registration_qc,
         "read_metrics",
@@ -258,6 +348,7 @@ def test_analyzer_reads_only_blinded_channels_and_writes_metrics_and_stages(
     assert result.decision_requests[0]["decision"] == ""
     assert result.registration_rows[0]["pre_Correlation"] == 0.5
     assert len(metric_paths) == 3
+    assert gradient_calls == 1
     assert all("FORBIDDEN" not in str(path) for path in read_paths)
     assert all("FORBIDDEN" not in str(path) for path in backend_read_paths)
     assert {path.name.split("-")[2] for path in result.overlay_paths} == {
