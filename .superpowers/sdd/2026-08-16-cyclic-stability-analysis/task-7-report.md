@@ -50,3 +50,30 @@ unavailable: no image-verified LAMP1 cell mappings; scheduled 0 cells
 The resulting `results/lamp-gate/validation/inputs.json` has `status` equal to
 `unavailable`, the explicit no-mapping reason, and `scheduled_cell_count` equal to
 zero.
+
+## Review-fix amendment
+
+The LAMP1 implementation now composes the established consensus nuclear surface
+and producer-attested transform-valid support machinery.  It gates every moving
+round on target-blind QC before opening a target volume, measures all object
+distances to one accepted-DAPI consensus surface, and detects only in the common
+valid support outside that nucleus.
+
+The LoG response is now assembled from per-axis voxel-coordinate second
+derivatives, each normalized by its squared voxel sigma.  This represents the
+scale-normalized physical Laplacian in intensity units and has regression coverage
+across three anisotropic samplings.  Peak duplicate suppression now uses the
+theoretical lateral/lateral/axial resolution reference.
+
+Long-form `objects.csv` and `matches.csv` are atomically published alongside the
+NPZ diagnostic.  They retain stable object/match indices, coordinates, physical
+measurements, comparison type and round identities.  The comparison helper emits
+round-2-relative and adjacent results, including fractions and median lateral,
+axial, and normalized displacement (NaN where no pair exists).
+
+Additional focused coverage verifies missing/excluded QC behavior, producer-support
+intersection and empty-ROI rejection, realistic distinct DAPI/LAMP fixtures,
+atomic stale-output replacement, table schemas/content, and singleton NN handling.
+
+Final review-fix verification: `22 passed` for `tests/test_lysosome.py`; full tests
+completed successfully; exact Ruff check and format checks passed.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import math
 from dataclasses import replace
@@ -15,12 +16,18 @@ from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.lysosome import (
     DetectionSet,
     LysosomeObject,
+    _fixed_lamp_roi,
+    _maxima,
+    _physical_log_response,
+    analyze_lamp1_cell,
     detect_lysosomes,
     eligible_lamp_cells,
     match_lysosomes,
 )
-from cyclic_stability.models import CellSpec, RoundSpec
+from cyclic_stability.models import CellSpec, QcDecision, RoundSpec
 from cyclic_stability.morphology import gaussian_sigma_zyx
+from cyclic_stability.nuclear import NuclearSurface
+from cyclic_stability.units import ResolutionReference
 from synthetic import (
     RESOLUTION,
     SPACING,
@@ -54,7 +61,12 @@ def test_log_detector_recovers_anisotropic_physical_spots() -> None:
     image = synthetic_lamp_spots()
     roi = np.ones(image.shape, dtype=bool)
     detected = detect_lysosomes(
-        image, roi, SPACING, (0.35, 0.70, 1.40), (3.0, 4.0, 5.0)
+        image,
+        roi,
+        SPACING,
+        (0.35, 0.70, 1.40),
+        (3.0, 4.0, 5.0),
+        resolution=RESOLUTION,
     )
     assert len(detected) == 9
     assert [item.object_count for item in detected] == [3] * 9
@@ -69,7 +81,9 @@ def test_duplicate_maxima_across_scales_are_suppressed() -> None:
     """One spot responding at several LoG scales must remain one detected object."""
     image = synthetic_lamp_spots()
     roi = np.ones(image.shape, dtype=bool)
-    detected = detect_lysosomes(image, roi, SPACING, (0.35, 0.70), (3.0,))
+    detected = detect_lysosomes(
+        image, roi, SPACING, (0.35, 0.70), (3.0,), resolution=RESOLUTION
+    )
     assert [item.object_count for item in detected] == [3, 3]
     assert all(
         len({tuple(point) for point in item.coordinates_xyz_um}) == 3
@@ -81,7 +95,12 @@ def test_watershed_objects_have_physical_geometry() -> None:
     """Replacing physical voxel volume or mesh area changes object geometry."""
     image = synthetic_lamp_spots()
     result = detect_lysosomes(
-        image, np.ones(image.shape, dtype=bool), SPACING, (0.70,), (3.0,)
+        image,
+        np.ones(image.shape, dtype=bool),
+        SPACING,
+        (0.70,),
+        (3.0,),
+        resolution=RESOLUTION,
     )[0]
     assert all(object_.volume_um3 > 0.0 for object_ in result.objects)
     assert all(object_.equivalent_diameter_um > 0.0 for object_ in result.objects)
@@ -130,6 +149,68 @@ def test_matching_uses_axial_resolution_separately_from_lateral() -> None:
 
 
 @pytest.mark.parametrize(
+    "spacing", ((0.1, 0.1, 0.3), (0.12, 0.12, 0.24), (0.08, 0.1, 0.36))
+)
+def test_physical_log_response_is_sampling_invariant(
+    spacing: tuple[float, float, float],
+) -> None:
+    """Voxel-coordinate LoG normalization must not change a physical peak response."""
+    sx, sy, sz = spacing
+    z, y, x = np.indices((41, 81, 81), dtype=float)
+    radius_squared = (
+        ((x - 40.0) * sx / 0.70) ** 2
+        + ((y - 40.0) * sy / 0.70) ** 2
+        + ((z - 20.0) * sz / 0.70) ** 2
+    )
+    response = _physical_log_response(
+        100.0 * np.exp(-0.5 * radius_squared), 0.70, spacing
+    )
+    assert response[20, 40, 40] == pytest.approx(53.0, rel=0.12)
+
+
+def test_duplicate_suppression_uses_lateral_and_axial_resolution_units() -> None:
+    """Replacing axial resolution with a scalar sigma misclassifies clustered Z peaks."""
+    resolution = ResolutionReference(0.3, 0.9, 0.3, 0.9, "synthetic")
+    response = np.zeros((13, 13, 13), dtype=float)
+    response[6, 6, 6] = 10.0
+    response[6, 6, 9] = 9.0  # 1.0 lateral resolution unit: suppress.
+    response[9, 6, 6] = 8.0  # 1.0 axial resolution unit: suppress.
+    roi = np.ones(response.shape, dtype=bool)
+    assert _maxima(response, roi, 1.0, SPACING, resolution) == ((6, 6, 6),)
+    response[9, 6, 6] = 0.0
+    response[6, 6, 9] = 0.0
+    response[6, 6, 10] = 8.0  # 4 lateral voxels: outside the 0.3 um limit.
+    assert _maxima(response, roi, 1.0, SPACING, resolution) == (
+        (6, 6, 6),
+        (6, 6, 10),
+    )
+
+
+def test_fixed_lamp_roi_intersects_producer_support_outside_one_consensus_nucleus() -> (
+    None
+):
+    """Round-specific padding must not create an intensity-dependent ROI edge."""
+    nucleus = np.zeros((7, 7, 7), dtype=bool)
+    nucleus[3, 3, 3] = True
+    surface = NuclearSurface(
+        nucleus,
+        np.empty((0, 3)),
+        np.empty((0, 3), dtype=int),
+        np.empty((0, 3)),
+        np.zeros(3),
+        np.empty(0),
+        SPACING,
+    )
+    padded = np.ones_like(nucleus)
+    padded[:, :, 0] = False
+    roi = _fixed_lamp_roi(surface, {1: np.ones_like(nucleus), 3: padded})
+    assert not roi[:, :, 0].any()
+    assert not roi[3, 3, 3]
+    with pytest.raises(ValueError, match="empty"):
+        _fixed_lamp_roi(surface, {2: nucleus})
+
+
+@pytest.mark.parametrize(
     ("image", "roi", "message"),
     (
         (np.full((3, 3, 3), np.nan), np.ones((3, 3, 3), dtype=bool), "finite"),
@@ -143,7 +224,7 @@ def test_detector_hard_gates_invalid_signal_roi_and_background(
 ) -> None:
     """Invalid finite/binary geometry or a zero robust background cannot invent spots."""
     with pytest.raises(ValueError, match=message):
-        detect_lysosomes(image, roi, SPACING, (0.7,), (3.0,))
+        detect_lysosomes(image, roi, SPACING, (0.7,), (3.0,), resolution=RESOLUTION)
 
 
 def _lamp_cell_and_artifacts(
@@ -155,9 +236,16 @@ def _lamp_cell_and_artifacts(
     for number in range(1, 6):
         dapi_path = tmp_path / f"dapi-{number}.tif"
         lamp_path = tmp_path / f"lamp-{number}.tif"
-        image = synthetic_lamp_spots()
-        tifffile.imwrite(dapi_path, image)
-        tifffile.imwrite(lamp_path, image)
+        lamp = synthetic_lamp_spots()
+        z, y, x = np.indices(lamp.shape, dtype=float)
+        radius = np.sqrt(
+            (x * SPACING[0] - 4.0) ** 2
+            + (y * SPACING[1] - 4.0) ** 2
+            + (z * SPACING[2] - 4.5) ** 2
+        )
+        dapi = 1.0 + 0.03 * np.sin(x * SPACING[0]) + 40.0 * (radius <= 1.1)
+        tifffile.imwrite(dapi_path, dapi)
+        tifffile.imwrite(lamp_path, lamp)
         rounds.append(
             RoundSpec(
                 "lamp1",
@@ -198,21 +286,127 @@ def _lamp_cell_and_artifacts(
 
 
 def test_lamp_analysis_emits_round_two_and_adjacent_comparisons_for_every_ensemble(
-    analysis_config, tmp_path: Path
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Dropping a five-round comparison would hide an acquisition-specific instability."""
-    from cyclic_stability.lysosome import analyze_lamp1_cell
-
     cell, artifacts = _lamp_cell_and_artifacts(tmp_path)
-    config = replace(analysis_config, cells=(cell,))
+    decisions = tuple(
+        QcDecision(
+            "lamp1",
+            cell.cell_id,
+            number,
+            "accept",
+            ("target-blind",),
+            "reviewer",
+            "2026-08-16T00:00:00Z",
+        )
+        for number in (1, 3, 4, 5)
+    )
+    config = replace(analysis_config, cells=(cell,), qc_decisions=decisions)
+    from cyclic_stability import lysosome
+
+    shape = synthetic_lamp_spots().shape
+    monkeypatch.setattr(
+        lysosome,
+        "_artifact_validity_masks",
+        lambda _artifacts, _config: (
+            {number: np.ones(shape, dtype=bool) for number in (1, 2, 3, 4, 5)},
+            "synthetic-digest",
+            ("synthetic-validity",),
+        ),
+    )
     result = analyze_lamp1_cell(cell, artifacts, config, tmp_path / "output")
     assert len(result.ensemble_rows) == 5 * 3 * 3 * 6
     assert {row.comparison_set for row in result.summary_rows} == {
-        "acquisition-round-2-reference",
-        "adjacent-acquisition-rounds",
+        "round2-relative",
+        "adjacent",
     }
     assert (tmp_path / "output" / "lamp1-detections.npz").is_file()
     assert (tmp_path / "output" / "lamp1-ensemble.csv").is_file()
+    assert (tmp_path / "output" / "objects.csv").is_file()
+    assert (tmp_path / "output" / "matches.csv").is_file()
+    with (tmp_path / "output" / "objects.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        objects = list(csv.DictReader(handle))
+    with (tmp_path / "output" / "matches.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        matches = list(csv.DictReader(handle))
+    assert objects and set(objects[0]) >= {
+        "object_index",
+        "x_um",
+        "volume_um3",
+        "nucleus_relative_distance_um",
+    }
+    assert matches and set(matches[0]) >= {
+        "comparison_type",
+        "reference_object_index",
+        "moving_object_index",
+        "normalized_displacement",
+    }
+    stale = tmp_path / "output" / "stale.txt"
+    stale.write_text("obsolete", encoding="utf-8")
+    analyze_lamp1_cell(cell, artifacts, config, tmp_path / "output")
+    assert not stale.exists()
+
+
+def test_missing_lamp_qc_rejects_before_any_target_volume_is_opened(
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Opening a LAMP target before target-blind QC would leak target information."""
+    from cyclic_stability import lysosome
+
+    cell, artifacts = _lamp_cell_and_artifacts(tmp_path)
+    config = replace(analysis_config, cells=(cell,))
+    monkeypatch.setattr(
+        lysosome,
+        "load_volume",
+        lambda _path: (_ for _ in ()).throw(AssertionError("target volume opened")),
+    )
+    with pytest.raises(ValueError, match="target-blind QC"):
+        analyze_lamp1_cell(cell, artifacts, config, tmp_path / "output")
+
+
+def test_excluded_lamp_round_never_opens_its_target(
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An excluded moving round must be absent from both target reads and comparisons."""
+    from cyclic_stability import lysosome
+
+    cell, artifacts = _lamp_cell_and_artifacts(tmp_path)
+    decisions = tuple(
+        QcDecision(
+            "lamp1",
+            cell.cell_id,
+            number,
+            "exclude" if number == 3 else "accept",
+            ("target-blind",),
+            "reviewer",
+            "2026-08-16T00:00:00Z",
+        )
+        for number in (1, 3, 4, 5)
+    )
+    config = replace(analysis_config, cells=(cell,), qc_decisions=decisions)
+    shape = synthetic_lamp_spots().shape
+    monkeypatch.setattr(
+        lysosome,
+        "_artifact_validity_masks",
+        lambda _artifacts, _config: (
+            {number: np.ones(shape, dtype=bool) for number in (1, 2, 4, 5)},
+            "synthetic-digest",
+            ("synthetic-validity",),
+        ),
+    )
+    original = lysosome.load_volume
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        lysosome,
+        "load_volume",
+        lambda path: (opened.append(path), original(path))[1],
+    )
+    analyze_lamp1_cell(cell, artifacts, config, tmp_path / "output")
+    assert artifacts[2].registered_target not in opened
 
 
 def test_real_lamp_gate_returns_machine_readable_unavailable(

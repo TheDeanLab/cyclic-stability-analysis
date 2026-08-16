@@ -6,17 +6,19 @@ import csv
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import gaussian_laplace, maximum_filter
+from scipy.ndimage import distance_transform_edt, gaussian_filter, maximum_filter
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 from skimage.measure import marching_cubes, mesh_surface_area
 from skimage.segmentation import watershed
 
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
+from cyclic_stability.golgi import _artifact_validity_masks
 from cyclic_stability.images import load_volume, robust_background
 from cyclic_stability.models import (
     AnalysisConfig,
@@ -26,7 +28,13 @@ from cyclic_stability.models import (
     MetricRow,
 )
 from cyclic_stability.morphology import gaussian_sigma_zyx, validated_binary_mask
-from cyclic_stability.nuclear import REFERENCE_ROUND, _atomic_publish_directory
+from cyclic_stability.nuclear import (
+    REFERENCE_ROUND,
+    NuclearSurface,
+    _accepted_rounds,
+    _atomic_publish_directory,
+    consensus_nuclear_surface,
+)
 from cyclic_stability.units import ResolutionReference, theoretical_resolution
 
 
@@ -119,10 +127,10 @@ def _maxima(
     response: NDArray[np.float64],
     roi: NDArray[np.bool_],
     threshold: float,
-    sigma_um: float,
     spacing_xyz_um: tuple[float, float, float],
+    resolution: ResolutionReference,
 ) -> tuple[tuple[int, int, int], ...]:
-    """Select 26-neighbour response maxima, suppressing physical-scale duplicates."""
+    """Select 26-neighbour maxima with lateral/lateral/axial duplicate units."""
     maxima = (
         response == maximum_filter(response, size=(3, 3, 3), mode="nearest")
     ) & roi
@@ -131,7 +139,18 @@ def _maxima(
         candidates.tolist(), key=lambda item: (-response[tuple(item)], *item)
     )
     sx, sy, sz = spacing_xyz_um
-    resolution_xyz = np.array((sigma_um, sigma_um, sigma_um), dtype=np.float64)
+    resolution_xyz = np.array(
+        (
+            resolution.lateral_expanded_um,
+            resolution.lateral_expanded_um,
+            resolution.axial_expanded_um,
+        ),
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(resolution_xyz)) or np.any(resolution_xyz <= 0.0):
+        raise ValueError(
+            "resolution must contain finite positive expanded-space values"
+        )
     retained: list[tuple[int, int, int]] = []
     for zyx in ordered:
         xyz = np.array((zyx[2] * sx, zyx[1] * sy, zyx[0] * sz), dtype=np.float64)
@@ -145,6 +164,29 @@ def _maxima(
         ):
             retained.append(tuple(zyx))
     return tuple(retained)
+
+
+def _physical_log_response(
+    image: NDArray[np.float64],
+    sigma_um: float,
+    spacing_xyz_um: tuple[float, float, float],
+) -> NDArray[np.float64]:
+    """Return scale-normalized negative physical Laplacian in source-intensity units.
+
+    SciPy derivative filters are expressed per voxel coordinate.  Multiplying each
+    second derivative by that axis's squared voxel sigma yields ``sigma_um**2``
+    times the corresponding physical-coordinate derivative, preserving response
+    units across anisotropic samplings.
+    """
+    sigma_zyx = gaussian_sigma_zyx(sigma_um, spacing_xyz_um)
+    response = np.zeros_like(image, dtype=np.float64)
+    for axis, sigma_vox in enumerate(sigma_zyx):
+        order = [0, 0, 0]
+        order[axis] = 2
+        response -= sigma_vox**2 * gaussian_filter(
+            image, sigma=sigma_zyx, order=tuple(order), mode="nearest"
+        )
+    return response
 
 
 def _surface_area(
@@ -212,6 +254,8 @@ def detect_lysosomes(
     spacing_xyz_um: tuple[float, float, float],
     sigma_values_um: tuple[float, ...],
     detection_sbr: tuple[float, ...],
+    *,
+    resolution: ResolutionReference,
 ) -> tuple[DetectionSet, ...]:
     """Detect physical 3-D LoG LAMP1 objects for every declared ensemble member."""
     source = _volume(image, "LAMP1 image")
@@ -225,19 +269,14 @@ def detect_lysosomes(
     corrected = source - background.median
     result: list[DetectionSet] = []
     for sigma_um in sigmas:
-        response = (
-            -gaussian_laplace(
-                corrected, sigma=gaussian_sigma_zyx(sigma_um, spacing), mode="nearest"
-            )
-            * sigma_um**2
-        )
+        response = _physical_log_response(corrected, sigma_um, spacing)
         for threshold_sbr in thresholds:
             peaks = _maxima(
                 response,
                 structure_roi,
                 threshold_sbr * background.scale,
-                sigma_um,
                 spacing,
+                resolution,
             )
             result.append(
                 DetectionSet(
@@ -368,14 +407,11 @@ def eligible_lamp_cells(config: AnalysisConfig) -> tuple[CellSpec, ...]:
 
 def _with_nuclear_distances(
     detections: DetectionSet,
-    nuclear_mask: NDArray[np.bool_],
-    spacing_xyz_um: tuple[float, float, float],
+    surface: NuclearSurface,
 ) -> DetectionSet:
     """Annotate object centroids with physical distance to the target-independent nucleus."""
-    from scipy.ndimage import distance_transform_edt
-
-    sx, sy, sz = spacing_xyz_um
-    distances = distance_transform_edt(~nuclear_mask, sampling=(sz, sy, sx))
+    sx, sy, sz = surface.spacing_xyz_um
+    distances = distance_transform_edt(~surface.mask_zyx, sampling=(sz, sy, sx))
     objects = []
     for object_ in detections.objects:
         x, y, z = object_.centroid_xyz_um
@@ -384,6 +420,44 @@ def _with_nuclear_distances(
             replace(object_, nucleus_relative_distance_um=float(distances[index]))
         )
     return replace(detections, objects=tuple(objects))
+
+
+def _fixed_lamp_roi(
+    surface: NuclearSurface,
+    validity_masks: Mapping[int, NDArray[np.bool_]],
+) -> NDArray[np.bool_]:
+    """Return one target-independent exterior ROI on common producer-valid support."""
+    if not validity_masks:
+        raise ValueError("LAMP1 ROI requires producer-attested transform support")
+    common = np.ones(surface.mask_zyx.shape, dtype=bool)
+    for number, raw_mask in validity_masks.items():
+        mask = validated_binary_mask(raw_mask, f"validity mask for round {number}")
+        if mask.ndim != 3 or mask.shape != common.shape:
+            raise ValueError(
+                "transform support and consensus nucleus must share geometry"
+            )
+        common &= mask
+    roi = common & ~surface.mask_zyx
+    if not np.any(roi):
+        raise ValueError("fixed LAMP1 ROI is empty")
+    roi.setflags(write=False)
+    return roi
+
+
+def _median_or_nan(values: list[float]) -> float:
+    """Return a median only when a finite measurement exists, without warnings."""
+    finite = [value for value in values if math.isfinite(value)]
+    return float(np.median(finite)) if finite else math.nan
+
+
+def _comparison_specs(rounds: tuple[int, ...]) -> tuple[tuple[str, int, int], ...]:
+    """Return explicit round-2-relative and adjacent comparison pairs in order."""
+    ordered = tuple(sorted(rounds))
+    return tuple(
+        ("round2-relative", REFERENCE_ROUND, number) for number in ordered
+    ) + tuple(
+        ("adjacent", previous, current) for previous, current in pairwise(ordered)
+    )
 
 
 def _rows_for_detections(
@@ -413,15 +487,11 @@ def _rows_for_detections(
             "fraction",
         ),
         "lysosome_nearest_neighbor_distance_median": (
-            float(np.nanmedian([item.nearest_neighbor_distance_um for item in objects]))
-            if objects
-            else math.nan,
+            _median_or_nan([item.nearest_neighbor_distance_um for item in objects]),
             "um",
         ),
         "lysosome_nucleus_relative_distance_median": (
-            float(np.nanmedian([item.nucleus_relative_distance_um for item in objects]))
-            if objects
-            else math.nan,
+            _median_or_nan([item.nucleus_relative_distance_um for item in objects]),
             "um",
         ),
     }
@@ -457,42 +527,52 @@ def analyze_lamp1_cell(
         raise ValueError(
             "cell and validated artifact acquisition-round inventories disagree"
         )
-    accepted = tuple(round_spec.acquisition_round for round_spec in cell.rounds)
-    lamp = {
-        number: load_volume(by_round[number].registered_target) for number in accepted
-    }
+    # The target-blind gate must run before any LAMP target is opened.
+    try:
+        accepted = _accepted_rounds(cell, config)
+    except ValueError as error:
+        raise ValueError(
+            "target-blind QC decisions are required for every moving LAMP1 round"
+        ) from error
+    if REFERENCE_ROUND not in accepted:
+        raise ValueError("LAMP1 analysis requires acquisition round 2")
     dapi = {
         number: load_volume(by_round[number].registered_dapi) for number in accepted
+    }
+    surface = consensus_nuclear_surface(
+        dapi, config.voxel_spacing_xyz_um, config.nuclear
+    )
+    validity_masks, validity_digest, validity_identities = _artifact_validity_masks(
+        {number: by_round[number] for number in accepted}, config
+    )
+    roi = _fixed_lamp_roi(surface, validity_masks)
+    lamp = {
+        number: load_volume(by_round[number].registered_target) for number in accepted
     }
     if len({image.shape for image in (*lamp.values(), *dapi.values())}) != 1:
         raise ValueError(
             "registered LAMP1 and DAPI volumes must share fixed-grid geometry"
         )
-    # A conservative target-independent nuclear support: only strictly positive DAPI.
-    nuclear = {
-        number: image > robust_background(image).median
-        for number, image in dapi.items()
-    }
-    roi = np.logical_or.reduce(tuple(nuclear.values()))
-    detections = {
-        number: tuple(
-            _with_nuclear_distances(item, nuclear[number], config.voxel_spacing_xyz_um)
-            for item in detect_lysosomes(
-                lamp[number],
-                roi,
-                config.voxel_spacing_xyz_um,
-                config.lysosome.log_sigma_um,
-                config.lysosome.detection_sbr,
-            )
-        )
-        for number in accepted
-    }
     resolution = theoretical_resolution(
         config.optics.target_wavelength_um,
         config.optics.numerical_aperture,
         config.optics.immersion_refractive_index,
         config.nominal_expansion_factor,
     )
+    detections = {
+        number: tuple(
+            _with_nuclear_distances(item, surface)
+            for item in detect_lysosomes(
+                lamp[number],
+                roi,
+                config.voxel_spacing_xyz_um,
+                config.lysosome.log_sigma_um,
+                config.lysosome.detection_sbr,
+                resolution=resolution,
+            )
+        )
+        for number in accepted
+    }
     ensemble_rows = tuple(
         row
         for number in sorted(detections)
@@ -500,66 +580,59 @@ def analyze_lamp1_cell(
         for row in _rows_for_detections(cell, number, item, config)
     )
     summary_rows: list[MetricRow] = []
-    reference = {
-        (item.sigma_um, item.detection_sbr): item
-        for item in detections[REFERENCE_ROUND]
-    }
-    for number in sorted(detections):
-        current = {
-            (item.sigma_um, item.detection_sbr): item for item in detections[number]
+    matches: list[tuple[str, int, int, DetectionSet, ObjectMatchResult]] = []
+    for comparison, reference_round, moving_round in _comparison_specs(accepted):
+        reference_members = {
+            (item.sigma_um, item.detection_sbr): item
+            for item in detections[reference_round]
         }
-        for key, reference_item in reference.items():
+        moving_members = {
+            (item.sigma_um, item.detection_sbr): item
+            for item in detections[moving_round]
+        }
+        for key, reference_member in reference_members.items():
             match = match_lysosomes(
-                reference_item,
-                current[key],
+                reference_member,
+                moving_members[key],
                 resolution,
                 config.lysosome.match_resolution_units,
             )
-            for endpoint, value in (
-                ("matched_fraction", match.matched_fraction),
-                ("lost_fraction", match.lost_fraction),
-                ("new_fraction", match.new_fraction),
+            matches.append(
+                (comparison, reference_round, moving_round, reference_member, match)
+            )
+            for endpoint, value, units in (
+                ("matched_fraction", match.matched_fraction, "fraction"),
+                ("lost_fraction", match.lost_fraction, "fraction"),
+                ("new_fraction", match.new_fraction, "fraction"),
+                (
+                    "lateral_displacement_median",
+                    _median_or_nan(list(match.lateral_displacements_um)),
+                    "um",
+                ),
+                (
+                    "axial_displacement_median",
+                    _median_or_nan(list(match.axial_displacements_um)),
+                    "um",
+                ),
+                (
+                    "normalized_displacement_median",
+                    _median_or_nan(list(match.normalized_displacements)),
+                    "resolution-units",
+                ),
             ):
                 summary_rows.append(
                     MetricRow(
                         cell.cohort,
                         cell.cell_id,
-                        number,
-                        f"lysosome_round2_{endpoint}_sigma_{key[0]:g}_sbr_{key[1]:g}",
+                        moving_round,
+                        f"lysosome_{endpoint}_sigma_{key[0]:g}_sbr_{key[1]:g}",
                         value,
-                        "fraction",
-                        "acquisition-round-2-reference",
+                        units,
+                        comparison,
                         True,
                         config.config_digest,
                     )
                 )
-        if number > min(accepted):
-            previous = number - 1
-            if previous in detections:
-                preceding = {
-                    (item.sigma_um, item.detection_sbr): item
-                    for item in detections[previous]
-                }
-                for key, prior in preceding.items():
-                    match = match_lysosomes(
-                        prior,
-                        current[key],
-                        resolution,
-                        config.lysosome.match_resolution_units,
-                    )
-                    summary_rows.append(
-                        MetricRow(
-                            cell.cohort,
-                            cell.cell_id,
-                            number,
-                            f"lysosome_adjacent_matched_fraction_sigma_{key[0]:g}_sbr_{key[1]:g}",
-                            match.matched_fraction,
-                            "fraction",
-                            "adjacent-acquisition-rounds",
-                            True,
-                            config.config_digest,
-                        )
-                    )
     staged_paths: tuple[Path, ...] = ()
     staging_root: Path | None = None
 
@@ -585,17 +658,112 @@ def analyze_lamp1_cell(
                 [getattr(row, field) for field in EnsembleRow.__dataclass_fields__]
                 for row in ensemble_rows
             )
-        staged_paths = (diagnostic, table)
+        objects_table = staged / "objects.csv"
+        with objects_table.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                (
+                    "acquisition_round",
+                    "log_sigma_um",
+                    "detection_sbr",
+                    "object_index",
+                    "x_um",
+                    "y_um",
+                    "z_um",
+                    "volume_um3",
+                    "equivalent_diameter_um",
+                    "sphericity",
+                    "nearest_neighbor_distance_um",
+                    "nucleus_relative_distance_um",
+                )
+            )
+            for number, members in sorted(detections.items()):
+                for member in members:
+                    for index, object_ in enumerate(member.objects):
+                        writer.writerow(
+                            (
+                                number,
+                                member.sigma_um,
+                                member.detection_sbr,
+                                index,
+                                *object_.centroid_xyz_um,
+                                object_.volume_um3,
+                                object_.equivalent_diameter_um,
+                                object_.sphericity,
+                                object_.nearest_neighbor_distance_um,
+                                object_.nucleus_relative_distance_um,
+                            )
+                        )
+        matches_table = staged / "matches.csv"
+        with matches_table.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(
+                (
+                    "comparison_type",
+                    "reference_round",
+                    "moving_round",
+                    "log_sigma_um",
+                    "detection_sbr",
+                    "reference_object_index",
+                    "moving_object_index",
+                    "reference_x_um",
+                    "reference_y_um",
+                    "reference_z_um",
+                    "moving_x_um",
+                    "moving_y_um",
+                    "moving_z_um",
+                    "lateral_displacement_um",
+                    "axial_displacement_um",
+                    "normalized_displacement",
+                )
+            )
+            for (
+                comparison,
+                reference_round,
+                moving_round,
+                reference_member,
+                match,
+            ) in matches:
+                moving_member = next(
+                    item
+                    for item in detections[moving_round]
+                    if (item.sigma_um, item.detection_sbr)
+                    == (reference_member.sigma_um, reference_member.detection_sbr)
+                )
+                for pair_index, (reference_index, moving_index) in enumerate(
+                    match.matched_pairs
+                ):
+                    writer.writerow(
+                        (
+                            comparison,
+                            reference_round,
+                            moving_round,
+                            reference_member.sigma_um,
+                            reference_member.detection_sbr,
+                            reference_index,
+                            moving_index,
+                            *reference_member.objects[reference_index].centroid_xyz_um,
+                            *moving_member.objects[moving_index].centroid_xyz_um,
+                            match.lateral_displacements_um[pair_index],
+                            match.axial_displacements_um[pair_index],
+                            match.normalized_displacements[pair_index],
+                        )
+                    )
+        staged_paths = (diagnostic, table, objects_table, matches_table)
 
     _atomic_publish_directory(output_dir, populate)
     assert staging_root is not None
     diagnostics = tuple(
         output_dir / item.relative_to(staging_root) for item in staged_paths
     )
-    identities = tuple(
-        str(path)
-        for artifact in artifacts
-        for path in (artifact.registered_dapi, artifact.registered_target)
+    identities = (
+        tuple(
+            str(path)
+            for artifact in artifacts
+            for path in (artifact.registered_dapi, artifact.registered_target)
+        )
+        + validity_identities
+        + (f"validity-mask-sha256:{validity_digest}",)
     )
     return MarkerResult(
         cell.cohort,
