@@ -1,0 +1,618 @@
+"""Gated LAMP1 object detection and one-to-one resolution-aware matching."""
+
+from __future__ import annotations
+
+import csv
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+import numpy as np
+from numpy.typing import NDArray
+from scipy.ndimage import gaussian_laplace, maximum_filter
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial import cKDTree
+from skimage.measure import marching_cubes, mesh_surface_area
+from skimage.segmentation import watershed
+
+from cyclic_stability.cyexm_artifacts import RoundArtifacts
+from cyclic_stability.images import load_volume, robust_background
+from cyclic_stability.models import (
+    AnalysisConfig,
+    CellSpec,
+    EnsembleRow,
+    MarkerResult,
+    MetricRow,
+)
+from cyclic_stability.morphology import gaussian_sigma_zyx, validated_binary_mask
+from cyclic_stability.nuclear import REFERENCE_ROUND, _atomic_publish_directory
+from cyclic_stability.units import ResolutionReference, theoretical_resolution
+
+
+@dataclass(frozen=True, slots=True)
+class LysosomeObject:
+    """One watershed-separated LAMP1 object in physical XYZ coordinates."""
+
+    centroid_xyz_um: tuple[float, float, float]
+    volume_um3: float
+    equivalent_diameter_um: float
+    sphericity: float
+    nearest_neighbor_distance_um: float
+    nucleus_relative_distance_um: float
+
+    def __post_init__(self) -> None:
+        if len(self.centroid_xyz_um) != 3 or not all(
+            math.isfinite(value) for value in self.centroid_xyz_um
+        ):
+            raise ValueError(
+                "lysosome object coordinates must be three finite XYZ values"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class DetectionSet:
+    """All detected LAMP1 objects for one physical LoG/SBR ensemble member."""
+
+    sigma_um: float
+    detection_sbr: float
+    objects: tuple[LysosomeObject, ...]
+
+    @property
+    def object_count(self) -> int:
+        """Return the number of watershed objects in this ensemble member."""
+        return len(self.objects)
+
+    @property
+    def coordinates_xyz_um(self) -> tuple[tuple[float, float, float], ...]:
+        """Return stable object centroids in physical XYZ micrometers."""
+        return tuple(object_.centroid_xyz_um for object_ in self.objects)
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectMatchResult:
+    """One finite, one-to-one LAMP1 assignment with explicit lost/new outcomes."""
+
+    matched_pairs: tuple[tuple[int, int], ...]
+    normalized_displacements: tuple[float, ...]
+    lateral_displacements_um: tuple[float, ...]
+    axial_displacements_um: tuple[float, ...]
+    matched_count: int
+    lost_count: int
+    new_count: int
+    matched_fraction: float
+    lost_fraction: float
+    new_fraction: float
+
+
+def _spacing(
+    spacing_xyz_um: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Validate public XYZ spacing through the shared physical conversion helper."""
+    gaussian_sigma_zyx(1.0, spacing_xyz_um)
+    return tuple(float(value) for value in spacing_xyz_um)
+
+
+def _volume(image: NDArray[np.generic], name: str) -> NDArray[np.float64]:
+    """Return exactly one finite, real 3-D ZYX volume."""
+    values = np.asarray(image)
+    if (
+        values.ndim != 3
+        or not np.issubdtype(values.dtype, np.number)
+        or np.issubdtype(values.dtype, np.complexfloating)
+    ):
+        raise ValueError(f"{name} must be one real numeric 3D ZYX volume")
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{name} must contain only finite values")
+    return values.astype(np.float64, copy=False)
+
+
+def _positive_values(values: tuple[float, ...], name: str) -> tuple[float, ...]:
+    """Validate one non-empty ordered physical parameter sequence."""
+    result = tuple(float(value) for value in values)
+    if not result or any(not math.isfinite(value) or value <= 0.0 for value in result):
+        raise ValueError(f"{name} must contain finite positive values")
+    return result
+
+
+def _maxima(
+    response: NDArray[np.float64],
+    roi: NDArray[np.bool_],
+    threshold: float,
+    sigma_um: float,
+    spacing_xyz_um: tuple[float, float, float],
+) -> tuple[tuple[int, int, int], ...]:
+    """Select 26-neighbour response maxima, suppressing physical-scale duplicates."""
+    maxima = (
+        response == maximum_filter(response, size=(3, 3, 3), mode="nearest")
+    ) & roi
+    candidates = np.argwhere(maxima & (response > threshold))
+    ordered = sorted(
+        candidates.tolist(), key=lambda item: (-response[tuple(item)], *item)
+    )
+    sx, sy, sz = spacing_xyz_um
+    resolution_xyz = np.array((sigma_um, sigma_um, sigma_um), dtype=np.float64)
+    retained: list[tuple[int, int, int]] = []
+    for zyx in ordered:
+        xyz = np.array((zyx[2] * sx, zyx[1] * sy, zyx[0] * sz), dtype=np.float64)
+        if all(
+            np.linalg.norm(
+                (xyz - np.array((point[2] * sx, point[1] * sy, point[0] * sz)))
+                / resolution_xyz
+            )
+            > 1.0
+            for point in retained
+        ):
+            retained.append(tuple(zyx))
+    return tuple(retained)
+
+
+def _surface_area(
+    mask: NDArray[np.bool_], spacing_xyz_um: tuple[float, float, float]
+) -> float:
+    """Return a padded marching-cubes physical surface area for one non-empty object."""
+    sx, sy, sz = spacing_xyz_um
+    vertices, faces, _, _ = marching_cubes(
+        np.pad(mask.astype(np.float32), 1), level=0.5, spacing=(sz, sy, sx)
+    )
+    return float(mesh_surface_area(vertices, faces))
+
+
+def _objects(
+    response: NDArray[np.float64],
+    roi: NDArray[np.bool_],
+    peaks: tuple[tuple[int, int, int], ...],
+    spacing_xyz_um: tuple[float, float, float],
+) -> tuple[LysosomeObject, ...]:
+    """Watershed positive LoG support and summarize every retained physical object."""
+    if not peaks:
+        return ()
+    markers = np.zeros(response.shape, dtype=np.int32)
+    for index, peak in enumerate(peaks, start=1):
+        markers[peak] = index
+    labels = watershed(-response, markers, mask=(response > 0.0) & roi)
+    sx, sy, sz = spacing_xyz_um
+    objects: list[LysosomeObject] = []
+    for index in range(1, len(peaks) + 1):
+        mask = labels == index
+        voxels = np.argwhere(mask)
+        if not len(voxels):
+            continue
+        centroid_zyx = voxels.mean(axis=0)
+        centroid = (
+            float(centroid_zyx[2] * sx),
+            float(centroid_zyx[1] * sy),
+            float(centroid_zyx[0] * sz),
+        )
+        volume = float(mask.sum() * sx * sy * sz)
+        area = _surface_area(mask, spacing_xyz_um)
+        objects.append(
+            LysosomeObject(
+                centroid,
+                volume,
+                float((6.0 * volume / np.pi) ** (1.0 / 3.0)),
+                float(np.pi ** (1.0 / 3.0) * (6.0 * volume) ** (2.0 / 3.0) / area),
+                math.nan,
+                math.nan,
+            )
+        )
+    if len(objects) < 2:
+        return tuple(objects)
+    points = np.array([object_.centroid_xyz_um for object_ in objects])
+    distances, _ = cKDTree(points).query(points, k=2)
+    return tuple(
+        replace(object_, nearest_neighbor_distance_um=float(distances[index, 1]))
+        for index, object_ in enumerate(objects)
+    )
+
+
+def detect_lysosomes(
+    image: NDArray[np.generic],
+    roi: NDArray[np.generic],
+    spacing_xyz_um: tuple[float, float, float],
+    sigma_values_um: tuple[float, ...],
+    detection_sbr: tuple[float, ...],
+) -> tuple[DetectionSet, ...]:
+    """Detect physical 3-D LoG LAMP1 objects for every declared ensemble member."""
+    source = _volume(image, "LAMP1 image")
+    structure_roi = validated_binary_mask(roi, "LAMP1 ROI")
+    if source.shape != structure_roi.shape:
+        raise ValueError("LAMP1 image and ROI must share a 3D ZYX geometry")
+    spacing = _spacing(spacing_xyz_um)
+    sigmas = _positive_values(sigma_values_um, "sigma_values_um")
+    thresholds = _positive_values(detection_sbr, "detection_sbr")
+    background = robust_background(source)
+    corrected = source - background.median
+    result: list[DetectionSet] = []
+    for sigma_um in sigmas:
+        response = (
+            -gaussian_laplace(
+                corrected, sigma=gaussian_sigma_zyx(sigma_um, spacing), mode="nearest"
+            )
+            * sigma_um**2
+        )
+        for threshold_sbr in thresholds:
+            peaks = _maxima(
+                response,
+                structure_roi,
+                threshold_sbr * background.scale,
+                sigma_um,
+                spacing,
+            )
+            result.append(
+                DetectionSet(
+                    sigma_um,
+                    threshold_sbr,
+                    _objects(response, structure_roi, peaks, spacing),
+                )
+            )
+    return tuple(result)
+
+
+def _coordinates(detections: DetectionSet) -> NDArray[np.float64]:
+    """Return a finite N-by-3 XYZ coordinate matrix for a detection set."""
+    result = np.asarray(detections.coordinates_xyz_um, dtype=np.float64)
+    if result.size == 0:
+        return np.empty((0, 3), dtype=np.float64)
+    if result.shape != (detections.object_count, 3) or not np.all(np.isfinite(result)):
+        raise ValueError("detection coordinates must be finite XYZ values")
+    return result
+
+
+def match_lysosomes(
+    reference: DetectionSet,
+    moving: DetectionSet,
+    resolution: ResolutionReference,
+    max_units: float,
+) -> ObjectMatchResult:
+    """Assign only finite one-to-one LAMP1 pairs within the stated resolution limit."""
+    if not math.isfinite(max_units) or max_units <= 0.0:
+        raise ValueError("max_units must be finite and positive")
+    reference_xyz = _coordinates(reference)
+    moving_xyz = _coordinates(moving)
+    reference_count, moving_count = len(reference_xyz), len(moving_xyz)
+    if not reference_count or not moving_count:
+        return ObjectMatchResult(
+            (),
+            (),
+            (),
+            (),
+            0,
+            reference_count,
+            moving_count,
+            0.0,
+            0.0 if not reference_count else 1.0,
+            0.0 if not moving_count else 1.0,
+        )
+    resolution_xyz = np.array(
+        (
+            resolution.lateral_expanded_um,
+            resolution.lateral_expanded_um,
+            resolution.axial_expanded_um,
+        ),
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(resolution_xyz)) or np.any(resolution_xyz <= 0.0):
+        raise ValueError(
+            "resolution must contain finite positive expanded-space values"
+        )
+    delta = moving_xyz[:, None, :] - reference_xyz[None, :, :]
+    cost = np.sqrt(np.sum((delta / resolution_xyz) ** 2, axis=-1))
+    cost[cost > max_units] = np.inf
+    possible_rows = np.any(np.isfinite(cost), axis=1)
+    possible_cols = np.any(np.isfinite(cost), axis=0)
+    pairs: list[tuple[int, int]] = []
+    if np.any(possible_rows) and np.any(possible_cols):
+        row_indices = np.flatnonzero(possible_rows)
+        col_indices = np.flatnonzero(possible_cols)
+        finite_cost = cost[np.ix_(row_indices, col_indices)]
+        sentinel = (
+            max_units
+            + max(1.0, float(np.max(finite_cost[np.isfinite(finite_cost)])))
+            * 1_000_000.0
+        )
+        assignment_rows, assignment_cols = linear_sum_assignment(
+            np.where(np.isfinite(finite_cost), finite_cost, sentinel)
+        )
+        pairs = sorted(
+            (
+                (int(col_indices[col]), int(row_indices[row]))
+                for row, col in zip(assignment_rows, assignment_cols, strict=True)
+                if math.isfinite(float(finite_cost[row, col]))
+            )
+        )
+    normalized = tuple(
+        float(cost[moving_index, reference_index])
+        for reference_index, moving_index in pairs
+    )
+    lateral = tuple(
+        float(
+            np.hypot(
+                *(moving_xyz[moving_index, :2] - reference_xyz[reference_index, :2])
+            )
+        )
+        for reference_index, moving_index in pairs
+    )
+    axial = tuple(
+        float(abs(moving_xyz[moving_index, 2] - reference_xyz[reference_index, 2]))
+        for reference_index, moving_index in pairs
+    )
+    matched = len(pairs)
+    return ObjectMatchResult(
+        tuple(pairs),
+        normalized,
+        lateral,
+        axial,
+        matched,
+        reference_count - matched,
+        moving_count - matched,
+        matched / reference_count,
+        (reference_count - matched) / reference_count,
+        (moving_count - matched) / moving_count,
+    )
+
+
+def eligible_lamp_cells(config: AnalysisConfig) -> tuple[CellSpec, ...]:
+    """Return only complete, image-verified LAMP1 cells in stable biological-ID order."""
+    return tuple(
+        cell
+        for cell in config.cells
+        if cell.cohort == "lamp1"
+        and tuple(round_spec.acquisition_round for round_spec in cell.rounds)
+        == (1, 2, 3, 4, 5)
+        and all(
+            round_spec.identity_method == "image-verified" for round_spec in cell.rounds
+        )
+    )
+
+
+def _with_nuclear_distances(
+    detections: DetectionSet,
+    nuclear_mask: NDArray[np.bool_],
+    spacing_xyz_um: tuple[float, float, float],
+) -> DetectionSet:
+    """Annotate object centroids with physical distance to the target-independent nucleus."""
+    from scipy.ndimage import distance_transform_edt
+
+    sx, sy, sz = spacing_xyz_um
+    distances = distance_transform_edt(~nuclear_mask, sampling=(sz, sy, sx))
+    objects = []
+    for object_ in detections.objects:
+        x, y, z = object_.centroid_xyz_um
+        index = tuple(round(value) for value in (z / sz, y / sy, x / sx))
+        objects.append(
+            replace(object_, nucleus_relative_distance_um=float(distances[index]))
+        )
+    return replace(detections, objects=tuple(objects))
+
+
+def _rows_for_detections(
+    cell: CellSpec, round_number: int, detections: DetectionSet, config: AnalysisConfig
+) -> tuple[EnsembleRow, ...]:
+    """Emit all object summaries for one declared physical LoG/SBR coordinate."""
+    name = f"log_sigma_um={detections.sigma_um:g};detection_sbr={detections.detection_sbr:g}"
+    objects = detections.objects
+    values = {
+        "lysosome_object_count": (float(detections.object_count), "count"),
+        "lysosome_volume_median": (
+            float(np.median([item.volume_um3 for item in objects]))
+            if objects
+            else math.nan,
+            "um3",
+        ),
+        "lysosome_equivalent_diameter_median": (
+            float(np.median([item.equivalent_diameter_um for item in objects]))
+            if objects
+            else math.nan,
+            "um",
+        ),
+        "lysosome_sphericity_median": (
+            float(np.median([item.sphericity for item in objects]))
+            if objects
+            else math.nan,
+            "fraction",
+        ),
+        "lysosome_nearest_neighbor_distance_median": (
+            float(np.nanmedian([item.nearest_neighbor_distance_um for item in objects]))
+            if objects
+            else math.nan,
+            "um",
+        ),
+        "lysosome_nucleus_relative_distance_median": (
+            float(np.nanmedian([item.nucleus_relative_distance_um for item in objects]))
+            if objects
+            else math.nan,
+            "um",
+        ),
+    }
+    return tuple(
+        EnsembleRow(
+            cell.cohort,
+            cell.cell_id,
+            round_number,
+            endpoint,
+            name,
+            detections.detection_sbr,
+            value,
+            units,
+            config.config_digest,
+        )
+        for endpoint, (value, units) in values.items()
+    )
+
+
+def analyze_lamp1_cell(
+    cell: CellSpec,
+    artifacts: tuple[RoundArtifacts, ...],
+    config: AnalysisConfig,
+    output_dir: Path,
+) -> MarkerResult:
+    """Analyze one eligible LAMP1 cell without cohort-level inference or implicit IDs."""
+    if cell not in eligible_lamp_cells(config):
+        raise ValueError("LAMP1 analysis requires a complete image-verified CellSpec")
+    by_round: Mapping[int, RoundArtifacts] = {
+        item.acquisition_round: item for item in artifacts
+    }
+    if set(by_round) != {item.acquisition_round for item in cell.rounds}:
+        raise ValueError(
+            "cell and validated artifact acquisition-round inventories disagree"
+        )
+    accepted = tuple(round_spec.acquisition_round for round_spec in cell.rounds)
+    lamp = {
+        number: load_volume(by_round[number].registered_target) for number in accepted
+    }
+    dapi = {
+        number: load_volume(by_round[number].registered_dapi) for number in accepted
+    }
+    if len({image.shape for image in (*lamp.values(), *dapi.values())}) != 1:
+        raise ValueError(
+            "registered LAMP1 and DAPI volumes must share fixed-grid geometry"
+        )
+    # A conservative target-independent nuclear support: only strictly positive DAPI.
+    nuclear = {
+        number: image > robust_background(image).median
+        for number, image in dapi.items()
+    }
+    roi = np.logical_or.reduce(tuple(nuclear.values()))
+    detections = {
+        number: tuple(
+            _with_nuclear_distances(item, nuclear[number], config.voxel_spacing_xyz_um)
+            for item in detect_lysosomes(
+                lamp[number],
+                roi,
+                config.voxel_spacing_xyz_um,
+                config.lysosome.log_sigma_um,
+                config.lysosome.detection_sbr,
+            )
+        )
+        for number in accepted
+    }
+    resolution = theoretical_resolution(
+        config.optics.target_wavelength_um,
+        config.optics.numerical_aperture,
+        config.optics.immersion_refractive_index,
+        config.nominal_expansion_factor,
+    )
+    ensemble_rows = tuple(
+        row
+        for number in sorted(detections)
+        for item in detections[number]
+        for row in _rows_for_detections(cell, number, item, config)
+    )
+    summary_rows: list[MetricRow] = []
+    reference = {
+        (item.sigma_um, item.detection_sbr): item
+        for item in detections[REFERENCE_ROUND]
+    }
+    for number in sorted(detections):
+        current = {
+            (item.sigma_um, item.detection_sbr): item for item in detections[number]
+        }
+        for key, reference_item in reference.items():
+            match = match_lysosomes(
+                reference_item,
+                current[key],
+                resolution,
+                config.lysosome.match_resolution_units,
+            )
+            for endpoint, value in (
+                ("matched_fraction", match.matched_fraction),
+                ("lost_fraction", match.lost_fraction),
+                ("new_fraction", match.new_fraction),
+            ):
+                summary_rows.append(
+                    MetricRow(
+                        cell.cohort,
+                        cell.cell_id,
+                        number,
+                        f"lysosome_round2_{endpoint}_sigma_{key[0]:g}_sbr_{key[1]:g}",
+                        value,
+                        "fraction",
+                        "acquisition-round-2-reference",
+                        True,
+                        config.config_digest,
+                    )
+                )
+        if number > min(accepted):
+            previous = number - 1
+            if previous in detections:
+                preceding = {
+                    (item.sigma_um, item.detection_sbr): item
+                    for item in detections[previous]
+                }
+                for key, prior in preceding.items():
+                    match = match_lysosomes(
+                        prior,
+                        current[key],
+                        resolution,
+                        config.lysosome.match_resolution_units,
+                    )
+                    summary_rows.append(
+                        MetricRow(
+                            cell.cohort,
+                            cell.cell_id,
+                            number,
+                            f"lysosome_adjacent_matched_fraction_sigma_{key[0]:g}_sbr_{key[1]:g}",
+                            match.matched_fraction,
+                            "fraction",
+                            "adjacent-acquisition-rounds",
+                            True,
+                            config.config_digest,
+                        )
+                    )
+    staged_paths: tuple[Path, ...] = ()
+    staging_root: Path | None = None
+
+    def populate(staged: Path) -> None:
+        nonlocal staged_paths, staging_root
+        staging_root = staged
+        diagnostic = staged / "lamp1-detections.npz"
+        np.savez_compressed(
+            diagnostic,
+            **{
+                f"round_{number}_sigma_{item.sigma_um:g}_sbr_{item.detection_sbr:g}_xyz_um": np.asarray(
+                    item.coordinates_xyz_um
+                )
+                for number, items in detections.items()
+                for item in items
+            },
+        )
+        table = staged / "lamp1-ensemble.csv"
+        with table.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(EnsembleRow.__dataclass_fields__)
+            writer.writerows(
+                [getattr(row, field) for field in EnsembleRow.__dataclass_fields__]
+                for row in ensemble_rows
+            )
+        staged_paths = (diagnostic, table)
+
+    _atomic_publish_directory(output_dir, populate)
+    assert staging_root is not None
+    diagnostics = tuple(
+        output_dir / item.relative_to(staging_root) for item in staged_paths
+    )
+    identities = tuple(
+        str(path)
+        for artifact in artifacts
+        for path in (artifact.registered_dapi, artifact.registered_target)
+    )
+    return MarkerResult(
+        cell.cohort,
+        cell.cell_id,
+        tuple(summary_rows),
+        ensemble_rows,
+        diagnostics,
+        identities,
+    )
+
+
+__all__ = [
+    "DetectionSet",
+    "LysosomeObject",
+    "ObjectMatchResult",
+    "analyze_lamp1_cell",
+    "detect_lysosomes",
+    "eligible_lamp_cells",
+    "match_lysosomes",
+]

@@ -7,7 +7,9 @@ from pathlib import Path
 
 import numpy as np
 from cyclic_stability.images import BackgroundSummary
+from cyclic_stability.lysosome import DetectionSet, LysosomeObject
 from cyclic_stability.models import NuclearConfig, RoundSpec
+from cyclic_stability.units import theoretical_resolution
 from cyexm.registration.artifacts import ArtifactStore, StageRequest
 from cyexm.spatial import ImageGeometry
 from numpy.typing import NDArray
@@ -162,6 +164,52 @@ def synthetic_roi() -> NDArray[np.bool_]:
     return roi
 
 
+def synthetic_lamp_spots() -> NDArray[np.float64]:
+    """Return three separated physical LAMP1-like spots on an anisotropic grid."""
+    z, y, x = np.indices((31, 81, 81), dtype=np.float64)
+    image = 1.0 + 0.04 * np.sin(x * SPACING[0]) * np.cos(y * SPACING[1])
+    for center_xyz in ((2.0, 2.0, 2.4), (5.6, 2.0, 4.2), (2.0, 5.6, 5.4)):
+        cx, cy, cz = center_xyz
+        radius_squared = (
+            ((x * SPACING[0] - cx) / 0.24) ** 2
+            + ((y * SPACING[1] - cy) / 0.24) ** 2
+            + ((z * SPACING[2] - cz) / 0.24) ** 2
+        )
+        image += 400.0 * np.exp(-0.5 * radius_squared)
+    return image
+
+
+def _detection(
+    coordinates_xyz_um: tuple[tuple[float, float, float], ...],
+) -> DetectionSet:
+    """Construct hand-checked detection values used to exercise real matching."""
+    return DetectionSet(
+        sigma_um=0.70,
+        detection_sbr=4.0,
+        objects=tuple(
+            LysosomeObject(
+                centroid_xyz_um=coordinate,
+                volume_um3=0.12,
+                equivalent_diameter_um=(6.0 * 0.12 / np.pi) ** (1.0 / 3.0),
+                sphericity=0.9,
+                nearest_neighbor_distance_um=1.0,
+                nucleus_relative_distance_um=2.0,
+            )
+            for coordinate in coordinates_xyz_um
+        ),
+    )
+
+
+def reference_detections() -> DetectionSet:
+    """Return three reference objects with distinct lateral and axial positions."""
+    return _detection(((1.0, 1.0, 1.0), (3.0, 1.0, 1.0), (1.0, 3.0, 2.0)))
+
+
+def moved_lost_new_detections() -> DetectionSet:
+    """Return two retained objects, one lost object, and one unmatched new object."""
+    return _detection(((1.1, 1.0, 1.0), (3.0, 1.1, 1.1), (8.0, 8.0, 5.0)))
+
+
 def synthetic_round_specs() -> tuple[RoundSpec, ...]:
     """Return five immutable rounds with the round-one exposure sensitivity case."""
     return tuple(
@@ -262,6 +310,7 @@ def synthetic_backgrounds(rounds: tuple[int, ...]) -> dict[int, BackgroundSummar
 
 
 SPACING = (0.1, 0.1, 0.3)
+RESOLUTION = theoretical_resolution(0.640, 1.4, 1.515, 4.5)
 NUCLEAR_CONFIG = NuclearConfig(
     consensus_smoothing_um=0.558,
     normal_half_window_um=1.5,

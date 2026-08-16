@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from cyclic_stability.config import load_analysis_config
 from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
+from cyclic_stability.lysosome import eligible_lamp_cells
 from cyclic_stability.provenance import compare_nd2_export
 from cyexm.errors import InputValidationError
 
@@ -40,7 +41,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--correspondence", type=Path, required=True)
     parser.add_argument("--qc-decisions", type=Path, required=True)
     parser.add_argument("--cohort", required=True)
-    parser.add_argument("--cell", required=True)
+    parser.add_argument("--cell")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--skip-nd2-pixel-check", action="store_true")
     return parser
@@ -67,6 +68,21 @@ def main(argv: list[str] | None = None) -> int:
     config = load_analysis_config(
         args.analysis_config, args.correspondence, args.qc_decisions
     )
+    if args.cohort == "lamp1" and not eligible_lamp_cells(config):
+        payload: dict[str, object] = {
+            "cohort": "lamp1",
+            "config_digest": config.config_digest,
+            "status": "unavailable",
+            "reason": "no image-verified LAMP1 cell mappings",
+            "scheduled_cell_count": 0,
+        }
+        output = args.run_dir / "validation" / "inputs.json"
+        _write_json(output, payload)
+        print("unavailable: no image-verified LAMP1 cell mappings; scheduled 0 cells")
+        print(output)
+        return 0
+    if args.cell is None:
+        raise InputValidationError("--cell is required when inputs are schedulable")
     cell = config.cell(args.cohort, args.cell)
     matches = (
         ()
