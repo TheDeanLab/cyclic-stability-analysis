@@ -6,6 +6,7 @@ import csv
 from pathlib import Path
 
 import numpy as np
+from cyclic_stability.models import RoundSpec
 from cyexm.registration.artifacts import ArtifactStore, StageRequest
 from cyexm.spatial import ImageGeometry
 from numpy.typing import NDArray
@@ -135,3 +136,50 @@ def synthetic_folded_warp(shape: tuple[int, int, int]) -> NDArray[np.float64]:
     x1 = shape[2] - x0
     warp[:, :, x0:x1, 0] = -2.0 * np.arange(x1 - x0, dtype=np.float64)
     return warp
+
+
+def single_voxel(
+    shape_zyx: tuple[int, int, int], index_zyx: tuple[int, int, int]
+) -> NDArray[np.bool_]:
+    """Return a Boolean ZYX volume with exactly one foreground voxel."""
+    result = np.zeros(shape_zyx, dtype=bool)
+    result[index_zyx] = True
+    return result
+
+
+def synthetic_target() -> NDArray[np.float64]:
+    """Return a deterministic target image with a bright central structure."""
+    image = np.arange(1.0, 730.0).reshape(9, 9, 9)
+    image[3:6, 3:6, 3:6] += 5_000.0
+    return image
+
+
+def synthetic_roi() -> NDArray[np.bool_]:
+    """Return a target-independent central structure ROI in ZYX order."""
+    roi = np.zeros((9, 9, 9), dtype=bool)
+    roi[2:7, 2:7, 2:7] = True
+    return roi
+
+
+def synthetic_round_specs() -> tuple[RoundSpec, ...]:
+    """Return five immutable rounds with the round-one exposure sensitivity case."""
+    return tuple(
+        RoundSpec(
+            cohort="golgi",
+            cell_id="Cell1",
+            acquisition_round=acquisition_round,
+            workflow_round=2 if acquisition_round == 1 else acquisition_round,
+            nd2_path=Path(f"round{acquisition_round}.nd2"),
+            tiff_directory=Path("tiffs"),
+            z_start_offset=0,
+            target_exposure_ms=100.0 if acquisition_round == 1 else 200.0,
+            target_laser_percent=50.0,
+            tubulin_exposure_ms=200.0,
+            dapi_exposure_ms=200.0,
+            dataset_manifest=Path("dataset.yaml"),
+            execution_profile=Path("execution.yaml"),
+            workflow_dataset_id=f"golgi-cell1-round{acquisition_round}",
+            identity_method="exact-pixel-audit",
+        )
+        for acquisition_round in range(1, 6)
+    )
