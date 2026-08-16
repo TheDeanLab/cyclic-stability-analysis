@@ -88,8 +88,8 @@ def _audit_planes(path: Path) -> tuple[int, ...]:
             count = len(source.pages)
     except (OSError, RuntimeError, ValueError) as error:
         raise InputValidationError(f"cannot inspect TIFF stack: {path}") from error
-    if count < 5:
-        raise InputValidationError(f"TIFF stack requires at least five planes: {path}")
+    if count < 3:
+        raise InputValidationError(f"TIFF stack requires at least three planes: {path}")
     return 0, count // 2, count - 1
 
 
@@ -101,7 +101,7 @@ def compare_nd2_export(
     matches: list[ChannelMatch] = []
     for channel, tiff_path in channel_tiff_paths(round_spec):
         indices = _audit_planes(tiff_path)
-        exact = all(
+        comparisons = tuple(
             np.array_equal(
                 source.nd2_plane(
                     round_spec.nd2_path,
@@ -112,7 +112,7 @@ def compare_nd2_export(
             )
             for index in indices
         )
-        matches.append(ChannelMatch(channel, indices, exact))
+        matches.append(ChannelMatch(channel, indices, all(comparisons)))
     return tuple(matches)
 
 

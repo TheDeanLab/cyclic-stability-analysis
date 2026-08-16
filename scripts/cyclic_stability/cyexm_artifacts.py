@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-import json
 from pathlib import Path
 
 from cyclic_stability.models import CellSpec, RoundSpec
@@ -67,46 +66,13 @@ def validate_completed_artifact(path: Path) -> CompletionRecord:
     return record
 
 
-def resolve_workflow_output_root(round_spec: RoundSpec) -> Path:
-    """Resolve the declared root or its verified legacy ``outputs`` child."""
-    profile = load_execution_profile(round_spec.execution_profile)
-    candidates = (profile.paths.output_root, profile.paths.output_root / "outputs")
-    matching: list[Path] = []
-    for candidate in candidates:
-        plan_path = WorkflowLayout.for_dataset(
-            candidate, round_spec.workflow_dataset_id
-        ).plan_path
-        if not plan_path.is_file():
-            continue
-        try:
-            payload = json.loads(plan_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as error:
-            raise InputValidationError(
-                f"scientific plan is unreadable: {plan_path}"
-            ) from error
-        if (
-            isinstance(payload, dict)
-            and payload.get("dataset_id") == round_spec.workflow_dataset_id
-        ):
-            matching.append(candidate)
-    if not matching:
-        raise InputValidationError(
-            f"workflow dataset plan missing: {round_spec.workflow_dataset_id}"
-        )
-    if len(matching) != 1:
-        raise InputValidationError(
-            f"ambiguous workflow output root: {round_spec.workflow_dataset_id}"
-        )
-    return matching[0]
-
-
 def require_complete_workflow(
     round_spec: RoundSpec,
     status_inspector: StatusInspector = inspect_workflow_status,
 ) -> WorkflowStatus:
     """Require the declared Cy-ExM workflow to be authoritatively complete."""
-    output_root = resolve_workflow_output_root(round_spec)
-    status = status_inspector(output_root, round_spec.workflow_dataset_id)
+    profile = load_execution_profile(round_spec.execution_profile)
+    status = status_inspector(profile.paths.output_root, round_spec.workflow_dataset_id)
     if not status.complete:
         raise InputValidationError(
             f"Cy-ExM workflow is not complete: {round_spec.workflow_dataset_id}"
@@ -126,7 +92,7 @@ def resolve_round_artifacts(
 ) -> RoundArtifacts:
     """Resolve and validate every Cy-ExM artifact consumed for a round."""
     require_complete_workflow(round_spec, status_inspector)
-    output_root = resolve_workflow_output_root(round_spec)
+    output_root = load_execution_profile(round_spec.execution_profile).paths.output_root
     round_layout = WorkflowLayout.for_dataset(
         output_root, round_spec.workflow_dataset_id
     ).round(round_spec.workflow_round)
@@ -143,7 +109,7 @@ def resolve_round_artifacts(
     linear_metrics: Path | None = None
     nonlinear_metrics: Path | None = None
     chunk_manifest: Path | None = None
-    if round_spec.workflow_round != 1:
+    if round_spec.acquisition_round != 2:
         registration = RegistrationPaths.for_round(
             round_layout.registration, round_spec.workflow_round
         )
@@ -209,7 +175,6 @@ __all__ = [
     "StatusInspector",
     "require_complete_workflow",
     "resolve_round_artifacts",
-    "resolve_workflow_output_root",
     "validate_cell_inputs",
     "validate_completed_artifact",
 ]

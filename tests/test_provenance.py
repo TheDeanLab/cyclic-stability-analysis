@@ -31,6 +31,30 @@ class _FakePlaneReader:
         return self.planes[channel, plane_index + 1]
 
 
+@dataclass
+class _CountingMismatchReader:
+    calls: list[tuple[str, str, int]]
+
+    def nd2_plane(self, _path: Path, channel: str, plane_index: int) -> np.ndarray:
+        self.calls.append(("nd2", channel, plane_index))
+        return (
+            np.ones((1, 1), dtype=np.uint16)
+            if channel == "target" and plane_index == 1
+            else np.zeros((1, 1), dtype=np.uint16)
+        )
+
+    def tiff_plane(self, path: Path, plane_index: int) -> np.ndarray:
+        channel = (
+            "target"
+            if "647_golgi" in path.name
+            else "tubulin"
+            if "488_tubulin" in path.name
+            else "dapi"
+        )
+        self.calls.append(("tiff", channel, plane_index))
+        return np.zeros((1, 1), dtype=np.uint16)
+
+
 @pytest.fixture
 def fake_round(tmp_path: Path) -> RoundSpec:
     """A validated round with five-plane channel TIFF exports."""
@@ -92,3 +116,27 @@ def test_exact_export_match_checks_three_channels_and_three_planes(
         ("dapi", (0, 2, 4)),
     ]
     assert all(match.exact for match in matches)
+
+
+def test_mismatch_still_reads_every_declared_channel_plane(
+    fake_round: RoundSpec,
+) -> None:
+    """A first-plane mismatch must not overstate unexamined planes as audited."""
+    reader = _CountingMismatchReader([])
+    matches = compare_nd2_export(fake_round, reader=reader)
+    assert [match.exact for match in matches] == [False, True, True]
+    assert len([call for call in reader.calls if call[0] == "nd2"]) == 9
+    assert len([call for call in reader.calls if call[0] == "tiff"]) == 9
+
+
+def test_three_plane_stacks_are_audited_at_first_middle_and_last(
+    fake_round: RoundSpec,
+) -> None:
+    """The stated first/middle/last policy needs no undocumented fifth plane."""
+    for path in fake_round.tiff_directory.glob("*.tif"):
+        tifffile.imwrite(
+            path, np.zeros((3, 2, 2), dtype=np.uint16), photometric="minisblack"
+        )
+    reader = _CountingMismatchReader([])
+    matches = compare_nd2_export(fake_round, reader=reader)
+    assert [match.plane_indices for match in matches] == [(0, 1, 2)] * 3
