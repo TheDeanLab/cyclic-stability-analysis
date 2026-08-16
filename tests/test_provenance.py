@@ -8,7 +8,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
-
 from cyclic_stability.models import RoundSpec
 from cyclic_stability.provenance import PlaneReader, compare_nd2_export
 

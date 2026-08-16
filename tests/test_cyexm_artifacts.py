@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 from cyclic_stability.cyexm_artifacts import (
     StatusInspector,
     resolve_round_artifacts,
@@ -40,14 +39,13 @@ def golgi_round_two(tmp_path: Path) -> RoundSpec:
     output_root = tmp_path / "workflow-root"
     profile = tmp_path / "execution.yaml"
     profile.write_text(
-        """schema_version: 1
+        f"""schema_version: 1
 executor: sequential
 paths:
   dataset_root: /synthetic/raw
-  output_root: %s
+  output_root: {output_root}
   worker_local_directory: null
-"""
-        % output_root,
+""",
         encoding="utf-8",
     )
     dataset_root = output_root / "synthetic"
@@ -109,14 +107,13 @@ def _lamin_round(
     output_root = tmp_path / "workflow-root"
     profile = tmp_path / "execution.yaml"
     profile.write_text(
-        """schema_version: 1
+        f"""schema_version: 1
 executor: sequential
 paths:
   dataset_root: /synthetic/raw
-  output_root: %s
+  output_root: {output_root}
   worker_local_directory: null
-"""
-        % output_root,
+""",
         encoding="utf-8",
     )
     round_root = output_root / "synthetic" / "rounds" / f"round-{workflow_round:03d}"

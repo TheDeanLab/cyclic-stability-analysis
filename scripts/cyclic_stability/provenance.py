@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import nd2
 import numpy as np
 import tifffile
+from cyexm.errors import InputValidationError
 
 from cyclic_stability.models import RoundSpec
-from cyexm.errors import InputValidationError
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +34,11 @@ class PlaneReader(Protocol):
 
 
 class _ProductionPlaneReader:
-    _CHANNEL_INDICES = {"target": 0, "tubulin": 1, "dapi": 2}
+    _CHANNEL_INDICES: ClassVar[dict[str, int]] = {
+        "target": 0,
+        "tubulin": 1,
+        "dapi": 2,
+    }
 
     def nd2_plane(self, path: Path, channel: str, plane_index: int) -> np.ndarray:
         """Read one physical ND2 Z plane without materializing the volume."""

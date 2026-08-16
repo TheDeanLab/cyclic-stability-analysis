@@ -28,10 +28,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from cyclic_stability.config import load_analysis_config  # noqa: E402
-from cyclic_stability.cyexm_artifacts import resolve_round_artifacts  # noqa: E402
-from cyclic_stability.provenance import compare_nd2_export  # noqa: E402
-from cyexm.errors import InputValidationError  # noqa: E402
+from cyclic_stability.config import load_analysis_config
+from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
+from cyclic_stability.provenance import compare_nd2_export
+from cyexm.errors import InputValidationError
 
 
 def _parser() -> argparse.ArgumentParser:

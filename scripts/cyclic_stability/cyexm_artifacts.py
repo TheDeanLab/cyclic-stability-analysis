@@ -6,8 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from cyclic_stability.models import CellSpec, RoundSpec
-from cyclic_stability.provenance import ChannelMatch, compare_nd2_export
 from cyexm.config.execution import load_execution_profile
 from cyexm.errors import InputValidationError
 from cyexm.registration.artifacts import ArtifactStore, CompletionRecord, FileIdentity
@@ -15,6 +13,9 @@ from cyexm.registration.whole_image import RegistrationPaths
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import WorkflowStatus
 from cyexm.workflow.status import inspect_workflow_status
+
+from cyclic_stability.models import CellSpec, RoundSpec
+from cyclic_stability.provenance import ChannelMatch, compare_nd2_export
 
 type StatusInspector = Callable[[str | Path, str], WorkflowStatus]
 
