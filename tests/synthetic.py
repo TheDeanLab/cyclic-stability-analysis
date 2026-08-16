@@ -211,6 +211,43 @@ def synthetic_shell(radius_um: float, shell_width_um: float) -> NDArray[np.float
     return lamin
 
 
+def synthetic_golgi(components: int = 1) -> NDArray[np.float64]:
+    """Return deterministic, separated perinuclear Golgi objects in physical ZYX."""
+    if components < 1 or components > 4:
+        raise ValueError("components must be between one and four")
+    z, y, x = np.indices((48, 128, 128), dtype=np.float64)
+    physical_z = (z - 23.5) * SPACING[2]
+    physical_y = (y - 63.5) * SPACING[1]
+    physical_x = (x - 63.5) * SPACING[0]
+    image = 1.0 + 0.05 * np.sin(physical_x) * np.cos(physical_y)
+    centers = ((2.4, 0.0, 0.0), (-2.4, 0.0, 0.0), (0.0, 2.4, 0.0), (0.0, -2.4, 0.0))
+    for center in centers[:components]:
+        radius = np.sqrt(
+            (physical_x - center[0]) ** 2
+            + (physical_y - center[1]) ** 2
+            + (physical_z - center[2]) ** 2
+        )
+        image += 80.0 * np.exp(-0.5 * (radius / 0.32) ** 2)
+    return image
+
+
+def synthetic_perinuclear_roi() -> NDArray[np.bool_]:
+    """Return a fixed target-independent exterior ring in the Golgi geometry."""
+    z, y, x = np.indices((48, 128, 128), dtype=np.float64)
+    radius = np.sqrt(
+        ((x - 63.5) * SPACING[0]) ** 2
+        + ((y - 63.5) * SPACING[1]) ** 2
+        + ((z - 23.5) * SPACING[2]) ** 2
+    )
+    return (radius > 1.2) & (radius <= 4.5)
+
+
+def synthetic_dapi_rounds() -> dict[int, NDArray[np.float64]]:
+    """Return deterministic registered DAPI rounds sharing the Golgi geometry."""
+    dapi, _ = synthetic_nucleus(radius_um=1.2, shell_width_um=0.4)
+    return {2: dapi, 3: dapi.copy()}
+
+
 def synthetic_backgrounds(rounds: tuple[int, ...]) -> dict[int, BackgroundSummary]:
     """Return the exact robust-background fixture for the synthetic volumes."""
     return {
