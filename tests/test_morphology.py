@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from cyclic_stability.models import AnalysisConfig
 from cyclic_stability.morphology import (
+    SurfaceMetrics,
     gaussian_sigma_zyx,
     median_surface_metrics,
     resolution_surface_metrics,
@@ -159,3 +162,73 @@ def test_median_surface_summary_preserves_members_and_excludes_empty_comparisons
     assert summary.median_surface_dice[1.0] == pytest.approx(
         (1.0 + shifted.surface_dice[1.0]) / 2.0
     )
+    assert sum(summary.status_counts.values()) == summary.member_count
+
+
+def _measured_surface_metric() -> SurfaceMetrics:
+    """Return one hand-specified valid direct-construction aggregation payload."""
+    return SurfaceMetrics(
+        fixed_to_moving_normalized_distance_p95=0.2,
+        moving_to_fixed_normalized_distance_p95=0.3,
+        normalized_distance_p95=0.3,
+        surface_dice={1.0: 0.8},
+        jaccard=0.7,
+        comparison_status="both-nonempty",
+    )
+
+
+@pytest.mark.parametrize(
+    ("member", "message"),
+    (
+        (
+            replace(_measured_surface_metric(), comparison_status="unknown"),
+            "unknown comparison status",
+        ),
+        (
+            replace(_measured_surface_metric(), normalized_distance_p95=None),
+            "both-nonempty",
+        ),
+        (
+            replace(_measured_surface_metric(), surface_dice={1.0: float("nan")}),
+            "surface Dice.*finite",
+        ),
+        (
+            replace(_measured_surface_metric(), jaccard=float("inf")),
+            "Jaccard.*finite",
+        ),
+        (
+            replace(_measured_surface_metric(), surface_dice={1.0: 1.1}),
+            "surface Dice.*0.*1",
+        ),
+        (
+            replace(
+                _measured_surface_metric(),
+                comparison_status="both-empty",
+                fixed_to_moving_normalized_distance_p95=None,
+                moving_to_fixed_normalized_distance_p95=None,
+                normalized_distance_p95=None,
+                surface_dice={1.0: 1.0},
+                jaccard=1.0,
+            ),
+            "both-empty payload",
+        ),
+        (
+            replace(
+                _measured_surface_metric(),
+                comparison_status="fixed-empty",
+                fixed_to_moving_normalized_distance_p95=0.0,
+                moving_to_fixed_normalized_distance_p95=None,
+                normalized_distance_p95=None,
+                surface_dice={1.0: 0.0},
+                jaccard=0.0,
+            ),
+            "one-empty payload",
+        ),
+    ),
+)
+def test_median_surface_summary_rejects_invalid_direct_member_payloads(
+    member: SurfaceMetrics, message: str
+) -> None:
+    """Malformed direct dataclass construction must fail before NumPy aggregation."""
+    with pytest.raises(ValueError, match=message):
+        median_surface_metrics((member,))

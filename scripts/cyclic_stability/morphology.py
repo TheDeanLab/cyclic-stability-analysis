@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from numbers import Real
 from types import MappingProxyType
 from typing import Literal
 
@@ -54,6 +55,14 @@ class RobustSurfaceSummary:
     median_surface_dice: Mapping[float, float | None]
     median_jaccard: float | None
     status_counts: Mapping[str, int]
+
+
+SURFACE_COMPARISON_STATUSES = (
+    "both-nonempty",
+    "both-empty",
+    "fixed-empty",
+    "moving-empty",
+)
 
 
 def _spacing_xyz(
@@ -275,6 +284,8 @@ def median_surface_metrics(
     """
     if not members:
         raise ValueError("surface metric ensemble must contain at least one member")
+    for member in members:
+        _validate_surface_metric_payload(member)
     tolerance_keys = tuple(members[0].surface_dice)
     if any(tuple(member.surface_dice) != tolerance_keys for member in members):
         raise ValueError("surface metric members must use identical tolerances")
@@ -283,8 +294,10 @@ def median_surface_metrics(
     )
     counts = {
         status: sum(member.comparison_status == status for member in members)
-        for status in ("both-nonempty", "both-empty", "fixed-empty", "moving-empty")
+        for status in SURFACE_COMPARISON_STATUSES
     }
+    if sum(counts.values()) != len(members):
+        raise ValueError("surface metric status counts must equal member_count")
     if not measured:
         return RobustSurfaceSummary(
             member_count=len(members),
@@ -296,11 +309,7 @@ def median_surface_metrics(
             median_jaccard=None,
             status_counts=MappingProxyType(counts),
         )
-    distances = [
-        member.normalized_distance_p95
-        for member in measured
-        if member.normalized_distance_p95 is not None
-    ]
+    distances = [float(member.normalized_distance_p95) for member in measured]
     return RobustSurfaceSummary(
         member_count=len(members),
         measured_member_count=len(measured),
@@ -315,6 +324,61 @@ def median_surface_metrics(
         ),
         median_jaccard=float(np.median([member.jaccard for member in measured])),
         status_counts=MappingProxyType(counts),
+    )
+
+
+def _validate_surface_metric_payload(member: SurfaceMetrics) -> None:
+    """Reject manually constructed metric payloads inconsistent with their status."""
+    status = member.comparison_status
+    if status not in SURFACE_COMPARISON_STATUSES:
+        raise ValueError(f"unknown comparison status: {status!r}")
+    if not member.surface_dice:
+        raise ValueError("surface Dice mapping must contain at least one tolerance")
+    for tolerance, value in member.surface_dice.items():
+        if not _finite_real(tolerance) or float(tolerance) <= 0.0:
+            raise ValueError("surface Dice tolerances must be finite and positive")
+        if not _finite_real(value):
+            raise ValueError("surface Dice values must be finite")
+        if not 0.0 <= float(value) <= 1.0:
+            raise ValueError("surface Dice must be between 0 and 1")
+    if not _finite_real(member.jaccard):
+        raise ValueError("Jaccard must be finite")
+    if not 0.0 <= float(member.jaccard) <= 1.0:
+        raise ValueError("Jaccard must be between 0 and 1")
+    distances = (
+        member.fixed_to_moving_normalized_distance_p95,
+        member.moving_to_fixed_normalized_distance_p95,
+        member.normalized_distance_p95,
+    )
+    if status == "both-nonempty":
+        if any(
+            value is None or not _finite_real(value) or float(value) < 0.0
+            for value in distances
+        ):
+            raise ValueError("both-nonempty requires finite non-negative distances")
+        return
+    if status == "both-empty":
+        if (
+            distances != (0.0, 0.0, 0.0)
+            or any(float(value) != 1.0 for value in member.surface_dice.values())
+            or float(member.jaccard) != 1.0
+        ):
+            raise ValueError("both-empty payload must report deterministic agreement")
+        return
+    if (
+        distances != (None, None, None)
+        or any(float(value) != 0.0 for value in member.surface_dice.values())
+        or float(member.jaccard) != 0.0
+    ):
+        raise ValueError(
+            "one-empty payload must report undefined distances and zero agreement"
+        )
+
+
+def _finite_real(value: object) -> bool:
+    """Return whether an input is a non-Boolean finite real scalar."""
+    return (
+        isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(value)
     )
 
 
