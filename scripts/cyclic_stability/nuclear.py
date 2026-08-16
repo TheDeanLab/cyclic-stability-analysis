@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import csv
 import math
-from collections.abc import Mapping
+import os
+import shutil
+import tempfile
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -181,10 +184,19 @@ def _surface_normals_and_curvature(
     vertices_xyz_um: NDArray[np.float64],
     spacing_xyz_um: tuple[float, float, float],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Sample outward physical normals and matching signed-distance curvature.
+
+    The signed field is positive outside the foreground and negative inside:
+    ``edt(~mask) - edt(mask)``. Its normalized physical gradient is outward and
+    its divergence uses exactly the same orientation. One-voxel zero padding
+    provides an outside field for an allowed face-contacting nucleus, with the
+    interpolation coordinates shifted by exactly that padding.
+    """
     sx, sy, sz = spacing_xyz_um
+    padded = np.pad(mask, 1)
     signed = distance_transform_edt(
-        mask, sampling=(sz, sy, sx)
-    ) - distance_transform_edt(~mask, sampling=(sz, sy, sx))
+        ~padded, sampling=(sz, sy, sx)
+    ) - distance_transform_edt(padded, sampling=(sz, sy, sx))
     gradients_zyx = np.gradient(signed, sz, sy, sx)
     gradient_xyz = np.stack(
         (gradients_zyx[2], gradients_zyx[1], gradients_zyx[0]), axis=-1
@@ -192,35 +204,35 @@ def _surface_normals_and_curvature(
     norm = np.linalg.norm(gradient_xyz, axis=-1, keepdims=True)
     if not np.all(np.isfinite(norm)):
         raise ValueError("signed-distance gradient is non-finite")
-    inward = np.divide(
+    outward = np.divide(
         gradient_xyz,
         norm,
         out=np.zeros_like(gradient_xyz),
         where=norm > 0.0,
     )
     divergence = (
-        np.gradient(inward[..., 0], sx, axis=2)
-        + np.gradient(inward[..., 1], sy, axis=1)
-        + np.gradient(inward[..., 2], sz, axis=0)
+        np.gradient(outward[..., 0], sx, axis=2)
+        + np.gradient(outward[..., 1], sy, axis=1)
+        + np.gradient(outward[..., 2], sz, axis=0)
     )
     sample_zyx = np.vstack(
         (
-            vertices_xyz_um[:, 2] / sz,
-            vertices_xyz_um[:, 1] / sy,
-            vertices_xyz_um[:, 0] / sx,
+            vertices_xyz_um[:, 2] / sz + 1.0,
+            vertices_xyz_um[:, 1] / sy + 1.0,
+            vertices_xyz_um[:, 0] / sx + 1.0,
         )
     )
-    sampled_inward = np.vstack(
-        [map_coordinates(inward[..., axis], sample_zyx, order=1) for axis in range(3)]
+    sampled_outward = np.vstack(
+        [map_coordinates(outward[..., axis], sample_zyx, order=1) for axis in range(3)]
     ).T
-    lengths = np.linalg.norm(sampled_inward, axis=1)
+    lengths = np.linalg.norm(sampled_outward, axis=1)
     if not np.all(np.isfinite(lengths)) or np.any(lengths <= 0.0):
         raise ValueError("surface normal interpolation is degenerate")
-    normals = -sampled_inward / lengths[:, None]
-    centroid = vertices_xyz_um.mean(axis=0)
-    direction = vertices_xyz_um - centroid
-    flip = np.sum(normals * direction, axis=1) < 0.0
-    normals[flip] *= -1.0
+    normals = sampled_outward / lengths[:, None]
+    foreground_zyx = np.argwhere(mask)
+    if foreground_zyx.size == 0:
+        raise ValueError("surface mask has no foreground centroid")
+    centroid = foreground_zyx.mean(axis=0)[::-1] * np.array((sx, sy, sz))
     curvature = map_coordinates(divergence, sample_zyx, order=1)
     if not np.all(np.isfinite(curvature)):
         raise ValueError("surface curvature interpolation is non-finite")
@@ -265,8 +277,11 @@ def consensus_nuclear_surface(
     mask = _largest_component(smoothed > threshold_otsu(smoothed))
     mask = binary_fill_holes(mask)
     _reject_face_touch(mask)
-    mask = binary_closing(
-        mask, structure=_physical_ball(_DAPI_LATERAL_RESOLUTION_UM, spacing)
+    mask = (
+        binary_closing(
+            mask, structure=_physical_ball(_DAPI_LATERAL_RESOLUTION_UM, spacing)
+        )
+        | mask
     )
     mask = _largest_component(mask)
     _reject_face_touch(mask)
@@ -491,7 +506,8 @@ def _metric_rows(
     rows: list[MetricRow] = []
     for round_number in sorted({row.acquisition_round for row in profiles}):
         subset = [row for row in profiles if row.acquisition_round == round_number]
-        supported = [
+        current_supported = [row for row in subset if row.supported]
+        paired_supported = [
             row
             for row in subset
             if row.supported and math.isfinite(row.displacement_um)
@@ -504,29 +520,42 @@ def _metric_rows(
                 "fraction",
             ),
         }
-        if supported:
+        if paired_supported:
             values.update(
                 {
                     "lamin_signed_displacement_median": (
-                        float(np.median([row.displacement_um for row in supported])),
+                        float(
+                            np.median([row.displacement_um for row in paired_supported])
+                        ),
                         "um",
                     ),
                     "lamin_absolute_displacement_median": (
                         float(
                             np.median(
-                                [row.absolute_displacement_um for row in supported]
+                                [
+                                    row.absolute_displacement_um
+                                    for row in paired_supported
+                                ]
                             )
                         ),
                         "um",
                     ),
+                }
+            )
+        if current_supported:
+            values.update(
+                {
                     "lamin_fwhm_median": (
-                        float(np.median([row.fwhm_um for row in supported])),
+                        float(np.median([row.fwhm_um for row in current_supported])),
                         "um",
                     ),
                     "lamin_integrated_ridge_intensity_median": (
                         float(
                             np.median(
-                                [row.integrated_ridge_intensity for row in supported]
+                                [
+                                    row.integrated_ridge_intensity
+                                    for row in current_supported
+                                ]
                             )
                         ),
                         "a.u. um",
@@ -542,7 +571,9 @@ def _metric_rows(
                     endpoint,
                     value,
                     units,
-                    "matched-settings",
+                    "round-1-exposure-sensitivity"
+                    if round_number == 1
+                    else "matched-settings",
                     True,
                     config.config_digest,
                 )
@@ -607,6 +638,31 @@ def _write_profile_diagnostics(
         plt.close(figure)
         projection_paths.append(path)
     return (surface_path, profile_path, *projection_paths)
+
+
+def _atomic_publish_directory(
+    destination: Path, populate: Callable[[Path], None]
+) -> None:
+    """Atomically replace a complete Lamin output tree on its destination filesystem."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staged = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.stage-", dir=destination.parent)
+    )
+    backup = destination.with_name(f".{destination.name}.previous")
+    if backup.exists():
+        shutil.rmtree(backup)
+    try:
+        populate(staged)
+        if destination.exists():
+            os.replace(destination, backup)
+        os.replace(staged, destination)
+    except BaseException:
+        shutil.rmtree(staged, ignore_errors=True)
+        if backup.exists() and not destination.exists():
+            os.replace(backup, destination)
+        raise
+    else:
+        shutil.rmtree(backup, ignore_errors=True)
 
 
 def _geometry(
@@ -805,7 +861,19 @@ def analyze_lamin_cell(
                         config,
                     )
                 )
-    diagnostics = _write_profile_diagnostics(output_dir, surface, profiles)
+    staged_diagnostics: tuple[Path, ...] = ()
+    staging_root: Path | None = None
+
+    def populate_diagnostics(staged: Path) -> None:
+        nonlocal staged_diagnostics, staging_root
+        staging_root = staged
+        staged_diagnostics = _write_profile_diagnostics(staged, surface, profiles)
+
+    _atomic_publish_directory(output_dir, populate_diagnostics)
+    assert staging_root is not None
+    diagnostics = tuple(
+        output_dir / path.relative_to(staging_root) for path in staged_diagnostics
+    )
     identities = tuple(
         str(path)
         for artifact in artifacts
