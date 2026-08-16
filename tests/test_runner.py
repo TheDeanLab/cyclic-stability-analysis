@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from cyclic_stability.runner import run_tasks
+from cyclic_stability.runner import initialize_run, run_tasks
 from synthetic import normalized_table_bytes, profile, synthetic_tasks
 
 
@@ -52,3 +52,26 @@ def test_cli_rejects_run_directory_and_results_root_together(tmp_path: Path) -> 
     )
     assert result.returncode == 2
     assert "not allowed with argument" in result.stderr
+
+
+def test_production_cli_declares_the_direct_nd2_runtime_pin() -> None:
+    text = Path("scripts/run_analysis.py").read_text(encoding="utf-8")
+    assert '"nd2==0.11.3"' in text
+
+
+def test_initialization_reopens_only_the_same_immutable_run(tmp_path: Path) -> None:
+    inputs = []
+    for name in ("analysis.yaml", "correspondence.csv", "qc.csv", "execution.yaml"):
+        path = tmp_path / name
+        path.write_text(name, encoding="utf-8")
+        inputs.append(path)
+    kwargs = {
+        "analysis_config": inputs[0],
+        "correspondence": inputs[1],
+        "qc_decisions": inputs[2],
+        "execution_profile": inputs[3],
+        "config_digest": "same-digest",
+    }
+    run_dir = tmp_path / "run"
+    initialize_run(run_dir, **kwargs)
+    initialize_run(run_dir, **kwargs)

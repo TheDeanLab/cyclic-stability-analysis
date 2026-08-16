@@ -8,9 +8,11 @@ analyzer that may load NumPy, ANTs, or a BLAS implementation.
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import os
 import re
+import stat
 import time
 import traceback
 import uuid
@@ -207,12 +209,19 @@ def _read_reusable(task: CellTask, complete: Path) -> TaskRecord | None:
         pointer = json.loads(complete.read_text(encoding="utf-8"))
         if set(pointer) != {"attempt_id", "record"}:
             return None
-        record_path = (
-            complete.parent
-            / "attempts"
-            / str(pointer["attempt_id"])
-            / str(pointer["record"])
-        )
+        attempt_id = str(pointer["attempt_id"])
+        if (
+            not re.fullmatch(r"[0-9a-f]{32}", attempt_id)
+            or pointer["record"] != "record.json"
+        ):
+            return None
+        attempts_root = (complete.parent / "attempts").resolve(strict=True)
+        attempt_dir = (attempts_root / attempt_id).resolve(strict=True)
+        if attempt_dir.parent != attempts_root:
+            return None
+        record_path = attempt_dir / "record.json"
+        if record_path.is_symlink() or not stat.S_ISREG(record_path.stat().st_mode):
+            return None
         record = _record_from_payload(
             json.loads(record_path.read_text(encoding="utf-8"))
         )
@@ -224,6 +233,13 @@ def _read_reusable(task: CellTask, complete: Path) -> TaskRecord | None:
         or record.config_digest != task.config_digest
         or record.software_identity != task.software_identity
         or record.input_identities != task.input_identities
+        or record.attempt_dir.resolve(strict=True) != attempt_dir
+        or any(
+            path.is_symlink()
+            or not stat.S_ISREG(path.stat().st_mode)
+            or attempt_dir not in path.resolve(strict=True).parents
+            for path in (Path(identity.path) for identity in record.output_identities)
+        )
         or not _current_identities_match(task.input_identities)
         or not _current_identities_match(record.output_identities)
     ):
@@ -246,7 +262,11 @@ def _csv_table(path: Path, rows: tuple[Mapping[str, object], ...]) -> None:
 
 
 def _directory_size(path: Path) -> int:
-    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+    return sum(
+        item.stat().st_size
+        for item in path.rglob("*")
+        if not item.is_symlink() and stat.S_ISREG(item.stat().st_mode)
+    )
 
 
 def _qc_gate(task: CellTask) -> None:
@@ -273,12 +293,20 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     _qc_gate(task)  # Must precede any analyzer import or target-volume opening.
     if task.config is None:
         raise ValueError("production marker analysis requires an AnalysisConfig")
-    from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
+    from cyclic_stability.cyexm_artifacts import validate_cell_inputs
     from cyclic_stability.golgi import analyze_golgi_cell
+    from cyclic_stability.images import load_volume
     from cyclic_stability.lysosome import analyze_lamp1_cell
+    from cyclic_stability.morphology import threshold_ensemble
     from cyclic_stability.nuclear import analyze_lamin_cell
+    from cyclic_stability.provenance import channel_tiff_paths
+    from cyclic_stability.registration_qc import analyze_registration_qc
+    from cyclic_stability.signal import measure_signal, raw_structure_roi
 
-    artifacts = tuple(resolve_round_artifacts(item) for item in task.cell.rounds)
+    # Exact ND2/TIFF and completion provenance are validated before target analysis.
+    validated = validate_cell_inputs(task.cell)
+    artifacts = validated.rounds
+    qc = analyze_registration_qc(task.cell, artifacts, output_dir / "target-blind-qc")
     analyzer = {
         "golgi": analyze_golgi_cell,
         "lamin": analyze_lamin_cell,
@@ -287,12 +315,43 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     if analyzer is None:
         raise ValueError(f"unsupported cohort: {task.cell.cohort}")
     result = analyzer(task.cell, artifacts, task.config, output_dir / "diagnostics")
+    decisions = {
+        (item.cohort, item.cell_id, item.acquisition_round): item.decision
+        for item in task.config.qc_decisions
+    }
+    signal_rows: list[Mapping[str, object]] = []
+    for round_spec in task.cell.rounds:
+        if (
+            round_spec.acquisition_round != task.config.reference_acquisition_round
+            and decisions[
+                (round_spec.cohort, round_spec.cell_id, round_spec.acquisition_round)
+            ]
+            != "accept"
+        ):
+            continue
+        paths = dict(channel_tiff_paths(round_spec))
+        raw_dapi = load_volume(paths["dapi"])
+        raw_target = load_volume(paths["target"])
+        roi = raw_structure_roi(round_spec.cohort, raw_dapi, task.config)
+        members = threshold_ensemble(
+            raw_target,
+            roi,
+            task.config.ensembles.gaussian_sigma_um,
+            task.config.ensembles.threshold_sbr,
+            task.config.voxel_spacing_xyz_um,
+        )
+        signal_rows.extend(
+            asdict(row) for row in measure_signal(round_spec, raw_target, roi, members)
+        )
     return TaskOutput(
         tables={
+            "registration-qc": qc.registration_rows,
+            "deformation-qc": qc.deformation_rows,
             "summary": tuple(asdict(item) for item in result.summary_rows),
             "ensemble": tuple(asdict(item) for item in result.ensemble_rows),
+            "raw-signal": tuple(signal_rows),
         },
-        diagnostics=result.diagnostics,
+        diagnostics=(*qc.overlay_paths, *result.diagnostics),
     )
 
 
@@ -300,6 +359,14 @@ def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
     """Run one immutable attempt or return an exactly matching complete attempt."""
     configure_native_threads(task.native_threads)
     task_dir = run_dir / "tasks" / task.key
+    task_dir.mkdir(parents=True, exist_ok=True)
+    with (task_dir / ".task.lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _run_cell_task_locked(task, task_dir)
+
+
+def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
+    """Execute under the kernel lock that serializes reuse and publication."""
     reusable = None if task.force else _read_reusable(task, task_dir / "complete.json")
     if reusable is not None:
         return reusable
@@ -326,7 +393,12 @@ def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
             _csv_table(path, rows)
             table_paths.append(path)
         output_paths = tuple(table_paths) + tuple(output.diagnostics)
-        if not output_paths or not all(path.is_file() for path in output_paths):
+        if not output_paths or not all(
+            path.is_file()
+            and not path.is_symlink()
+            and attempt_dir in path.resolve(strict=True).parents
+            for path in output_paths
+        ):
             raise ValueError("analyzer did not produce valid task outputs")
         after = process.io_counters()
         peak = max(peak, process.memory_info().rss)

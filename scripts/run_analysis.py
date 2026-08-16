@@ -2,13 +2,17 @@
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
 #   "cy-exm[workflow] @ git+https://github.com/TheDeanLab/Cy-ExM.git@c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52",
+#   "nd2==0.11.3",
 #   "PyYAML>=6,<7",
 #   "psutil>=5.9,<8",
 #   "numpy>=1.26,<3",
 #   "scipy>=1.12,<2",
 #   "scikit-image>=0.22,<1",
 #   "tifffile>=2025.1.10",
+#   "pandas>=2.2,<3",
 #   "matplotlib>=3.8,<4",
+#   "seaborn>=0.13,<1",
+#   "Jinja2>=3.1,<4",
 # ]
 # ///
 """Run restart-safe, target-blind-gated cyclic marker-cell analyses."""
@@ -17,6 +21,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
+import subprocess
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -45,6 +51,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _pilot_cell(config, cohorts: tuple[str, ...]):
+    if len(cohorts) != 1:
+        raise ValueError("--pilot-first-accepted requires exactly one --cohort")
     decisions = {
         (value.cohort, value.cell_id, value.acquisition_round): value.decision
         for value in config.qc_decisions
@@ -70,6 +78,49 @@ def _write_selection(run_dir: Path, payload: dict[str, object]) -> None:
     target.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _software_identity() -> str:
+    """Return pinned interpreter, analysis-tree, Cy-ExM, and runtime versions."""
+    from importlib.metadata import version
+
+    dependencies = (
+        "nd2",
+        "numpy",
+        "scipy",
+        "scikit-image",
+        "tifffile",
+        "PyYAML",
+        "psutil",
+    )
+    versions = {name: version(name) for name in dependencies}
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    dirty = bool(
+        subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+    )
+    return json.dumps(
+        {
+            "analysis_commit": commit,
+            "analysis_dirty": dirty,
+            "cyexm_commit": "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52",
+            "python": platform.python_version(),
+            "dependencies": versions,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """Initialize one immutable run and execute its selected deterministic task set."""
     args = _parser().parse_args(argv)
@@ -82,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         configure_native_threads,
         run_cell_task,
     )
+    from cyexm.registration.artifacts import FileIdentity
 
     config = load_analysis_config(
         args.analysis_config, args.correspondence, args.qc_decisions
@@ -89,7 +141,30 @@ def main(argv: list[str] | None = None) -> int:
     profile = load_execution_profile(args.execution_profile)
     configure_native_threads(profile.native_threads)
     cohorts = tuple(args.cohort)
+    known_cohorts = {cell.cohort for cell in config.cells}
+    if any(cohort not in known_cohorts for cohort in cohorts):
+        raise ValueError("--cohort must name a configured cohort")
+    if profile.mode == "slurm" and args.task_index is None:
+        raise ValueError("SLURM execution requires --task-index")
     tasks = build_tasks(config, cohorts)
+    run_input_identities = tuple(
+        FileIdentity.from_path(path)
+        for path in (
+            args.analysis_config,
+            args.correspondence,
+            args.qc_decisions,
+            args.execution_profile,
+        )
+    )
+    software_identity = _software_identity()
+    tasks = tuple(
+        replace(
+            task,
+            input_identities=(*task.input_identities, *run_input_identities),
+            software_identity=software_identity,
+        )
+        for task in tasks
+    )
     if args.cell is not None:
         tasks = tuple(task for task in tasks if task.cell.cell_id == args.cell)
     selected = None

@@ -33,6 +33,19 @@ profiles deliberately keep machine resources separate from frozen scientific inp
 the local profile is sequential with conservative pre-pilot values and the optional
 SLURM profile requests one process per array element.
 
+For a validated SLURM profile, submit one immutable task index per array element;
+the Python runner never submits jobs itself.  After determining the task count from
+the validated configuration, use the profile's array concurrency and resources, for
+example:
+
+```bash
+sbatch --array=0-24%3 --cpus-per-task=4 --mem=32G --time=12:00:00 \
+  --wrap='uv run --script scripts/run_analysis.py \
+    --analysis-config config/analysis.yaml --correspondence config/correspondence.csv \
+    --qc-decisions config/qc-decisions.csv --execution-profile config/execution-slurm.yaml \
+    --run-dir results/20260816-example --cohort golgi --task-index "$SLURM_ARRAY_TASK_ID"'
+```
+
 ## Run identity and outputs
 
 Each run identity is derived from the digest of the validated scientific YAML,

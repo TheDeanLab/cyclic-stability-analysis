@@ -10,7 +10,7 @@ from typing import Literal
 import numpy as np
 from numpy.typing import NDArray
 
-from cyclic_stability.models import RoundSpec
+from cyclic_stability.models import AnalysisConfig, RoundSpec
 from cyclic_stability.morphology import MaskMember, validated_binary_mask
 
 
@@ -38,6 +38,28 @@ class SignalRow:
 
 
 PERCENTILES = (10, 25, 50, 75, 90, 95, 99)
+
+
+def raw_structure_roi(
+    cohort: str, raw_dapi_zyx: NDArray[np.generic], config: AnalysisConfig
+) -> NDArray[np.bool_]:
+    """Return a target-independent, raw-DAPI structure ROI for one acquisition.
+
+    This shared Task 4 helper deliberately never receives a target image.  A
+    per-round consensus call avoids cross-round native-grid assumptions.
+    """
+    from cyclic_stability.nuclear import consensus_nuclear_surface
+
+    surface = consensus_nuclear_surface(
+        {config.reference_acquisition_round: raw_dapi_zyx},
+        config.voxel_spacing_xyz_um,
+        config.nuclear,
+    )
+    if cohort == "lamin":
+        return surface.mask_zyx
+    if cohort in {"golgi", "lamp1"}:
+        return ~surface.mask_zyx
+    raise ValueError(f"unsupported cohort for raw signal ROI: {cohort}")
 
 
 def _percentiles(values: NDArray[np.float64]) -> Mapping[int, float]:
@@ -143,4 +165,4 @@ def measure_signal(
     return tuple(rows)
 
 
-__all__ = ["PERCENTILES", "SignalRow", "measure_signal"]
+__all__ = ["PERCENTILES", "SignalRow", "measure_signal", "raw_structure_roi"]

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import json
+import multiprocessing
 import os
 import uuid
 from concurrent.futures import ProcessPoolExecutor
@@ -85,7 +87,10 @@ def run_tasks(
     if profile.mode == "sequential":
         records = tuple(_worker(task, run_dir) for task in configured)
     else:
-        with ProcessPoolExecutor(max_workers=profile.max_workers) as executor:
+        with ProcessPoolExecutor(
+            max_workers=profile.max_workers,
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as executor:
             futures = {
                 task.key: executor.submit(_worker, task, run_dir) for task in configured
             }
@@ -109,7 +114,6 @@ def initialize_run(
     results_root: Path | None = None,
 ) -> None:
     """Snapshot immutable run configuration and atomically publish latest pointer."""
-    run_dir.mkdir(parents=True, exist_ok=False)
     config_dir = run_dir / "config"
     copies = {
         "analysis.yaml": analysis_config,
@@ -117,27 +121,49 @@ def initialize_run(
         "qc-decisions.csv": qc_decisions,
         "execution-profile.yaml": execution_profile,
     }
-    digests: dict[str, str] = {}
-    for name, source in copies.items():
-        destination = config_dir / name
-        _atomic_bytes(destination, source.read_bytes())
-        digests[name] = _sha256(destination)
-    _atomic_bytes(
-        run_dir / "run.json",
-        (
-            json.dumps(
-                {
-                    "config_digest": config_digest,
-                    "config_sha256": digests,
-                    "cyexm_commit": "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52",
-                    "initialized_at": datetime.now(UTC).isoformat(),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
-        ).encode(),
-    )
+    digests = {name: _sha256(source) for name, source in copies.items()}
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = run_dir.parent / f".{run_dir.name}.initialize.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if run_dir.exists():
+            try:
+                existing = json.loads(
+                    (run_dir / "run.json").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    "existing run has no valid immutable run record"
+                ) from error
+            if (
+                existing.get("config_digest") != config_digest
+                or existing.get("config_sha256") != digests
+                or existing.get("cyexm_commit")
+                != "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52"
+            ):
+                raise ValueError(
+                    "existing run identity does not match immutable inputs"
+                )
+            return
+        run_dir.mkdir()
+        for name, source in copies.items():
+            _atomic_bytes(config_dir / name, source.read_bytes())
+        _atomic_bytes(
+            run_dir / "run.json",
+            (
+                json.dumps(
+                    {
+                        "config_digest": config_digest,
+                        "config_sha256": digests,
+                        "cyexm_commit": "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52",
+                        "initialized_at": datetime.now(UTC).isoformat(),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode(),
+        )
     if results_root is not None:
         _atomic_bytes(
             results_root / "latest-run.txt", (str(run_dir.resolve()) + "\n").encode()
