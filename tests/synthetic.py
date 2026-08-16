@@ -5,6 +5,9 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+from cyexm.registration.artifacts import ArtifactStore, StageRequest
+from cyexm.spatial import ImageGeometry
+
 CORRESPONDENCE_COLUMNS = (
     "cohort",
     "cell_id",
@@ -94,3 +97,30 @@ def write_synthetic_correspondence(path: Path) -> None:
                         "identity_method": "exact-pixel-audit",
                     }
                 )
+
+
+def write_completion_fixture(path: Path, payload: bytes) -> Path:
+    """Write one synthetic Cy-ExM artifact with its canonical completion record."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    request = StageRequest.for_files(
+        stage="synthetic",
+        inputs=(),
+        geometry=ImageGeometry(
+            shape=(1, 1, 1),
+            origin=(0.0, 0.0, 0.0),
+            spacing=(1.0, 1.0, 1.0),
+            direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        ),
+        method="synthetic",
+        accuracy="synthetic",
+        native_threads={},
+        upstream=None,
+        parameters={},
+    )
+    ArtifactStore().commit(
+        path,
+        request,
+        lambda target: target.write_bytes(payload),
+        lambda target: target.read_bytes() == payload,
+    )
+    return path
