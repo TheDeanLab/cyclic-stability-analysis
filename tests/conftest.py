@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from cyclic_stability.config import load_analysis_config
+from cyclic_stability.models import AnalysisConfig
 from synthetic import ANALYSIS_YAML, write_synthetic_correspondence
 
 
@@ -21,3 +23,9 @@ def config_files(tmp_path: Path) -> tuple[Path, Path, Path]:
         encoding="utf-8",
     )
     return analysis, correspondence, decisions
+
+
+@pytest.fixture
+def analysis_config(config_files: tuple[Path, Path, Path]) -> AnalysisConfig:
+    """Return the validated frozen configuration used by Task 4 sensitivity tests."""
+    return load_analysis_config(*config_files)

@@ -6,6 +6,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -26,17 +27,33 @@ class MaskMember:
     threshold_sbr: float
     background: BackgroundSummary
     spacing_xyz_um: tuple[float, float, float]
+    mask_status: Literal["nonempty", "empty"]
 
 
 @dataclass(frozen=True, slots=True)
 class SurfaceMetrics:
     """Bidirectional resolution-normalized boundary agreement measures."""
 
-    fixed_to_moving_normalized_distance_p95: float
-    moving_to_fixed_normalized_distance_p95: float
-    normalized_distance_p95: float
+    fixed_to_moving_normalized_distance_p95: float | None
+    moving_to_fixed_normalized_distance_p95: float | None
+    normalized_distance_p95: float | None
     surface_dice: Mapping[float, float]
     jaccard: float
+    comparison_status: Literal[
+        "both-nonempty", "both-empty", "fixed-empty", "moving-empty"
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class RobustSurfaceSummary:
+    """Median surface metrics while retaining all individual ensemble curves."""
+
+    member_count: int
+    measured_member_count: int
+    median_normalized_distance_p95: float | None
+    median_surface_dice: Mapping[float, float | None]
+    median_jaccard: float | None
+    status_counts: Mapping[str, int]
 
 
 def _spacing_xyz(
@@ -66,7 +83,7 @@ def _validated_image_and_roi(
 ) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
     """Validate matching finite ZYX signal and independent structure ROI volumes."""
     source = np.asarray(image)
-    mask = np.asarray(roi, dtype=bool)
+    mask = validated_binary_mask(roi, "ROI")
     if source.ndim != 3 or mask.ndim != 3 or source.shape != mask.shape:
         raise ValueError("image and ROI must be matching 3D ZYX volumes")
     if not np.issubdtype(source.dtype, np.number) or np.issubdtype(
@@ -76,6 +93,27 @@ def _validated_image_and_roi(
     if not np.all(np.isfinite(source)):
         raise ValueError("image must contain only finite values")
     return source.astype(np.float64, copy=False), mask
+
+
+def validated_binary_mask(
+    values: NDArray[np.generic], name: str = "mask"
+) -> NDArray[np.bool_]:
+    """Return a Boolean mask only when input is Boolean or finite binary 0/1.
+
+    Direct Boolean coercion would turn NaN, negative, and nonbinary values into
+    foreground. This boundary accepts only Boolean arrays or real, finite arrays
+    containing exactly zero and one.
+    """
+    array = np.asarray(values)
+    if array.dtype == np.bool_:
+        return array
+    if not np.issubdtype(array.dtype, np.number) or np.issubdtype(
+        array.dtype, np.complexfloating
+    ):
+        raise ValueError(f"{name} must be Boolean or finite binary 0/1")
+    if not np.all(np.isfinite(array)) or not np.all((array == 0) | (array == 1)):
+        raise ValueError(f"{name} must be Boolean or finite binary 0/1")
+    return array.astype(bool)
 
 
 def threshold_ensemble(
@@ -115,6 +153,7 @@ def threshold_ensemble(
                     threshold_sbr=threshold,
                     background=background,
                     spacing_xyz_um=spacing,
+                    mask_status="nonempty" if np.any(mask) else "empty",
                 )
             )
     return tuple(members)
@@ -124,9 +163,9 @@ def _surface_vertices_xyz(
     mask_zyx: NDArray[np.bool_], spacing_xyz_um: tuple[float, float, float]
 ) -> NDArray[np.float64]:
     """Return padded binary-mask marching-cubes vertices in physical XYZ order."""
-    mask = np.asarray(mask_zyx, dtype=bool)
-    if mask.ndim != 3 or not np.any(mask):
-        raise ValueError("surface masks must be non-empty 3D ZYX volumes")
+    mask = validated_binary_mask(mask_zyx, "surface mask")
+    if mask.ndim != 3:
+        raise ValueError("surface masks must be 3D ZYX volumes")
     sx, sy, sz = spacing_xyz_um
     padded = np.pad(mask.astype(np.float32), 1)
     vertices_zyx, _, _, _ = marching_cubes(padded, level=0.5, spacing=(sz, sy, sx))
@@ -155,11 +194,34 @@ def resolution_surface_metrics(
     tolerance_units: float | tuple[float, ...],
 ) -> SurfaceMetrics:
     """Measure bidirectional surface agreement in theoretical-resolution units."""
-    fixed = np.asarray(fixed_mask, dtype=bool)
-    moving = np.asarray(moving_mask, dtype=bool)
+    fixed = validated_binary_mask(fixed_mask, "fixed mask")
+    moving = validated_binary_mask(moving_mask, "moving mask")
     if fixed.ndim != 3 or moving.ndim != 3 or fixed.shape != moving.shape:
         raise ValueError("fixed and moving masks must be matching 3D ZYX volumes")
     spacing = _spacing_xyz(spacing_xyz_um)
+    tolerances = _tolerances(tolerance_units)
+    fixed_empty = not np.any(fixed)
+    moving_empty = not np.any(moving)
+    if fixed_empty or moving_empty:
+        if fixed_empty and moving_empty:
+            return SurfaceMetrics(
+                fixed_to_moving_normalized_distance_p95=0.0,
+                moving_to_fixed_normalized_distance_p95=0.0,
+                normalized_distance_p95=0.0,
+                surface_dice=MappingProxyType(
+                    {tolerance: 1.0 for tolerance in tolerances}
+                ),
+                jaccard=1.0,
+                comparison_status="both-empty",
+            )
+        return SurfaceMetrics(
+            fixed_to_moving_normalized_distance_p95=None,
+            moving_to_fixed_normalized_distance_p95=None,
+            normalized_distance_p95=None,
+            surface_dice=MappingProxyType({tolerance: 0.0 for tolerance in tolerances}),
+            jaccard=0.0,
+            comparison_status="fixed-empty" if fixed_empty else "moving-empty",
+        )
     fixed_xyz = _surface_vertices_xyz(fixed, spacing)
     moving_xyz = _surface_vertices_xyz(moving, spacing)
     reference_xyz = np.array(
@@ -179,13 +241,13 @@ def resolution_surface_metrics(
     distances = np.concatenate((fixed_to_moving, moving_to_fixed))
     dice = {
         tolerance: float(
-            0.5
-            * (
-                np.mean(fixed_to_moving <= tolerance)
-                + np.mean(moving_to_fixed <= tolerance)
+            (
+                np.count_nonzero(fixed_to_moving <= tolerance)
+                + np.count_nonzero(moving_to_fixed <= tolerance)
             )
+            / (fixed_to_moving.size + moving_to_fixed.size)
         )
-        for tolerance in _tolerances(tolerance_units)
+        for tolerance in tolerances
     }
     union = np.logical_or(fixed, moving).sum()
     return SurfaceMetrics(
@@ -198,13 +260,71 @@ def resolution_surface_metrics(
         normalized_distance_p95=float(np.percentile(distances, 95.0)),
         surface_dice=MappingProxyType(dice),
         jaccard=float(np.logical_and(fixed, moving).sum() / union),
+        comparison_status="both-nonempty",
+    )
+
+
+def median_surface_metrics(
+    members: tuple[SurfaceMetrics, ...],
+) -> RobustSurfaceSummary:
+    """Return medians over nonempty comparisons while retaining every curve member.
+
+    Both-empty and one-empty members remain in the per-member result curve but do
+    not contribute numeric distance or Dice medians: absence is an explicit status,
+    not a measured boundary displacement.
+    """
+    if not members:
+        raise ValueError("surface metric ensemble must contain at least one member")
+    tolerance_keys = tuple(members[0].surface_dice)
+    if any(tuple(member.surface_dice) != tolerance_keys for member in members):
+        raise ValueError("surface metric members must use identical tolerances")
+    measured = tuple(
+        member for member in members if member.comparison_status == "both-nonempty"
+    )
+    counts = {
+        status: sum(member.comparison_status == status for member in members)
+        for status in ("both-nonempty", "both-empty", "fixed-empty", "moving-empty")
+    }
+    if not measured:
+        return RobustSurfaceSummary(
+            member_count=len(members),
+            measured_member_count=0,
+            median_normalized_distance_p95=None,
+            median_surface_dice=MappingProxyType(
+                {tolerance: None for tolerance in tolerance_keys}
+            ),
+            median_jaccard=None,
+            status_counts=MappingProxyType(counts),
+        )
+    distances = [
+        member.normalized_distance_p95
+        for member in measured
+        if member.normalized_distance_p95 is not None
+    ]
+    return RobustSurfaceSummary(
+        member_count=len(members),
+        measured_member_count=len(measured),
+        median_normalized_distance_p95=float(np.median(distances)),
+        median_surface_dice=MappingProxyType(
+            {
+                tolerance: float(
+                    np.median([member.surface_dice[tolerance] for member in measured])
+                )
+                for tolerance in tolerance_keys
+            }
+        ),
+        median_jaccard=float(np.median([member.jaccard for member in measured])),
+        status_counts=MappingProxyType(counts),
     )
 
 
 __all__ = [
     "MaskMember",
+    "RobustSurfaceSummary",
     "SurfaceMetrics",
     "gaussian_sigma_zyx",
+    "median_surface_metrics",
     "resolution_surface_metrics",
     "threshold_ensemble",
+    "validated_binary_mask",
 ]

@@ -43,7 +43,7 @@ def load_volume(path: Path) -> NDArray[np.generic]:
     """
     try:
         image = tifffile.memmap(path, mode="r")
-    except (OSError, ValueError, tifffile.TiffFileError):
+    except (OSError, TypeError, ValueError, tifffile.TiffFileError):
         image = tifffile.imread(path)
     result = _validated_volume(np.asarray(image))
     result.setflags(write=False)
