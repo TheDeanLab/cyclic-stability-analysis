@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from cyclic_stability.task import run_cell_task
 from synthetic import cell_task, different_identity
 
@@ -55,3 +56,17 @@ def test_record_keeps_the_exact_software_version_identity(tmp_path: Path) -> Non
     task = cell_task(tmp_path)
     record = run_cell_task(task, tmp_path)
     assert record.software_versions == (task.software_identity,)
+
+
+def test_symlinked_attempts_root_is_rejected_without_writing_outside(
+    tmp_path: Path,
+) -> None:
+    task = cell_task(tmp_path)
+    task_dir = tmp_path / "tasks" / task.key
+    task_dir.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (task_dir / "attempts").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        run_cell_task(task, tmp_path)
+    assert not list(outside.iterdir())

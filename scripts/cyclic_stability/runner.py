@@ -99,8 +99,8 @@ def run_tasks(
     return RunRecord(records, _write_compact(records, run_dir))
 
 
-def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _sha256_bytes(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
 
 
 def initialize_run(
@@ -121,7 +121,10 @@ def initialize_run(
         "qc-decisions.csv": qc_decisions,
         "execution-profile.yaml": execution_profile,
     }
-    digests = {name: _sha256(source) for name, source in copies.items()}
+    # Read each mutable source once: this is the exact byte sequence both hashed
+    # and persisted, so a writer cannot create a digest/copy TOCTOU split.
+    snapshots = {name: source.read_bytes() for name, source in copies.items()}
+    digests = {name: _sha256_bytes(payload) for name, payload in snapshots.items()}
     run_dir.parent.mkdir(parents=True, exist_ok=True)
     lock_path = run_dir.parent / f".{run_dir.name}.initialize.lock"
     with lock_path.open("a+b") as lock:
@@ -136,18 +139,30 @@ def initialize_run(
                     "existing run has no valid immutable run record"
                 ) from error
             if (
-                existing.get("config_digest") != config_digest
+                set(existing)
+                != {
+                    "config_digest",
+                    "config_sha256",
+                    "cyexm_commit",
+                    "initialized_at",
+                }
+                or existing.get("config_digest") != config_digest
                 or existing.get("config_sha256") != digests
                 or existing.get("cyexm_commit")
                 != "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52"
+                or any(
+                    not (config_dir / name).is_file()
+                    or _sha256_bytes((config_dir / name).read_bytes()) != digest
+                    for name, digest in digests.items()
+                )
             ):
                 raise ValueError(
-                    "existing run identity does not match immutable inputs"
+                    "existing frozen run identity does not match immutable inputs"
                 )
             return
         run_dir.mkdir()
-        for name, source in copies.items():
-            _atomic_bytes(config_dir / name, source.read_bytes())
+        for name, payload in snapshots.items():
+            _atomic_bytes(config_dir / name, payload)
         _atomic_bytes(
             run_dir / "run.json",
             (

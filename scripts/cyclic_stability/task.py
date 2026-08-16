@@ -230,10 +230,12 @@ def _read_reusable(task: CellTask, complete: Path) -> TaskRecord | None:
     if (
         record.status != "complete"
         or record.key != task.key
+        or record.attempt_id != attempt_id
         or record.config_digest != task.config_digest
         or record.software_identity != task.software_identity
         or record.input_identities != task.input_identities
         or record.attempt_dir.resolve(strict=True) != attempt_dir
+        or not record.output_identities
         or any(
             path.is_symlink()
             or not stat.S_ISREG(path.stat().st_mode)
@@ -358,8 +360,21 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
 def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
     """Run one immutable attempt or return an exactly matching complete attempt."""
     configure_native_threads(task.native_threads)
-    task_dir = run_dir / "tasks" / task.key
+    run_root = run_dir.resolve()
+    tasks_root = run_root / "tasks"
+    tasks_root.mkdir(parents=True, exist_ok=True)
+    if tasks_root.is_symlink() or not stat.S_ISDIR(tasks_root.stat().st_mode):
+        raise ValueError("task root must be a real nonsymlink directory")
+    task_dir = tasks_root / task.key
     task_dir.mkdir(parents=True, exist_ok=True)
+    if task_dir.is_symlink() or not stat.S_ISDIR(task_dir.stat().st_mode):
+        raise ValueError("task directory must be a real nonsymlink directory")
+    attempts_root = task_dir / "attempts"
+    if attempts_root.exists() and (
+        attempts_root.is_symlink() or not stat.S_ISDIR(attempts_root.stat().st_mode)
+    ):
+        raise ValueError("attempts directory must be a real nonsymlink directory")
+    attempts_root.mkdir(exist_ok=True)
     with (task_dir / ".task.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         return _run_cell_task_locked(task, task_dir)

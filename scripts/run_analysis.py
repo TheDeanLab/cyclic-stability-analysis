@@ -20,10 +20,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import platform
 import subprocess
 import sys
+import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -74,8 +77,19 @@ def _pilot_cell(config, cohorts: tuple[str, ...]):
 
 
 def _write_selection(run_dir: Path, payload: dict[str, object]) -> None:
+    """Durably publish the optional selection record without partial JSON."""
     target = run_dir / "selection.json"
-    target.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, target)
+    directory = os.open(run_dir, os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _software_identity() -> str:
@@ -99,19 +113,18 @@ def _software_identity() -> str:
         capture_output=True,
         check=True,
     ).stdout.strip()
-    dirty = bool(
-        subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=ROOT,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout.strip()
-    )
+    tree = hashlib.sha256()
+    for path in sorted((ROOT / "scripts").rglob("*.py")):
+        relative = path.relative_to(ROOT).as_posix().encode()
+        tree.update(len(relative).to_bytes(8, "big"))
+        tree.update(relative)
+        payload = path.read_bytes()
+        tree.update(len(payload).to_bytes(8, "big"))
+        tree.update(payload)
     return json.dumps(
         {
             "analysis_commit": commit,
-            "analysis_dirty": dirty,
+            "analysis_tree_sha256": tree.hexdigest(),
             "cyexm_commit": "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52",
             "python": platform.python_version(),
             "dependencies": versions,
@@ -141,11 +154,18 @@ def main(argv: list[str] | None = None) -> int:
     profile = load_execution_profile(args.execution_profile)
     configure_native_threads(profile.native_threads)
     cohorts = tuple(args.cohort)
-    known_cohorts = {cell.cohort for cell in config.cells}
+    known_cohorts = {"golgi", "lamin", "lamp1"}
     if any(cohort not in known_cohorts for cohort in cohorts):
         raise ValueError("--cohort must name a configured cohort")
     if profile.mode == "slurm" and args.task_index is None:
         raise ValueError("SLURM execution requires --task-index")
+    if args.cell is not None and not any(
+        cell.cell_id == args.cell and (not cohorts or cell.cohort in cohorts)
+        for cell in config.cells
+    ):
+        raise KeyError(
+            "--cell does not match a configured cell in the requested cohort"
+        )
     tasks = build_tasks(config, cohorts)
     run_input_identities = tuple(
         FileIdentity.from_path(path)

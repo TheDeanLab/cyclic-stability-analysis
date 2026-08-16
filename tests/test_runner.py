@@ -6,8 +6,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from cyclic_stability.runner import initialize_run, run_tasks
-from synthetic import normalized_table_bytes, profile, synthetic_tasks
+from synthetic import (
+    ANALYSIS_YAML,
+    normalized_table_bytes,
+    profile,
+    synthetic_tasks,
+    write_synthetic_correspondence,
+)
 
 
 def test_sequential_and_process_modes_produce_identical_compact_tables(
@@ -75,3 +82,63 @@ def test_initialization_reopens_only_the_same_immutable_run(tmp_path: Path) -> N
     run_dir = tmp_path / "run"
     initialize_run(run_dir, **kwargs)
     initialize_run(run_dir, **kwargs)
+
+
+def test_reopen_rejects_a_corrupted_frozen_snapshot(tmp_path: Path) -> None:
+    sources = []
+    for name in ("analysis.yaml", "correspondence.csv", "qc.csv", "execution.yaml"):
+        path = tmp_path / name
+        path.write_text(name, encoding="utf-8")
+        sources.append(path)
+    kwargs = {
+        "analysis_config": sources[0],
+        "correspondence": sources[1],
+        "qc_decisions": sources[2],
+        "execution_profile": sources[3],
+        "config_digest": "same-digest",
+    }
+    run_dir = tmp_path / "run"
+    initialize_run(run_dir, **kwargs)
+    (run_dir / "config" / "analysis.yaml").write_text("corrupt", encoding="utf-8")
+    with pytest.raises(ValueError, match="frozen"):
+        initialize_run(run_dir, **kwargs)
+
+
+def test_empty_lamp_inventory_is_an_unavailable_success(tmp_path: Path) -> None:
+    analysis = tmp_path / "analysis.yaml"
+    correspondence = tmp_path / "correspondence.csv"
+    decisions = tmp_path / "qc.csv"
+    execution = tmp_path / "execution.yaml"
+    analysis.write_text(ANALYSIS_YAML, encoding="utf-8")
+    write_synthetic_correspondence(correspondence)
+    decisions.write_text(
+        "cohort,cell_id,acquisition_round,decision,reasons,reviewer,reviewed_at\n",
+        encoding="utf-8",
+    )
+    execution.write_text(
+        "mode: sequential\nmax_workers: 1\nnative_threads: 1\nscratch_root: /tmp/scratch\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_analysis.py",
+            "--analysis-config",
+            str(analysis),
+            "--correspondence",
+            str(correspondence),
+            "--qc-decisions",
+            str(decisions),
+            "--execution-profile",
+            str(execution),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--cohort",
+            "lamp1",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert "unavailable" in result.stdout
