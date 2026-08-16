@@ -5,8 +5,10 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
+import numpy as np
 from cyexm.registration.artifacts import ArtifactStore, StageRequest
 from cyexm.spatial import ImageGeometry
+from numpy.typing import NDArray
 
 CORRESPONDENCE_COLUMNS = (
     "cohort",
@@ -124,3 +126,12 @@ def write_completion_fixture(path: Path, payload: bytes) -> Path:
         lambda target: target.read_bytes() == payload,
     )
     return path
+
+
+def synthetic_folded_warp(shape: tuple[int, int, int]) -> NDArray[np.float64]:
+    """Return a ZYX/XYZ displacement with a folded central X slab."""
+    warp = np.zeros((*shape, 3), dtype=np.float64)
+    x0 = shape[2] // 3
+    x1 = shape[2] - x0
+    warp[:, :, x0:x1, 0] = -2.0 * np.arange(x1 - x0, dtype=np.float64)
+    return warp

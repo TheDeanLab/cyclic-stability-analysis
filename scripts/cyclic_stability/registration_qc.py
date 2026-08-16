@@ -1,0 +1,605 @@
+"""Target-blind physical registration and deformation quality-control summaries."""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+from cyexm.metrics import read_metrics
+from cyexm.registration.backend import AntsRegistrationBackend
+from cyexm.runtime import NativeThreadConfig
+from numpy.typing import NDArray
+from scipy.linalg import polar, rq
+from scipy.spatial.transform import Rotation
+
+from cyclic_stability.cyexm_artifacts import RoundArtifacts
+from cyclic_stability.models import CellSpec, RoundSpec
+from cyclic_stability.units import ResolutionReference, theoretical_resolution
+
+
+@dataclass(frozen=True, slots=True)
+class AffineSummary:
+    """Physical XYZ affine decomposition; pose fields are not morphology endpoints."""
+
+    determinant: float
+    singular_values: tuple[float, float, float]
+    scale_xyz: tuple[float, float, float]
+    anisotropy: float
+    rotation_xyz_deg: tuple[float, float, float]
+    translation_xyz_um: tuple[float, float, float]
+    shear_xy_deg: float
+    shear_xz_deg: float
+    shear_yz_deg: float
+    translation_role: str = "repositioning"
+    rotation_role: str = "repositioning"
+
+
+@dataclass(frozen=True, slots=True)
+class WarpSummary:
+    """Physical deformation summary for a selected set of fixed-grid voxels."""
+
+    displacement_p50_um: float
+    displacement_p95_um: float
+    fraction_over_one_resolution: float
+    jacobian_p05: float
+    jacobian_p50: float
+    jacobian_p95: float
+    jacobian_nonpositive_count: int
+    gradient_frobenius_p50: float
+    gradient_frobenius_p95: float
+    flags: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RegistrationQcResult:
+    """Target-blind QC records, overlays, and explicitly undecided moving rounds."""
+
+    registration_rows: tuple[dict[str, object], ...]
+    deformation_rows: tuple[dict[str, object], ...]
+    automated_validity: tuple[tuple[int, bool], ...]
+    overlay_paths: tuple[Path, ...]
+    seam_summaries: tuple[WarpSummary, ...]
+    interior_summaries: tuple[WarpSummary, ...]
+    decision_requests: tuple[dict[str, object], ...]
+
+
+def decompose_affine(matrix_xyz: NDArray[np.float64]) -> AffineSummary:
+    """Decompose a physical 4-by-4 XYZ affine using polar and RQ factors."""
+    matrix = np.asarray(matrix_xyz, dtype=np.float64)
+    if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
+        raise ValueError("affine matrix must be finite with shape (4, 4)")
+    linear = matrix[:3, :3]
+    rotation_matrix, symmetric = polar(linear)
+    upper, _ = rq(symmetric)
+    scales = np.abs(np.diag(upper))
+    if np.any(scales == 0.0):
+        raise ValueError("affine matrix has a singular scale factor")
+    if np.linalg.det(rotation_matrix) < 0.0:
+        rotation_deg = (math.nan, math.nan, math.nan)
+    else:
+        rotation_deg = tuple(
+            float(value)
+            for value in Rotation.from_matrix(rotation_matrix).as_euler(
+                "xyz", degrees=True
+            )
+        )
+    shear_xy = math.degrees(math.atan(upper[0, 1] / upper[1, 1]))
+    shear_xz = math.degrees(math.atan(upper[0, 2] / upper[2, 2]))
+    shear_yz = math.degrees(math.atan(upper[1, 2] / upper[2, 2]))
+    singular_values = tuple(
+        float(value) for value in np.linalg.svd(linear, compute_uv=False)
+    )
+    return AffineSummary(
+        determinant=float(np.linalg.det(linear)),
+        singular_values=singular_values,
+        scale_xyz=tuple(float(value) for value in scales),
+        anisotropy=float(max(singular_values) / min(singular_values)),
+        rotation_xyz_deg=rotation_deg,
+        translation_xyz_um=tuple(float(value) for value in matrix[:3, 3]),
+        shear_xy_deg=float(shear_xy),
+        shear_xz_deg=float(shear_xz),
+        shear_yz_deg=float(shear_yz),
+    )
+
+
+def deformation_gradient(
+    warp_zyx_xyz: NDArray[np.float64],
+    spacing_xyz_um: tuple[float, float, float],
+) -> NDArray[np.float64]:
+    """Return ``I + du/dx`` with physical XYZ derivatives on a ZYX volume."""
+    sx, sy, sz = spacing_xyz_um
+    gradients = [np.gradient(warp_zyx_xyz[..., c], sz, sy, sx) for c in range(3)]
+    field = np.zeros((*warp_zyx_xyz.shape[:3], 3, 3), dtype=np.float64)
+    field[..., 0, :] = np.stack(
+        (gradients[0][2], gradients[0][1], gradients[0][0]), axis=-1
+    )
+    field[..., 1, :] = np.stack(
+        (gradients[1][2], gradients[1][1], gradients[1][0]), axis=-1
+    )
+    field[..., 2, :] = np.stack(
+        (gradients[2][2], gradients[2][1], gradients[2][0]), axis=-1
+    )
+    field += np.eye(3)
+    return field
+
+
+def _validate_warp(
+    warp_zyx_xyz: NDArray[np.float64], spacing_xyz_um: tuple[float, float, float]
+) -> NDArray[np.float64]:
+    warp = np.asarray(warp_zyx_xyz, dtype=np.float64)
+    if warp.ndim != 4 or warp.shape[-1] != 3 or not np.isfinite(warp).all():
+        raise ValueError("warp must be a finite ZYX volume with three XYZ components")
+    if any(not math.isfinite(value) or value <= 0.0 for value in spacing_xyz_um):
+        raise ValueError("spacing_xyz_um must contain three finite positive values")
+    return warp
+
+
+def _summarize_warp(
+    warp_zyx_xyz: NDArray[np.float64],
+    spacing_xyz_um: tuple[float, float, float],
+    resolution: ResolutionReference,
+    mask: NDArray[np.bool_] | None = None,
+) -> WarpSummary:
+    warp = _validate_warp(warp_zyx_xyz, spacing_xyz_um)
+    gradient = deformation_gradient(warp, spacing_xyz_um)
+    displacement = np.linalg.vector_norm(warp, axis=-1)
+    normalized = np.sqrt(
+        (warp[..., 0] / resolution.lateral_expanded_um) ** 2
+        + (warp[..., 1] / resolution.lateral_expanded_um) ** 2
+        + (warp[..., 2] / resolution.axial_expanded_um) ** 2
+    )
+    jacobian = np.linalg.det(gradient)
+    gradient_norm = np.linalg.norm(gradient - np.eye(3), ord="fro", axis=(-2, -1))
+    selected = np.ones(warp.shape[:3], dtype=bool) if mask is None else mask
+    if selected.shape != warp.shape[:3] or not selected.any():
+        raise ValueError("summary mask must select at least one ZYX voxel")
+    values = lambda array: array[selected]
+    nonpositive = int(np.count_nonzero(values(jacobian) <= 0.0))
+    flags = ("nonpositive-jacobian",) if nonpositive else ()
+    return WarpSummary(
+        displacement_p50_um=float(np.percentile(values(displacement), 50)),
+        displacement_p95_um=float(np.percentile(values(displacement), 95)),
+        fraction_over_one_resolution=float(np.mean(values(normalized) > 1.0)),
+        jacobian_p05=float(np.percentile(values(jacobian), 5)),
+        jacobian_p50=float(np.percentile(values(jacobian), 50)),
+        jacobian_p95=float(np.percentile(values(jacobian), 95)),
+        jacobian_nonpositive_count=nonpositive,
+        gradient_frobenius_p50=float(np.percentile(values(gradient_norm), 50)),
+        gradient_frobenius_p95=float(np.percentile(values(gradient_norm), 95)),
+        flags=flags,
+    )
+
+
+def summarize_warp(
+    warp_zyx_xyz: NDArray[np.float64],
+    spacing_xyz_um: tuple[float, float, float],
+    resolution: ResolutionReference,
+) -> WarpSummary:
+    """Summarize a physical XYZ displacement vector field on its ZYX grid."""
+    return _summarize_warp(warp_zyx_xyz, spacing_xyz_um, resolution)
+
+
+def seam_adjacency_mask(
+    manifest_path: Path, shape_zyx: tuple[int, int, int]
+) -> NDArray[np.bool_]:
+    """Mark voxels within 16 expanded-image pixels of an internal core boundary."""
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    chunks = payload.get("chunks")
+    if not isinstance(chunks, list):
+        raise TypeError("chunk manifest has no chunks list")
+    boundaries: tuple[set[int], set[int], set[int]] = (set(), set(), set())
+    for item in chunks:
+        chunk = item.get("chunk", item) if isinstance(item, dict) else None
+        if not isinstance(chunk, dict):
+            raise TypeError("chunk manifest has an invalid chunk entry")
+        for axis, name in enumerate(("z", "y", "x")):
+            for suffix in ("start", "end"):
+                value = chunk.get(f"{name}_{suffix}")
+                if isinstance(value, int) and 0 < value < shape_zyx[axis]:
+                    boundaries[axis].add(value)
+    grid = np.indices(shape_zyx)
+    mask = np.zeros(shape_zyx, dtype=bool)
+    for axis, values in enumerate(boundaries):
+        for boundary in values:
+            mask |= np.abs(grid[axis] - boundary) <= 16
+    return mask
+
+
+def _physical_affine(transform: object) -> NDArray[np.float64]:
+    parameters = np.asarray(transform.parameters, dtype=np.float64)
+    center = np.asarray(transform.fixed_parameters, dtype=np.float64)
+    if parameters.shape != (12,) or center.shape != (3,):
+        raise ValueError("ANTs affine transform has unexpected parameters")
+    linear = parameters[:9].reshape(3, 3)
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = linear
+    matrix[:3, 3] = parameters[9:] + center - linear @ center
+    return matrix
+
+
+def _load_overlay_volume(path: Path) -> NDArray[np.float64]:
+    import tifffile
+
+    array = np.asarray(tifffile.imread(path), dtype=np.float64)
+    if array.ndim != 3 or not np.isfinite(array).all():
+        raise ValueError(f"invalid target-blind channel volume: {path}")
+    return array
+
+
+def _projection_overlay(
+    first: NDArray[np.float64], second: NDArray[np.float64], axis: int
+) -> NDArray[np.uint8]:
+    first_projection = np.max(first, axis=axis)
+    second_projection = np.max(second, axis=axis)
+
+    def scale(image: NDArray[np.float64]) -> NDArray[np.uint8]:
+        high = float(np.percentile(image, 99.5))
+        if not math.isfinite(high) or high <= 0.0:
+            return np.zeros(image.shape, dtype=np.uint8)
+        return np.clip(image * (255.0 / high), 0, 255).astype(np.uint8)
+
+    red, green = scale(first_projection), scale(second_projection)
+    return np.stack((red, green, np.zeros_like(red)), axis=-1)
+
+
+def _padded_pair(
+    first: NDArray[np.float64], second: NDArray[np.float64]
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Center-pad native-space images solely for an unregistered visual overlay."""
+    shape = tuple(
+        max(left, right) for left, right in zip(first.shape, second.shape, strict=True)
+    )
+
+    def padded(image: NDArray[np.float64]) -> NDArray[np.float64]:
+        result = np.zeros(shape, dtype=np.float64)
+        starts = tuple(
+            (target - actual) // 2
+            for target, actual in zip(shape, image.shape, strict=True)
+        )
+        slices = tuple(
+            slice(start, start + length)
+            for start, length in zip(starts, image.shape, strict=True)
+        )
+        result[slices] = image
+        return result
+
+    return padded(first), padded(second)
+
+
+def _source_channel(round_spec: RoundSpec, suffix: str) -> Path:
+    return (
+        round_spec.tiff_directory / f"round_{round_spec.acquisition_round}_{suffix}.tif"
+    )
+
+
+def _write_stage_overlays(
+    stage: str,
+    reference_dapi: NDArray[np.float64],
+    moving_dapi: NDArray[np.float64],
+    reference_tubulin: NDArray[np.float64],
+    moving_tubulin: NDArray[np.float64],
+    moving: RoundArtifacts,
+    output_dir: Path,
+) -> tuple[Path, ...]:
+    import tifffile
+
+    paths: list[Path] = []
+    for marker, fixed, transformed in (
+        ("dapi", reference_dapi, moving_dapi),
+        ("tubulin", reference_tubulin, moving_tubulin),
+    ):
+        if fixed.shape != transformed.shape:
+            if stage != "pre":
+                raise ValueError(
+                    f"{stage} target-blind overlay channels have mismatched shapes"
+                )
+            fixed, transformed = _padded_pair(fixed, transformed)
+        for name, axis in (("xy", 0), ("xz", 1), ("yz", 2)):
+            path = (
+                output_dir
+                / f"{moving.acquisition_round:02d}-{marker}-{stage}-{name}.tif"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tifffile.imwrite(path, _projection_overlay(fixed, transformed, axis))
+            paths.append(path)
+    return tuple(paths)
+
+
+def _write_target_blind_overlays(
+    cell: CellSpec,
+    reference: RoundArtifacts,
+    moving: RoundArtifacts,
+    transform: object,
+    backend: AntsRegistrationBackend,
+    output_dir: Path,
+) -> tuple[Path, ...]:
+    """Write pre-, affine-, and nonlinear DAPI/tubulin overlays without targets."""
+    round_specs = {
+        round_spec.acquisition_round: round_spec for round_spec in cell.rounds
+    }
+    reference_spec, moving_spec = round_specs[2], round_specs[moving.acquisition_round]
+    reference_dapi_pre = _load_overlay_volume(
+        _source_channel(reference_spec, "405_DAPI")
+    )
+    moving_dapi_pre = _load_overlay_volume(_source_channel(moving_spec, "405_DAPI"))
+    reference_tubulin_pre = _load_overlay_volume(
+        _source_channel(reference_spec, "488_tubulin")
+    )
+    moving_tubulin_pre = _load_overlay_volume(
+        _source_channel(moving_spec, "488_tubulin")
+    )
+    reference_dapi_image = backend.load_image(
+        _source_channel(reference_spec, "405_DAPI"), (0.108333, 0.108333, 0.3)
+    )
+    reference_tubulin_image = backend.load_image(
+        _source_channel(reference_spec, "488_tubulin"), (0.108333, 0.108333, 0.3)
+    )
+    moving_dapi_image = backend.load_image(
+        _source_channel(moving_spec, "405_DAPI"), (0.108333, 0.108333, 0.3)
+    )
+    moving_tubulin_image = backend.load_image(
+        _source_channel(moving_spec, "488_tubulin"), (0.108333, 0.108333, 0.3)
+    )
+    moving_dapi_affine = np.asarray(
+        backend.to_array(
+            backend.apply_affine(
+                fixed=reference_dapi_image,
+                moving=moving_dapi_image,
+                transform=transform,
+                interpolation="linear",
+            )
+        ),
+        dtype=np.float64,
+    )
+    moving_tubulin_affine = np.asarray(
+        backend.to_array(
+            backend.apply_affine(
+                fixed=reference_tubulin_image,
+                moving=moving_tubulin_image,
+                transform=transform,
+                interpolation="linear",
+            )
+        ),
+        dtype=np.float64,
+    )
+    reference_dapi = _load_overlay_volume(reference.registered_dapi)
+    moving_dapi = _load_overlay_volume(moving.registered_dapi)
+    reference_tubulin = _load_overlay_volume(reference.registered_tubulin)
+    moving_tubulin = _load_overlay_volume(moving.registered_tubulin)
+    return (
+        *_write_stage_overlays(
+            "pre",
+            reference_dapi_pre,
+            moving_dapi_pre,
+            reference_tubulin_pre,
+            moving_tubulin_pre,
+            moving,
+            output_dir,
+        ),
+        *_write_stage_overlays(
+            "affine",
+            np.asarray(backend.to_array(reference_dapi_image), dtype=np.float64),
+            moving_dapi_affine,
+            np.asarray(backend.to_array(reference_tubulin_image), dtype=np.float64),
+            moving_tubulin_affine,
+            moving,
+            output_dir,
+        ),
+        *_write_stage_overlays(
+            "nonlinear",
+            reference_dapi,
+            moving_dapi,
+            reference_tubulin,
+            moving_tubulin,
+            moving,
+            output_dir,
+        ),
+    )
+
+
+def _csv_rows(
+    path: Path, fieldnames: tuple[str, ...], rows: tuple[dict[str, object], ...]
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def _summary_row(prefix: str, summary: WarpSummary) -> dict[str, object]:
+    return {f"{prefix}_{key}": value for key, value in asdict(summary).items()}
+
+
+def analyze_registration_qc(
+    cell: CellSpec, artifacts: tuple[RoundArtifacts, ...], output_dir: Path
+) -> RegistrationQcResult:
+    """Write target-blind QC evidence for validated artifacts from one cell.
+
+    This function intentionally accesses only DAPI, tubulin, transforms, warp,
+    chunk-manifest, and metric artifacts.  It never opens ``registered_target``.
+    """
+    by_acquisition = {artifact.acquisition_round: artifact for artifact in artifacts}
+    reference = by_acquisition.get(2)
+    if reference is None:
+        raise ValueError("registration QC requires biological acquisition round 2")
+    if tuple(round_spec.acquisition_round for round_spec in cell.rounds) != tuple(
+        sorted(by_acquisition)
+    ):
+        raise ValueError("cell and artifact acquisition-round inventories disagree")
+    resolution = theoretical_resolution(0.640, 1.4, 1.515, 4.5)
+    spacing = (0.108333, 0.108333, 0.3)
+    backend = AntsRegistrationBackend(NativeThreadConfig(itk_threads=1, blas_threads=1))
+    registration_rows: list[dict[str, object]] = []
+    deformation_rows: list[dict[str, object]] = []
+    decision_requests: list[dict[str, object]] = []
+    overlay_paths: list[Path] = []
+    seam_summaries: list[WarpSummary] = []
+    interior_summaries: list[WarpSummary] = []
+    validity: list[tuple[int, bool]] = []
+    for artifact in sorted(artifacts, key=lambda value: value.acquisition_round):
+        row: dict[str, object] = {
+            "cohort": cell.cohort,
+            "cell_id": cell.cell_id,
+            "acquisition_round": artifact.acquisition_round,
+            "workflow_round": artifact.workflow_round,
+            "is_reference": artifact.acquisition_round == 2,
+            "automated_valid": True,
+            "invalid_reason": "",
+            "translation_role": "repositioning",
+            "rotation_role": "repositioning",
+        }
+        if artifact.acquisition_round != 2:
+            try:
+                if None in (
+                    artifact.affine,
+                    artifact.warp,
+                    artifact.pre_metrics,
+                    artifact.linear_metrics,
+                    artifact.nonlinear_metrics,
+                    artifact.chunk_manifest,
+                ):
+                    raise ValueError("validated moving artifact chain is incomplete")
+                affine_path, warp_path = artifact.affine, artifact.warp
+                assert affine_path is not None and warp_path is not None
+                transform = backend.read_affine(affine_path)
+                affine = decompose_affine(_physical_affine(transform))
+                warp = np.asarray(
+                    backend.to_array(backend.read_warp(warp_path)), dtype=np.float64
+                )
+                dapi = _load_overlay_volume(artifact.registered_dapi)
+                tubulin = _load_overlay_volume(artifact.registered_tubulin)
+                if dapi.shape != tubulin.shape or warp.shape[:3] != dapi.shape:
+                    raise ValueError("registered DAPI/tubulin/warp shapes disagree")
+                whole = summarize_warp(warp, spacing, resolution)
+                assert artifact.chunk_manifest is not None
+                seam_mask = seam_adjacency_mask(artifact.chunk_manifest, dapi.shape)
+                seam = (
+                    _summarize_warp(warp, spacing, resolution, seam_mask)
+                    if seam_mask.any()
+                    else None
+                )
+                interior_mask = ~seam_mask
+                interior = (
+                    _summarize_warp(warp, spacing, resolution, interior_mask)
+                    if interior_mask.any()
+                    else None
+                )
+                metrics = {
+                    "pre": read_metrics(artifact.pre_metrics),
+                    "linear": read_metrics(artifact.linear_metrics),
+                    "nonlinear": read_metrics(artifact.nonlinear_metrics),
+                }
+                row.update(_summary_row("affine", affine))
+                row.update(
+                    {
+                        f"{stage}_{name}": value
+                        for stage, values in metrics.items()
+                        for name, value in values.items()
+                    }
+                )
+                row["automated_valid"] = not whole.flags
+                row["invalid_reason"] = ";".join(whole.flags)
+                deformation_rows.append(
+                    {
+                        "cohort": cell.cohort,
+                        "cell_id": cell.cell_id,
+                        "acquisition_round": artifact.acquisition_round,
+                        "region": "whole",
+                        **_summary_row("warp", whole),
+                    }
+                )
+                for region, summary in (("seam", seam), ("interior", interior)):
+                    if summary is None:
+                        continue
+                    deformation_rows.append(
+                        {
+                            "cohort": cell.cohort,
+                            "cell_id": cell.cell_id,
+                            "acquisition_round": artifact.acquisition_round,
+                            "region": region,
+                            **_summary_row("warp", summary),
+                        }
+                    )
+                if seam is not None:
+                    seam_summaries.append(seam)
+                if interior is not None:
+                    interior_summaries.append(interior)
+                overlay_paths.extend(
+                    _write_target_blind_overlays(
+                        cell,
+                        reference,
+                        artifact,
+                        transform,
+                        backend,
+                        output_dir / "qc" / "overlays",
+                    )
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                row["automated_valid"] = False
+                row["invalid_reason"] = str(error)
+        registration_rows.append(row)
+        valid = bool(row["automated_valid"])
+        validity.append((artifact.acquisition_round, valid))
+        if artifact.acquisition_round != 2:
+            decision_requests.append(
+                {
+                    "cohort": cell.cohort,
+                    "cell_id": cell.cell_id,
+                    "acquisition_round": artifact.acquisition_round,
+                    "automated_valid": valid,
+                    "automated_reason": row["invalid_reason"],
+                    "decision": "",
+                }
+            )
+    registration = tuple(registration_rows)
+    deformation = tuple(deformation_rows)
+    decisions = tuple(decision_requests)
+    _csv_rows(
+        output_dir / "qc" / "registration-qc.csv",
+        tuple(sorted({key for row in registration for key in row})),
+        registration,
+    )
+    _csv_rows(
+        output_dir / "qc" / "deformation.csv",
+        tuple(sorted({key for row in deformation for key in row})),
+        deformation,
+    )
+    _csv_rows(
+        output_dir / "qc" / "decision-requests.csv",
+        (
+            "cohort",
+            "cell_id",
+            "acquisition_round",
+            "automated_valid",
+            "automated_reason",
+            "decision",
+        ),
+        decisions,
+    )
+    return RegistrationQcResult(
+        registration,
+        deformation,
+        tuple(validity),
+        tuple(overlay_paths),
+        tuple(seam_summaries),
+        tuple(interior_summaries),
+        decisions,
+    )
+
+
+__all__ = [
+    "AffineSummary",
+    "RegistrationQcResult",
+    "WarpSummary",
+    "analyze_registration_qc",
+    "decompose_affine",
+    "deformation_gradient",
+    "seam_adjacency_mask",
+    "summarize_warp",
+]
