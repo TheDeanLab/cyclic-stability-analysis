@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from cyclic_stability.task import run_cell_task
+from cyclic_stability.task import _record_from_payload, _record_payload, run_cell_task
 from synthetic import cell_task, different_identity
 
 
@@ -93,3 +93,15 @@ def test_extra_nested_output_invalidates_reuse(tmp_path: Path) -> None:
     extra.write_text("{}\n", encoding="utf-8")
     second = run_cell_task(task, tmp_path)
     assert second.attempt_id != first.attempt_id
+
+
+def test_record_decoder_rejects_coerced_or_nonfinite_scalars(tmp_path: Path) -> None:
+    record = run_cell_task(cell_task(tmp_path), tmp_path)
+    payload = _record_payload(record)
+    payload["elapsed_seconds"] = "0"
+    with pytest.raises(ValueError, match="numeric"):
+        _record_from_payload(payload)
+    payload = _record_payload(record)
+    payload["peak_rss_bytes"] = float("nan")
+    with pytest.raises(ValueError, match="numeric"):
+        _record_from_payload(payload)

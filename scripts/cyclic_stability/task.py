@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -189,6 +190,28 @@ def _record_from_payload(payload: Mapping[str, object]) -> TaskRecord:
     }
     if set(payload) != required or payload["status"] not in {"complete", "failed"}:
         raise ValueError("invalid task completion record")
+    if not isinstance(payload["attempt_id"], str) or not re.fullmatch(
+        r"[0-9a-f]{32}", payload["attempt_id"]
+    ):
+        raise ValueError("task record attempt_id must be a UUID hex component")
+    numeric_names = (
+        "started_at",
+        "completed_at",
+        "peak_rss_bytes",
+        "elapsed_seconds",
+        "process_read_bytes",
+        "scratch_bytes",
+    )
+    if any(
+        isinstance(payload[name], bool)
+        or not isinstance(payload[name], int | float)
+        or not math.isfinite(float(payload[name]))
+        or float(payload[name]) < 0.0
+        for name in numeric_names
+    ):
+        raise ValueError("task record numeric fields must be finite and nonnegative")
+    if float(payload["completed_at"]) < float(payload["started_at"]):
+        raise ValueError("task record timestamps must be ordered")
     return TaskRecord(
         key=str(payload["key"]),
         attempt_id=str(payload["attempt_id"]),
