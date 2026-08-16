@@ -5,7 +5,18 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from cyclic_stability.config import load_analysis_config
+from cyclic_stability.config import load_analysis_config, load_execution_profile
+
+
+def _lamp_rows(cell_id: str) -> str:
+    return "".join(
+        f"lamp1,{cell_id},{acquisition_round},{acquisition_round},"
+        f"round{acquisition_round}/DAPI_tubulin_lamp1_001.nd2,"
+        f"Lysosomes/{cell_id},0,647_lamp1,"
+        f"{150 if acquisition_round == 1 else 200},50,200,50,200,75,"
+        f"lamp.yaml,exec.yaml,lamp-{cell_id},image-verified\n"
+        for acquisition_round in range(1, 6)
+    )
 
 
 def test_config_preserves_acquisition_and_workflow_rounds(
@@ -36,6 +47,88 @@ def test_config_rejects_numeric_lamp_identity(
     invalid.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="LAMP1 identity must be image-verified"):
         load_analysis_config(analysis, invalid, decisions)
+
+
+def test_config_requires_biological_round_two_reference(
+    config_files: tuple[Path, ...],
+) -> None:
+    """Changing the fixed round would invalidate every reference comparison."""
+    analysis, correspondence, decisions = config_files
+    invalid = analysis.with_name("wrong-reference.yaml")
+    invalid.write_text(
+        analysis.read_text(encoding="utf-8").replace(
+            "reference_acquisition_round: 2", "reference_acquisition_round: 1"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError, match="reference_acquisition_round must be exactly 2"
+    ):
+        load_analysis_config(invalid, correspondence, decisions)
+
+
+def test_config_requires_five_image_verified_lamp_cells(
+    config_files: tuple[Path, ...],
+) -> None:
+    """One mapped LAMP1 cell is insufficient for the predeclared production gate."""
+    analysis, correspondence, decisions = config_files
+    incomplete = correspondence.with_name("one-lamp-cell.csv")
+    incomplete.write_text(
+        correspondence.read_text(encoding="utf-8") + _lamp_rows("verified_alpha"),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError, match="lamp1 cohort must contain exactly five cells by five rounds"
+    ):
+        load_analysis_config(analysis, incomplete, decisions)
+
+
+def test_config_rejects_suffix_derived_lamp_cell_identity(
+    config_files: tuple[Path, ...],
+) -> None:
+    """Image verification cannot turn a numeric source suffix into a cell identity."""
+    analysis, correspondence, decisions = config_files
+    invalid = correspondence.with_name("numeric-lamp-cell.csv")
+    lamp_cells = (
+        "Cell1",
+        "verified_alpha",
+        "verified_beta",
+        "verified_gamma",
+        "verified_delta",
+    )
+    invalid.write_text(
+        correspondence.read_text(encoding="utf-8")
+        + "".join(_lamp_rows(cell_id) for cell_id in lamp_cells),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError, match="LAMP1 cell_id must not be numeric or suffix-derived"
+    ):
+        load_analysis_config(analysis, invalid, decisions)
+
+
+def test_config_preserves_image_verified_biological_lamp_identifiers(
+    config_files: tuple[Path, ...],
+) -> None:
+    """A reviewed biological ID may contain the LAMP1 marker name but no numeric suffix."""
+    analysis, correspondence, decisions = config_files
+    valid = correspondence.with_name("image-verified-lamp.csv")
+    lamp_cells = (
+        "LAMP1-verified-alpha",
+        "LAMP1-verified-beta",
+        "LAMP1-verified-gamma",
+        "LAMP1-verified-delta",
+        "LAMP1-verified-epsilon",
+    )
+    valid.write_text(
+        correspondence.read_text(encoding="utf-8")
+        + "".join(_lamp_rows(cell_id) for cell_id in lamp_cells),
+        encoding="utf-8",
+    )
+    config = load_analysis_config(analysis, valid, decisions)
+    assert {cell.cell_id for cell in config.cells if cell.cohort == "lamp1"} == set(
+        lamp_cells
+    )
 
 
 def test_config_rejects_boolean_physical_values(config_files: tuple[Path, ...]) -> None:
@@ -80,3 +173,43 @@ def test_config_rejects_incomplete_golgi_inventory(
         ValueError, match="golgi cohort must contain exactly five cells by five rounds"
     ):
         load_analysis_config(analysis, incomplete, decisions)
+
+
+def test_config_rejects_qc_decision_for_unknown_cell(
+    config_files: tuple[Path, ...],
+) -> None:
+    """A target-blind decision must refer to a loaded non-reference cell-round."""
+    analysis, correspondence, decisions = config_files
+    invalid = decisions.with_name("unknown-qc.csv")
+    invalid.write_text(
+        decisions.read_text(encoding="utf-8")
+        + "golgi,UnknownCell,1,accept,overlay-ok,reviewer,2026-08-16T00:00:00Z\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        ValueError, match="QC decision does not match a loaded cell-round"
+    ):
+        load_analysis_config(analysis, correspondence, invalid)
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    (
+        (
+            "mode: slurm\nmax_workers: 2\nnative_threads: 1\nscratch_root: /tmp/scratch\n",
+            "SLURM execution profile requires a slurm mapping",
+        ),
+        (
+            "mode: sequential\nmax_workers: 2\nnative_threads: 1\nscratch_root: /tmp/scratch\nslurm: {}\n",
+            "only valid when mode is slurm",
+        ),
+    ),
+)
+def test_execution_profile_rejects_mode_schema_mismatch(
+    tmp_path: Path, text: str, message: str
+) -> None:
+    """SLURM settings must be present exactly when the profile selects SLURM."""
+    profile = tmp_path / "invalid-execution.yaml"
+    profile.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_execution_profile(profile)

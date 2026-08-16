@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
@@ -169,8 +170,8 @@ def _parse_scientific_config(
     reference = _positive_int(
         data["reference_acquisition_round"], "reference_acquisition_round"
     )
-    if reference not in ROUND_NUMBERS:
-        raise ValueError("reference_acquisition_round must be in 1--5")
+    if reference != 2:
+        raise ValueError("reference_acquisition_round must be exactly 2")
     spacing = _sequence_numbers(
         data["voxel_spacing_xyz_um"], "voxel_spacing_xyz_um", expected_length=3
     )
@@ -326,6 +327,8 @@ def _parse_rounds(
         identity_method = row["identity_method"]
         if cohort == "lamp1" and identity_method != "image-verified":
             raise ValueError("LAMP1 identity must be image-verified")
+        if cohort == "lamp1" and re.search(r"\d+$", cell_id):
+            raise ValueError("LAMP1 cell_id must not be numeric or suffix-derived")
         if identity_method not in {"exact-pixel-audit", "image-verified"}:
             raise ValueError(f"invalid identity_method {identity_method!r}")
         if not row["workflow_dataset_id"]:
@@ -366,7 +369,7 @@ def _parse_rounds(
             ),
         )
         cells.setdefault((cohort, cell_id), []).append(round_spec)
-    for cohort in ("golgi", "lamin"):
+    for cohort in ("golgi", "lamin", "lamp1"):
         cohort_cells = [item for item in cells if item[0] == cohort]
         if cohort_cells and (
             len(cohort_cells) != 5
@@ -422,7 +425,9 @@ def _validate_cohort_settings(
                     )
 
 
-def _parse_qc_decisions(path: Path) -> tuple[QcDecision, ...]:
+def _parse_qc_decisions(
+    path: Path, valid_rounds: set[tuple[str, str, int]]
+) -> tuple[QcDecision, ...]:
     rows = _read_csv(path, QC_COLUMNS, "QC decisions")
     decisions: list[QcDecision] = []
     seen: set[tuple[str, str, int]] = set()
@@ -438,6 +443,8 @@ def _parse_qc_decisions(path: Path) -> tuple[QcDecision, ...]:
         if row["decision"] not in {"accept", "exclude"}:
             raise ValueError("QC decision must be accept or exclude")
         key = (cohort, row["cell_id"], acquisition_round)
+        if key not in valid_rounds:
+            raise ValueError("QC decision does not match a loaded cell-round")
         if key in seen:
             raise ValueError(
                 f"duplicate QC decision: {cohort}/{row['cell_id']}/{acquisition_round}"
@@ -508,7 +515,12 @@ def load_analysis_config(
         correspondence_path, CORRESPONDENCE_COLUMNS, "correspondence"
     )
     cells = _parse_rounds(correspondence, paths)
-    decisions = _parse_qc_decisions(qc_path)
+    valid_rounds = {
+        (round_spec.cohort, round_spec.cell_id, round_spec.acquisition_round)
+        for cell in cells
+        for round_spec in cell.rounds
+    }
+    decisions = _parse_qc_decisions(qc_path, valid_rounds)
     return AnalysisConfig(
         reference,
         spacing,
@@ -530,16 +542,28 @@ def load_execution_profile(path: Path) -> ExecutionProfile:
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as error:
         raise ValueError(f"cannot read execution profile {path}: {error}") from error
-    data = _mapping(
-        value,
-        "execution profile",
-        {"mode", "max_workers", "native_threads", "scratch_root", "slurm"}
-        if isinstance(value, Mapping) and "slurm" in value
-        else {"mode", "max_workers", "native_threads", "scratch_root"},
-    )
-    mode = data["mode"]
+    base_keys = {"mode", "max_workers", "native_threads", "scratch_root"}
+    allowed_keys = base_keys | {"slurm"}
+    if not isinstance(value, Mapping):
+        raise ValueError("execution profile must be a mapping")  # noqa: TRY004
+    raw = cast(Mapping[str, Any], value)
+    if unknown := set(raw) - allowed_keys:
+        raise ValueError(f"execution profile has unknown keys: {sorted(unknown)}")
+    if missing := base_keys - set(raw):
+        raise ValueError(f"execution profile is missing keys: {sorted(missing)}")
+    mode = raw["mode"]
     if mode not in {"sequential", "process", "slurm"}:
         raise ValueError("execution mode must be sequential, process, or slurm")
+    has_slurm = "slurm" in raw
+    if mode == "slurm" and not has_slurm:
+        raise ValueError("SLURM execution profile requires a slurm mapping")
+    if mode != "slurm" and has_slurm:
+        raise ValueError("slurm mapping is only valid when mode is slurm")
+    data = _mapping(
+        raw,
+        "execution profile",
+        allowed_keys if mode == "slurm" else base_keys,
+    )
     profile = ExecutionProfile(
         cast(Literal["sequential", "process", "slurm"], mode),
         _positive_int(data["max_workers"], "max_workers"),
