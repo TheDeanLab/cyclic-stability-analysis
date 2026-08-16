@@ -6,7 +6,8 @@ import csv
 from pathlib import Path
 
 import numpy as np
-from cyclic_stability.models import RoundSpec
+from cyclic_stability.images import BackgroundSummary
+from cyclic_stability.models import NuclearConfig, RoundSpec
 from cyexm.registration.artifacts import ArtifactStore, StageRequest
 from cyexm.spatial import ImageGeometry
 from numpy.typing import NDArray
@@ -183,3 +184,50 @@ def synthetic_round_specs() -> tuple[RoundSpec, ...]:
         )
         for acquisition_round in range(1, 6)
     )
+
+
+def synthetic_nucleus(
+    radius_um: float, shell_width_um: float
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return a centered DAPI ball and co-located smooth Lamin shell in ZYX."""
+    if radius_um <= 0.0 or shell_width_um <= 0.0:
+        raise ValueError("synthetic nucleus dimensions must be positive")
+    z, y, x = np.indices((48, 128, 128), dtype=np.float64)
+    physical_z = (z - 23.5) * SPACING[2]
+    physical_y = (y - 63.5) * SPACING[1]
+    physical_x = (x - 63.5) * SPACING[0]
+    radius = np.sqrt(physical_x**2 + physical_y**2 + physical_z**2)
+    background = 1.0 + 0.05 * np.sin(physical_x) * np.cos(physical_y)
+    dapi = background + 40.0 * (radius <= radius_um)
+    lamin = background + 20.0 * np.exp(
+        -0.5 * ((radius - radius_um) / (shell_width_um / 2.355)) ** 2
+    )
+    return dapi, lamin
+
+
+def synthetic_shell(radius_um: float, shell_width_um: float) -> NDArray[np.float64]:
+    """Return a smooth centered Lamin shell in the shared synthetic geometry."""
+    _, lamin = synthetic_nucleus(radius_um, shell_width_um)
+    return lamin
+
+
+def synthetic_backgrounds(rounds: tuple[int, ...]) -> dict[int, BackgroundSummary]:
+    """Return the exact robust-background fixture for the synthetic volumes."""
+    return {
+        acquisition_round: BackgroundSummary(
+            median=1.0,
+            scale=0.05,
+            positive_count=48 * 128 * 128,
+            background_count=48 * 128 * 128,
+        )
+        for acquisition_round in rounds
+    }
+
+
+SPACING = (0.1, 0.1, 0.3)
+NUCLEAR_CONFIG = NuclearConfig(
+    consensus_smoothing_um=0.558,
+    normal_half_window_um=1.5,
+    normal_step_um=0.05,
+    ridge_min_sbr=3.0,
+)
