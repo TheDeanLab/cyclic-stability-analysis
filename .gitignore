@@ -1,0 +1,10 @@
+results/
+smoke-data/
+.partial/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.DS_Store
+.idea/
+.vscode/
+*~

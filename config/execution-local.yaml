@@ -1,0 +1,4 @@
+mode: sequential
+max_workers: 2
+native_threads: 1
+scratch_root: /project/bioinformatics/Danuser_lab/Dean/dean/cyclic-stability-analysis-scratch

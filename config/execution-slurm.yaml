@@ -1,0 +1,10 @@
+mode: slurm
+max_workers: 2
+native_threads: 1
+scratch_root: /project/bioinformatics/Danuser_lab/Dean/dean/cyclic-stability-analysis-scratch
+slurm:
+  processes_per_array_element: 1
+  array_concurrency: 2
+  cpus_per_task: 1
+  memory_gib: 64
+  walltime_hours: 12
