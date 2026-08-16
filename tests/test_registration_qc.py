@@ -3,8 +3,22 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
-from cyclic_stability.registration_qc import seam_adjacency_mask
+import numpy as np
+import pytest
+from cyclic_stability import registration_qc
+from cyclic_stability.cyexm_artifacts import RoundArtifacts
+from cyclic_stability.models import CellSpec, RoundSpec
+from cyclic_stability.registration_qc import (
+    _physical_affine,
+    analyze_registration_qc,
+    decompose_affine,
+    publish_qc_outputs,
+    seam_adjacency_mask,
+)
+from scipy.linalg import polar
+from scipy.spatial.transform import Rotation
 
 
 def test_internal_core_boundary_marks_only_its_16_pixel_neighborhood(
@@ -22,3 +36,250 @@ def test_internal_core_boundary_marks_only_its_16_pixel_neighborhood(
     assert mask[:, :, 4].all()
     assert mask[:, :, 19].all()
     assert not mask[:, :, 21].any()
+
+
+def test_nested_cyexm_manifest_marks_the_actual_internal_core_boundary(
+    tmp_path: Path,
+) -> None:
+    """The persisted schema-v2 nested chunk record must locate the seam."""
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        '{"schema_version": 2, "chunks": ['
+        '{"chunk": {"z_start": 0, "z_end": 8, "y_start": 0, '
+        '"y_end": 8, "x_start": 0, "x_end": 20}}, '
+        '{"chunk": {"z_start": 0, "z_end": 8, "y_start": 0, '
+        '"y_end": 8, "x_start": 20, "x_end": 40}}]}',
+        encoding="utf-8",
+    )
+    assert seam_adjacency_mask(manifest, (8, 8, 40))[:, :, 20].all()
+
+
+def test_affine_decomposition_reconstructs_rotation_scale_and_shear() -> None:
+    """Discarding the RQ orthogonal factor must fail this reconstruction contract."""
+    scale = np.asarray((1.2, 0.8, 1.4))
+    shear = np.asarray((0.15, -0.2, 0.1))
+    upper = np.asarray(
+        (
+            (scale[0], np.tan(shear[0]) * scale[1], np.tan(shear[1]) * scale[2]),
+            (0.0, scale[1], np.tan(shear[2]) * scale[2]),
+            (0.0, 0.0, scale[2]),
+        )
+    )
+    rotation = Rotation.from_euler("xyz", (10.0, -20.0, 35.0), degrees=True)
+    matrix = np.eye(4)
+    matrix[:3, :3] = upper @ rotation.as_matrix()
+    matrix[:3, 3] = (3.0, -4.0, 5.0)
+
+    summary = decompose_affine(matrix)
+
+    reconstructed_upper = np.asarray(
+        (
+            (
+                summary.scale_xyz[0],
+                np.tan(np.radians(summary.shear_xy_deg)) * summary.scale_xyz[1],
+                np.tan(np.radians(summary.shear_xz_deg)) * summary.scale_xyz[2],
+            ),
+            (
+                0.0,
+                summary.scale_xyz[1],
+                np.tan(np.radians(summary.shear_yz_deg)) * summary.scale_xyz[2],
+            ),
+            (0.0, 0.0, summary.scale_xyz[2]),
+        )
+    )
+    reconstructed = (
+        reconstructed_upper
+        @ Rotation.from_euler("xyz", summary.rotation_xyz_deg, degrees=True).as_matrix()
+    )
+    assert reconstructed == pytest.approx(matrix[:3, :3], abs=1e-10)
+    assert summary.translation_xyz_um == pytest.approx((3.0, -4.0, 5.0))
+    assert summary.polar_rotation_xyz_deg == pytest.approx(
+        Rotation.from_matrix(polar(matrix[:3, :3])[0]).as_euler("xyz", degrees=True)
+    )
+
+
+def test_centered_ants_affine_is_converted_to_physical_xyz_offset() -> None:
+    """ANTs center-of-rotation parameters must contribute to the 4-by-4 offset."""
+
+    class Transform:
+        parameters = np.asarray(
+            (2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 7.0, 8.0, 9.0)
+        )
+        fixed_parameters = np.asarray((10.0, 20.0, 30.0))
+
+    assert _physical_affine(Transform())[:3, 3] == pytest.approx((-3.0, 8.0, 9.0))
+
+
+def test_improper_affine_is_hard_invalid_geometry() -> None:
+    """A reflection cannot be emitted as a valid row with NaN pose values."""
+    matrix = np.eye(4)
+    matrix[0, 0] = -1.0
+    with pytest.raises(ValueError, match="improper"):
+        decompose_affine(matrix)
+
+
+def test_publish_qc_outputs_replaces_a_complete_stale_tree_even_when_empty(
+    tmp_path: Path,
+) -> None:
+    """A retry with no rows must atomically remove stale prior QC evidence."""
+    destination = tmp_path / "output" / "qc"
+    destination.mkdir(parents=True)
+    (destination / "stale.txt").write_text("stale", encoding="utf-8")
+
+    publish_qc_outputs(destination, (), (), ())
+
+    assert not (destination / "stale.txt").exists()
+    assert (
+        (destination / "registration-qc.csv").read_text(encoding="utf-8").endswith("\n")
+    )
+    assert (destination / "deformation.csv").is_file()
+    assert (destination / "decision-requests.csv").is_file()
+
+
+def test_failed_overlay_publication_preserves_the_prior_complete_tree(
+    tmp_path: Path,
+) -> None:
+    """An operational output failure must not replace a prior complete QC tree."""
+    destination = tmp_path / "qc"
+    destination.mkdir()
+    (destination / "prior.txt").write_text("complete", encoding="utf-8")
+
+    def fail_after_staging(overlays: Path) -> tuple[Path, ...]:
+        overlays.mkdir(parents=True)
+        (overlays / "partial.tif").write_bytes(b"partial")
+        raise OSError("simulated full filesystem")
+
+    with pytest.raises(OSError, match="simulated full filesystem"):
+        publish_qc_outputs(destination, (), (), (), fail_after_staging)
+    assert (destination / "prior.txt").read_text(encoding="utf-8") == "complete"
+    assert not (destination / "registration-qc.csv").exists()
+
+
+def _target_blind_inputs(tmp_path: Path) -> tuple[CellSpec, tuple[RoundArtifacts, ...]]:
+    rounds = tuple(
+        RoundSpec(
+            cohort="golgi",
+            cell_id="Cell1",
+            acquisition_round=acquisition,
+            workflow_round=acquisition,
+            nd2_path=tmp_path / f"round-{acquisition}.nd2",
+            tiff_directory=tmp_path / "raw",
+            z_start_offset=0,
+            target_exposure_ms=1.0,
+            target_laser_percent=1.0,
+            tubulin_exposure_ms=1.0,
+            dapi_exposure_ms=1.0,
+            dataset_manifest=tmp_path / "dataset.yaml",
+            execution_profile=tmp_path / "execution.yaml",
+            workflow_dataset_id="synthetic",
+            identity_method="exact-pixel-audit",
+        )
+        for acquisition in (1, 2)
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        '{"chunks": [{"chunk": {"z_start": 0, "z_end": 5, '
+        '"y_start": 0, "y_end": 5, "x_start": 0, "x_end": 2}}, '
+        '{"chunk": {"z_start": 0, "z_end": 5, "y_start": 0, '
+        '"y_end": 5, "x_start": 2, "x_end": 5}}]}',
+        encoding="utf-8",
+    )
+
+    def artifact(acquisition: int) -> RoundArtifacts:
+        root = tmp_path / f"round-{acquisition}"
+        return RoundArtifacts(
+            acquisition_round=acquisition,
+            workflow_round=acquisition,
+            workflow_output_root=root,
+            registered_dapi=root / "dapi.tif",
+            registered_tubulin=root / "tubulin.tif",
+            registered_target=root / "FORBIDDEN-target.tif",
+            affine=None if acquisition == 2 else root / "affine.mat",
+            warp=None if acquisition == 2 else root / "warp.nii.gz",
+            pre_metrics=None if acquisition == 2 else root / "pre.txt",
+            linear_metrics=None if acquisition == 2 else root / "linear.txt",
+            nonlinear_metrics=None if acquisition == 2 else root / "nonlinear.txt",
+            chunk_manifest=None if acquisition == 2 else manifest,
+            completion_records=(),
+        )
+
+    return CellSpec("golgi", "Cell1", rounds), (artifact(1), artifact(2))
+
+
+def test_analyzer_reads_only_blinded_channels_and_writes_metrics_and_stages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DAPI/tubulin-only evaluation must produce all three stage overlays and metrics."""
+    cell, artifacts = _target_blind_inputs(tmp_path)
+    read_paths: list[Path] = []
+    backend_read_paths: list[Path] = []
+
+    class Backend:
+        def __init__(self, native_threads: object) -> None:
+            pass
+
+        def read_affine(self, path: Path) -> object:
+            return SimpleNamespace(
+                parameters=np.r_[np.eye(3).reshape(-1), (0.0, 0.0, 0.0)],
+                fixed_parameters=np.zeros(3),
+            )
+
+        def read_warp(self, path: Path) -> str:
+            return "warp"
+
+        def to_array(self, value: object) -> np.ndarray:
+            if value == "warp":
+                return np.zeros((5, 5, 5, 3), dtype=np.float64)
+            return np.zeros((5, 5, 5), dtype=np.float64)
+
+        def load_image(self, path: Path, spacing: tuple[float, float, float]) -> Path:
+            backend_read_paths.append(path)
+            return path
+
+        def apply_affine(self, **kwargs: object) -> object:
+            return kwargs["fixed"]
+
+    def read_volume(path: Path) -> np.ndarray:
+        read_paths.append(path)
+        return np.ones((5, 5, 5), dtype=np.float64)
+
+    metric_paths: list[Path] = []
+    monkeypatch.setattr(registration_qc, "AntsRegistrationBackend", Backend)
+    monkeypatch.setattr(registration_qc, "_load_overlay_volume", read_volume)
+    monkeypatch.setattr(
+        registration_qc,
+        "read_metrics",
+        lambda path: metric_paths.append(path) or {"Correlation": 0.5},
+    )
+
+    result = analyze_registration_qc(cell, artifacts, tmp_path / "out")
+
+    assert len(result.overlay_paths) == 18
+    assert result.decision_requests[0]["decision"] == ""
+    assert result.registration_rows[0]["pre_Correlation"] == 0.5
+    assert len(metric_paths) == 3
+    assert all("FORBIDDEN" not in str(path) for path in read_paths)
+    assert all("FORBIDDEN" not in str(path) for path in backend_read_paths)
+    assert {path.name.split("-")[2] for path in result.overlay_paths} == {
+        "pre",
+        "affine",
+        "nonlinear",
+    }
+
+    def improper_affine(self: object, path: Path) -> object:
+        return SimpleNamespace(
+            parameters=np.r_[np.diag((-1.0, 1.0, 1.0)).reshape(-1), (0.0, 0.0, 0.0)],
+            fixed_parameters=np.zeros(3),
+        )
+
+    monkeypatch.setattr(Backend, "read_affine", improper_affine)
+    invalid = analyze_registration_qc(cell, artifacts, tmp_path / "invalid")
+    assert invalid.decision_requests[0]["automated_valid"] is False
+    assert "improper" in str(invalid.decision_requests[0]["automated_reason"])
+
+    def output_error(*args: object, **kwargs: object) -> tuple[Path, ...]:
+        raise OSError("simulated output failure")
+
+    monkeypatch.setattr(registration_qc, "publish_qc_outputs", output_error)
+    with pytest.raises(OSError, match="simulated output failure"):
+        analyze_registration_qc(cell, artifacts, tmp_path / "failed-output")

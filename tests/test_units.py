@@ -24,9 +24,11 @@ def test_target_resolution_is_labeled_in_expanded_and_nominal_space() -> None:
 def test_constant_physical_warp_has_expected_resolution_fraction() -> None:
     """A displacement equal to one lateral reference unit remains in tolerance."""
     warp = np.zeros((5, 6, 7, 3), dtype=np.float64)
-    warp[..., 0] = 0.278857
+    warp[..., 0] = TARGET_RESOLUTION.lateral_expanded_um
     summary = summarize_warp(warp, (0.108333, 0.108333, 0.3), TARGET_RESOLUTION)
-    assert summary.displacement_p95_um == pytest.approx(0.278857)
+    assert summary.displacement_p95_um == pytest.approx(
+        TARGET_RESOLUTION.lateral_expanded_um
+    )
     assert summary.fraction_over_one_resolution == pytest.approx(0.0)
     assert summary.jacobian_nonpositive_count == 0
 

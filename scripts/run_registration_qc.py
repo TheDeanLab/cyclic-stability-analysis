@@ -20,7 +20,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from pathlib import Path
 
@@ -29,7 +28,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from cyclic_stability.config import load_analysis_config
 from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
-from cyclic_stability.registration_qc import analyze_registration_qc
+from cyclic_stability.registration_qc import analyze_registration_qc, publish_qc_outputs
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -38,18 +37,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--correspondence", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     return parser
-
-
-def _write_rows(path: Path, rows: tuple[dict[str, object], ...]) -> None:
-    """Write one aggregate CSV after every cell has validated successfully."""
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = tuple(sorted({key for row in rows for key in row}))
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -76,9 +63,9 @@ def main(argv: list[str] | None = None) -> int:
         row for result in results for row in result.deformation_rows
     )
     decision_rows = tuple(row for result in results for row in result.decision_requests)
-    _write_rows(args.run_dir / "qc" / "registration-qc.csv", registration_rows)
-    _write_rows(args.run_dir / "qc" / "deformation.csv", deformation_rows)
-    _write_rows(args.run_dir / "qc" / "decision-requests.csv", decision_rows)
+    publish_qc_outputs(
+        args.run_dir / "qc", registration_rows, deformation_rows, decision_rows
+    )
     print(
         f"wrote {len(decision_rows)} blank target-blind moving-round decision requests"
     )

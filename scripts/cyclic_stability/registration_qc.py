@@ -5,6 +5,10 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
+import shutil
+import tempfile
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -34,6 +38,8 @@ class AffineSummary:
     shear_xy_deg: float
     shear_xz_deg: float
     shear_yz_deg: float
+    polar_rotation_xyz_deg: tuple[float, float, float]
+    polar_strain_principal_values: tuple[float, float, float]
     translation_role: str = "repositioning"
     rotation_role: str = "repositioning"
 
@@ -67,31 +73,50 @@ class RegistrationQcResult:
     decision_requests: tuple[dict[str, object], ...]
 
 
+class _HardInvalid(ValueError):
+    """A permitted automated exclusion based on registration evidence."""
+
+
 def decompose_affine(matrix_xyz: NDArray[np.float64]) -> AffineSummary:
-    """Decompose a physical 4-by-4 XYZ affine using polar and RQ factors."""
+    """Return a sign-normalized, proper RQ decomposition of a physical affine.
+
+    The reported ``scale_xyz``, shear angles, and ``rotation_xyz_deg`` obey
+    ``linear = upper(scale, shear) @ rotation`` exactly (up to numerical
+    precision).  The separately named polar fields are descriptive strain/pose
+    quantities and are not substituted into that reconstruction.  Reflections
+    are rejected because a valid proper rotation cannot represent them.
+    """
     matrix = np.asarray(matrix_xyz, dtype=np.float64)
     if matrix.shape != (4, 4) or not np.isfinite(matrix).all():
         raise ValueError("affine matrix must be finite with shape (4, 4)")
     linear = matrix[:3, :3]
-    rotation_matrix, symmetric = polar(linear)
-    upper, _ = rq(symmetric)
-    scales = np.abs(np.diag(upper))
+    polar_rotation, polar_strain = polar(linear)
+    upper, rotation_matrix = rq(linear)
+    signs = np.where(np.diag(upper) < 0.0, -1.0, 1.0)
+    sign_matrix = np.diag(signs)
+    upper = upper @ sign_matrix
+    rotation_matrix = sign_matrix @ rotation_matrix
+    if np.linalg.det(rotation_matrix) <= 0.0:
+        raise ValueError("affine matrix is improper (contains a reflection)")
+    scales = np.diag(upper)
     if np.any(scales == 0.0):
         raise ValueError("affine matrix has a singular scale factor")
-    if np.linalg.det(rotation_matrix) < 0.0:
-        rotation_deg = (math.nan, math.nan, math.nan)
-    else:
-        rotation_deg = tuple(
-            float(value)
-            for value in Rotation.from_matrix(rotation_matrix).as_euler(
-                "xyz", degrees=True
-            )
-        )
+    rotation_deg = tuple(
+        float(value)
+        for value in Rotation.from_matrix(rotation_matrix).as_euler("xyz", degrees=True)
+    )
     shear_xy = math.degrees(math.atan(upper[0, 1] / upper[1, 1]))
     shear_xz = math.degrees(math.atan(upper[0, 2] / upper[2, 2]))
     shear_yz = math.degrees(math.atan(upper[1, 2] / upper[2, 2]))
     singular_values = tuple(
         float(value) for value in np.linalg.svd(linear, compute_uv=False)
+    )
+    polar_rotation_deg = tuple(
+        float(value)
+        for value in Rotation.from_matrix(polar_rotation).as_euler("xyz", degrees=True)
+    )
+    polar_principal_values = tuple(
+        float(value) for value in np.linalg.eigvalsh(polar_strain)
     )
     return AffineSummary(
         determinant=float(np.linalg.det(linear)),
@@ -103,6 +128,8 @@ def decompose_affine(matrix_xyz: NDArray[np.float64]) -> AffineSummary:
         shear_xy_deg=float(shear_xy),
         shear_xz_deg=float(shear_xz),
         shear_yz_deg=float(shear_yz),
+        polar_rotation_xyz_deg=polar_rotation_deg,
+        polar_strain_principal_values=polar_principal_values,
     )
 
 
@@ -146,7 +173,7 @@ def _summarize_warp(
 ) -> WarpSummary:
     warp = _validate_warp(warp_zyx_xyz, spacing_xyz_um)
     gradient = deformation_gradient(warp, spacing_xyz_um)
-    displacement = np.linalg.vector_norm(warp, axis=-1)
+    displacement = np.linalg.norm(warp, axis=-1)
     normalized = np.sqrt(
         (warp[..., 0] / resolution.lateral_expanded_um) ** 2
         + (warp[..., 1] / resolution.lateral_expanded_um) ** 2
@@ -226,7 +253,7 @@ def _load_overlay_volume(path: Path) -> NDArray[np.float64]:
 
     array = np.asarray(tifffile.imread(path), dtype=np.float64)
     if array.ndim != 3 or not np.isfinite(array).all():
-        raise ValueError(f"invalid target-blind channel volume: {path}")
+        raise _HardInvalid(f"non-finite or invalid target-blind channel data: {path}")
     return array
 
 
@@ -404,7 +431,6 @@ def _write_target_blind_overlays(
 def _csv_rows(
     path: Path, fieldnames: tuple[str, ...], rows: tuple[dict[str, object], ...]
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -412,8 +438,89 @@ def _csv_rows(
             writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
-def _summary_row(prefix: str, summary: WarpSummary) -> dict[str, object]:
+def _summary_row(
+    prefix: str, summary: AffineSummary | WarpSummary
+) -> dict[str, object]:
     return {f"{prefix}_{key}": value for key, value in asdict(summary).items()}
+
+
+def _atomic_replace_directory(
+    destination: Path, populate: Callable[[Path], None]
+) -> None:
+    """Populate then atomically promote a same-filesystem directory tree."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staged = Path(
+        tempfile.mkdtemp(prefix=f".{destination.name}.stage-", dir=destination.parent)
+    )
+    backup = destination.with_name(f".{destination.name}.previous")
+    if backup.exists():
+        shutil.rmtree(backup)
+    try:
+        populate(staged)
+        if destination.exists():
+            os.replace(destination, backup)
+        os.replace(staged, destination)
+    except BaseException:
+        shutil.rmtree(staged, ignore_errors=True)
+        if backup.exists() and not destination.exists():
+            os.replace(backup, destination)
+        raise
+    else:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
+def publish_qc_outputs(
+    destination: Path,
+    registration_rows: tuple[dict[str, object], ...],
+    deformation_rows: tuple[dict[str, object], ...],
+    decision_rows: tuple[dict[str, object], ...],
+    overlay_writer: Callable[[Path], tuple[Path, ...]] | None = None,
+) -> tuple[Path, ...]:
+    """Atomically replace one QC tree after all scientific evaluation succeeds."""
+    staged_overlays: tuple[Path, ...] = ()
+    staging_root: Path | None = None
+
+    def populate(staged: Path) -> None:
+        nonlocal staged_overlays, staging_root
+        staging_root = staged
+        registration_fields = tuple(
+            sorted({key for row in registration_rows for key in row})
+        ) or (
+            "cohort",
+            "cell_id",
+            "acquisition_round",
+            "workflow_round",
+            "is_reference",
+            "automated_valid",
+            "invalid_reason",
+        )
+        deformation_fields = tuple(
+            sorted({key for row in deformation_rows for key in row})
+        ) or ("cohort", "cell_id", "acquisition_round", "region")
+        _csv_rows(
+            staged / "registration-qc.csv", registration_fields, registration_rows
+        )
+        _csv_rows(staged / "deformation.csv", deformation_fields, deformation_rows)
+        _csv_rows(
+            staged / "decision-requests.csv",
+            (
+                "cohort",
+                "cell_id",
+                "acquisition_round",
+                "automated_valid",
+                "automated_reason",
+                "decision",
+            ),
+            decision_rows,
+        )
+        if overlay_writer is not None:
+            staged_overlays = overlay_writer(staged / "overlays")
+
+    _atomic_replace_directory(destination, populate)
+    assert staging_root is not None
+    return tuple(
+        destination / path.relative_to(staging_root) for path in staged_overlays
+    )
 
 
 def analyze_registration_qc(
@@ -442,6 +549,7 @@ def analyze_registration_qc(
     seam_summaries: list[WarpSummary] = []
     interior_summaries: list[WarpSummary] = []
     validity: list[tuple[int, bool]] = []
+    overlay_jobs: list[tuple[RoundArtifacts, object]] = []
     for artifact in sorted(artifacts, key=lambda value: value.acquisition_round):
         row: dict[str, object] = {
             "cohort": cell.cohort,
@@ -464,21 +572,36 @@ def analyze_registration_qc(
                     artifact.nonlinear_metrics,
                     artifact.chunk_manifest,
                 ):
-                    raise ValueError("validated moving artifact chain is incomplete")
+                    raise _HardInvalid("validated moving artifact chain is incomplete")
                 affine_path, warp_path = artifact.affine, artifact.warp
                 assert affine_path is not None and warp_path is not None
-                transform = backend.read_affine(affine_path)
-                affine = decompose_affine(_physical_affine(transform))
-                warp = np.asarray(
-                    backend.to_array(backend.read_warp(warp_path)), dtype=np.float64
-                )
+                try:
+                    transform = backend.read_affine(affine_path)
+                    affine = decompose_affine(_physical_affine(transform))
+                except (OSError, RuntimeError, TypeError, ValueError) as error:
+                    raise _HardInvalid(
+                        f"unreadable or invalid affine geometry: {error}"
+                    ) from error
+                try:
+                    warp = np.asarray(
+                        backend.to_array(backend.read_warp(warp_path)), dtype=np.float64
+                    )
+                    whole = summarize_warp(warp, spacing, resolution)
+                except (OSError, RuntimeError, TypeError, ValueError) as error:
+                    raise _HardInvalid(
+                        f"unreadable or non-finite warp geometry: {error}"
+                    ) from error
                 dapi = _load_overlay_volume(artifact.registered_dapi)
                 tubulin = _load_overlay_volume(artifact.registered_tubulin)
                 if dapi.shape != tubulin.shape or warp.shape[:3] != dapi.shape:
-                    raise ValueError("registered DAPI/tubulin/warp shapes disagree")
-                whole = summarize_warp(warp, spacing, resolution)
+                    raise _HardInvalid("registered DAPI/tubulin/warp shapes disagree")
                 assert artifact.chunk_manifest is not None
-                seam_mask = seam_adjacency_mask(artifact.chunk_manifest, dapi.shape)
+                try:
+                    seam_mask = seam_adjacency_mask(artifact.chunk_manifest, dapi.shape)
+                except (OSError, RuntimeError, TypeError, ValueError) as error:
+                    raise _HardInvalid(
+                        f"invalid chunk-manifest evidence: {error}"
+                    ) from error
                 seam = (
                     _summarize_warp(warp, spacing, resolution, seam_mask)
                     if seam_mask.any()
@@ -530,17 +653,8 @@ def analyze_registration_qc(
                     seam_summaries.append(seam)
                 if interior is not None:
                     interior_summaries.append(interior)
-                overlay_paths.extend(
-                    _write_target_blind_overlays(
-                        cell,
-                        reference,
-                        artifact,
-                        transform,
-                        backend,
-                        output_dir / "qc" / "overlays",
-                    )
-                )
-            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                overlay_jobs.append((artifact, transform))
+            except _HardInvalid as error:
                 row["automated_valid"] = False
                 row["invalid_reason"] = str(error)
         registration_rows.append(row)
@@ -560,27 +674,20 @@ def analyze_registration_qc(
     registration = tuple(registration_rows)
     deformation = tuple(deformation_rows)
     decisions = tuple(decision_requests)
-    _csv_rows(
-        output_dir / "qc" / "registration-qc.csv",
-        tuple(sorted({key for row in registration for key in row})),
-        registration,
-    )
-    _csv_rows(
-        output_dir / "qc" / "deformation.csv",
-        tuple(sorted({key for row in deformation for key in row})),
-        deformation,
-    )
-    _csv_rows(
-        output_dir / "qc" / "decision-requests.csv",
-        (
-            "cohort",
-            "cell_id",
-            "acquisition_round",
-            "automated_valid",
-            "automated_reason",
-            "decision",
-        ),
-        decisions,
+
+    def write_overlays(staged_overlays: Path) -> tuple[Path, ...]:
+        return tuple(
+            path
+            for artifact, transform in overlay_jobs
+            for path in _write_target_blind_overlays(
+                cell, reference, artifact, transform, backend, staged_overlays
+            )
+        )
+
+    overlay_paths = list(
+        publish_qc_outputs(
+            output_dir / "qc", registration, deformation, decisions, write_overlays
+        )
     )
     return RegistrationQcResult(
         registration,
