@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import json
 import secrets
 import sys
@@ -37,6 +39,22 @@ if TYPE_CHECKING:
 
 _MANIFEST_NAME = "randomization-manifest.json"
 _STATE_NAMES = ("review-state.json", "review-state.previous.json")
+
+
+def _load_x11() -> ctypes.CDLL:
+    library = ctypes.util.find_library("X11") or "libX11.so.6"
+    return ctypes.CDLL(library)
+
+
+def _initialize_x11_threads() -> None:
+    """Enable Xlib thread safety before any graphical or imaging imports."""
+    if not sys.platform.startswith("linux"):
+        return
+    initializer = _load_x11().XInitThreads
+    initializer.argtypes = []
+    initializer.restype = ctypes.c_int
+    if initializer() == 0:
+        raise OSError("XInitThreads failed")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -209,6 +227,15 @@ def main(argv: list[str] | None = None) -> int:
               "--reviewer", "Reviewer", "--seed", "8142026", "--validate-only"])
     """
     args = _parser().parse_args(argv)
+    if not args.validate_only:
+        try:
+            _initialize_x11_threads()
+        except (AttributeError, OSError) as error:
+            print(
+                f"GUI unavailable: could not initialize X11 thread safety: {error}",
+                file=sys.stderr,
+            )
+            return 2
     try:
         store, manifest = _open_lifecycle(args)
     except (OSError, TypeError, ValueError) as error:

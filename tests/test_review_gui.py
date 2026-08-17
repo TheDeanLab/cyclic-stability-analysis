@@ -675,6 +675,121 @@ def test_validate_only_production_import_order_is_headless(tmp_path: Path) -> No
     assert "validated 40 cases, 39 visual cases, and 4 repeats" in result.stdout
 
 
+def test_linux_gui_initializes_x11_threads_before_preflight_and_tk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A graphical launch initializes Xlib threading before any GUI boundary."""
+    module = _entry_point_module()
+    store, manifest = fresh_review_store(tmp_path)
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        module,
+        "_initialize_x11_threads",
+        lambda: events.append("x11-threads"),
+        raising=False,
+    )
+
+    def open_lifecycle(_args: object) -> tuple[ReviewStore, object]:
+        events.append("preflight")
+        return store, manifest
+
+    monkeypatch.setattr(module, "_open_lifecycle", open_lifecycle)
+
+    class FakeRoot:
+        def mainloop(self) -> None:
+            events.append("mainloop")
+
+        def destroy(self) -> None:
+            events.append("destroy")
+
+    fake_tk = ModuleType("tkinter")
+    fake_tk.TclError = RuntimeError  # type: ignore[attr-defined]
+
+    def create_root() -> FakeRoot:
+        events.append("tk-root")
+        return FakeRoot()
+
+    fake_tk.Tk = create_root  # type: ignore[attr-defined]
+    fake_gui = ModuleType("cyclic_stability.review_gui")
+
+    def create_application(_root: FakeRoot, _store: object, _manifest: object) -> None:
+        events.append("application")
+
+    fake_gui.ReviewApplication = create_application  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    monkeypatch.setitem(sys.modules, "cyclic_stability.review_gui", fake_gui)
+
+    result = module.main(
+        ["--review-dir", str(tmp_path / "review"), "--reviewer", "Reviewer"]
+    )
+
+    assert result == 0
+    assert events == [
+        "x11-threads",
+        "preflight",
+        "tk-root",
+        "application",
+        "mainloop",
+    ]
+
+
+def test_linux_x11_initializer_calls_xinitthreads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Linux initializer invokes the real Xlib thread-safety boundary."""
+    module = _entry_point_module()
+    calls: list[str] = []
+
+    class FakeXInitThreads:
+        argtypes: list[object] | None = None
+        restype: object | None = None
+
+        def __call__(self) -> int:
+            calls.append("XInitThreads")
+            return 1
+
+    class FakeX11:
+        XInitThreads = FakeXInitThreads()
+
+    monkeypatch.setattr(module.sys, "platform", "linux")
+    monkeypatch.setattr(module, "_load_x11", lambda: FakeX11(), raising=False)
+
+    module._initialize_x11_threads()
+
+    assert calls == ["XInitThreads"]
+    assert FakeX11.XInitThreads.argtypes == []
+
+
+def test_validate_only_does_not_initialize_x11_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Headless validation does not load or initialize the X11 client library."""
+    module = _entry_point_module()
+    store, manifest = fresh_review_store(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        module,
+        "_initialize_x11_threads",
+        lambda: calls.append("x11-threads"),
+        raising=False,
+    )
+    monkeypatch.setattr(module, "_open_lifecycle", lambda _args: (store, manifest))
+
+    result = module.main(
+        [
+            "--review-dir",
+            str(tmp_path / "review"),
+            "--reviewer",
+            "Reviewer",
+            "--validate-only",
+        ]
+    )
+
+    assert result == 0
+    assert calls == []
+
+
 def test_normal_launch_without_display_is_concise(tmp_path: Path) -> None:
     """A non-headless launch without DISPLAY exits with actionable guidance."""
     qc_root = write_review_qc_fixture(tmp_path / "qc")
