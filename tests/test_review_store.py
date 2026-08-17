@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -180,6 +181,62 @@ def test_repository_identity_tracks_untracked_nonignored_file_content() -> None:
     assert first.diff_sha256
     assert first != before
     assert second != first
+
+
+def test_repository_identity_tracks_untracked_symlink_payloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dangling and retargeted untracked links have durable Git-style identities."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q"), cwd=repository, check=True)
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.name=Test Reviewer",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ),
+        cwd=repository,
+        check=True,
+    )
+    monkeypatch.setattr(
+        review_store,
+        "__file__",
+        str(repository / "scripts/cyclic_stability/review_store.py"),
+    )
+    clean = review_store._repository_identity()
+    dangling = repository / "dangling-evidence"
+    dangling.symlink_to("missing-evidence")
+
+    dangling_identity = review_store._repository_identity()
+
+    assert dangling_identity.dirty
+    assert dangling_identity != clean
+    dangling.unlink()
+    assert review_store._repository_identity() == clean
+
+    first_target = tmp_path / "same-content-first"
+    second_target = tmp_path / "same-content-second"
+    first_target.write_bytes(b"same bytes")
+    second_target.write_bytes(b"same bytes")
+    link = repository / "retargeted-evidence"
+    link.symlink_to(first_target)
+    first_identity = review_store._repository_identity()
+    link.unlink()
+    link.symlink_to(second_target)
+    second_identity = review_store._repository_identity()
+
+    assert first_identity.dirty
+    assert second_identity.dirty
+    assert second_identity != first_identity
+    link.unlink()
+    assert review_store._repository_identity() == clean
 
 
 def test_state_model_rejects_extra_unmanifested_case_revision(tmp_path: Path) -> None:

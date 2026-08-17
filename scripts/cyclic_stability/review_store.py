@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import uuid
 from collections.abc import Callable, Mapping
@@ -103,9 +104,21 @@ def _repository_identity() -> RepositoryIdentity:
     _digest_component(digest, b"tracked-diff", diff)
     for relative_path in untracked_paths:
         try:
-            content = (repository / os.fsdecode(relative_path)).read_bytes()
+            path = repository / os.fsdecode(relative_path)
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                kind = b"symlink"
+                content = os.fsencode(os.readlink(path))
+            elif stat.S_ISREG(mode):
+                kind = b"regular-file"
+                content = path.read_bytes()
+            else:
+                raise ValueError(
+                    "untracked repository path is not a regular file or symlink"
+                )
         except OSError as error:
             raise ValueError("could not read untracked repository content") from error
+        _digest_component(digest, b"untracked-kind", kind)
         _digest_component(digest, b"untracked-path", relative_path)
         _digest_component(digest, b"untracked-content", content)
     dirty = bool(diff or untracked_paths)
