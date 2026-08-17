@@ -10,7 +10,9 @@ and navigation behavior independently testable.
 from __future__ import annotations
 
 import hashlib
+import os
 import tkinter as tk
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -26,6 +28,7 @@ from cyclic_stability.review_models import (
     OverlayEvidence,
     Presentation,
     ReviewManifest,
+    ReviewState,
 )
 from cyclic_stability.review_store import ReviewStore
 
@@ -63,6 +66,16 @@ _STATUS_KEYS: dict[str, AssessmentStatus] = {
     "e": "exclude",
     "u": "needs-adjudication",
 }
+_FINALIZATION_BUNDLE_NAMES = (
+    "review-state.json",
+    "review-state.previous.json",
+    "remediation-requests.csv",
+    "consistency-report.csv",
+    "qc-decisions.csv",
+    "qc-decisions.previous.csv",
+    "review-record.pdf",
+    "review-summary.md",
+)
 
 KeyboardAction = tuple[Literal["status", "navigate", "reason"], str]
 EvidenceTokenGrid = dict[str, dict[str, dict[str, str]]]
@@ -174,6 +187,14 @@ class _ResolvedEvidence:
     overlay: OverlayEvidence
 
 
+@dataclass(frozen=True, slots=True)
+class _FinalizationCheckpoint:
+    state: ReviewState
+    active_manifest: ReviewManifest
+    files: dict[str, bytes | None]
+    staged_names: frozenset[str]
+
+
 def _evidence_token(presentation: Presentation, overlay: OverlayEvidence) -> str:
     parts = (
         "review-evidence-v1",
@@ -274,6 +295,128 @@ def keyboard_action(key: str) -> KeyboardAction | None:
     if key in _REASON_KEYS:
         return "reason", _REASON_KEYS[key]
     return None
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _checkpoint_finalization(store: ReviewStore) -> _FinalizationCheckpoint:
+    review_dir = store.review_dir
+    return _FinalizationCheckpoint(
+        store.state,
+        store.manifest,
+        {
+            name: path.read_bytes() if (path := review_dir / name).exists() else None
+            for name in _FINALIZATION_BUNDLE_NAMES
+        },
+        frozenset(path.name for path in review_dir.glob(".*tmp")),
+    )
+
+
+def _restore_file(path: Path, content: bytes | None) -> None:
+    if content is None:
+        if path.exists():
+            path.unlink()
+            _fsync_directory(path.parent)
+        return
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.rollback.tmp")
+    try:
+        with temporary.open("wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _restore_finalization(
+    store: ReviewStore, checkpoint: _FinalizationCheckpoint
+) -> None:
+    review_dir = store.review_dir
+    try:
+        for name, content in checkpoint.files.items():
+            _restore_file(review_dir / name, content)
+        for path in review_dir.glob(".*tmp"):
+            if path.name not in checkpoint.staged_names:
+                path.unlink()
+        _fsync_directory(review_dir)
+    finally:
+        # The durable snapshot is authoritative, but the live GUI must observe
+        # the same exact immutable objects after rollback without a reopen.
+        store._restore_memory_checkpoint(checkpoint.state, checkpoint.active_manifest)
+
+
+def finalize_review_bundle(
+    store: ReviewStore, manifest: ReviewManifest
+) -> tuple[Path, Path, Path]:
+    """Publish final decisions and archival reports as one failure-safe bundle.
+
+    This is the combined finalization boundary used by ``ReviewApplication``. It
+    composes the existing Task 3 CSV/state and Task 4 PDF/Markdown publishers in
+    that order while restoring exact prior bundle bytes and in-memory store state
+    if either layer fails. It does not alter the atomic behavior owned by either
+    underlying publisher.
+
+    Parameters
+    ----------
+    store : ReviewStore
+        Open durable review owner. Its review directory owns every bundle output.
+    manifest : ReviewManifest
+        Immutable initial manifest used for final validation and report provenance.
+
+    Returns
+    -------
+    decisions : Path
+        Current finalized decision CSV.
+    pdf : Path
+        Current archival PDF record.
+    summary : Path
+        Current archival Markdown record.
+
+    Raises
+    ------
+    ValueError
+        The review is incomplete, stale, or otherwise not finalizable.
+    OSError
+        Publication or rollback cannot complete safely.
+
+    See Also
+    --------
+    cyclic_stability.review_exports.finalize_decisions :
+        Atomically publish the decision CSV and export-history event.
+    cyclic_stability.review_report.write_review_report :
+        Atomically publish the PDF and Markdown report pair.
+
+    Notes
+    -----
+    Rollback covers current and previous review JSON, operational CSVs, current and
+    previous decision CSVs, current report files, live store state, and new staging
+    debris. The initial randomization manifest is immutable and never modified by
+    finalization.
+    """
+    from cyclic_stability.review_exports import finalize_decisions
+    from cyclic_stability.review_report import write_review_report
+
+    checkpoint = _checkpoint_finalization(store)
+    try:
+        decisions = finalize_decisions(store, manifest, store.review_dir)
+        pdf, summary = write_review_report(
+            store.state,
+            manifest,
+            store.review_dir / "review-record.pdf",
+            store.review_dir / "review-summary.md",
+        )
+    except Exception:
+        _restore_finalization(store, checkpoint)
+        raise
+    return decisions, pdf, summary
 
 
 class ReviewController:
@@ -413,6 +556,14 @@ class ReviewController:
         """Persist a valid dirty draft before permitting application shutdown."""
         self.persist_current()
         return True
+
+    def prepare_reconciliation(self) -> None:
+        """Persist the current draft before checking visual-pass completeness."""
+        self.persist_current()
+        if not self.all_assessed:
+            raise IncompleteAssessmentError(
+                "assess every visual presentation before reconciliation"
+            )
 
     def refresh_from_store(self, *, first_unassessed: bool = False) -> None:
         """Refresh from attached revisions without replacing durable ownership."""
@@ -774,10 +925,14 @@ class ReviewApplication(ReviewController):
         redraw()
 
     def _open_reconciliation(self) -> None:
-        if not self.all_assessed:
+        try:
+            if self._dirty or self._form_has_changed():
+                self._sync_draft()
+            self.prepare_reconciliation()
+        except (IncompleteAssessmentError, ValueError, OSError) as error:
             messagebox.showwarning(
                 "Visual review incomplete",
-                "Assess every visual presentation before reconciliation.",
+                str(error),
                 parent=self._root,
             )
             return
@@ -960,18 +1115,9 @@ class ReviewApplication(ReviewController):
         parent.destroy()
 
     def _finalize(self, parent: tk.Misc) -> None:
-        from cyclic_stability.review_exports import finalize_decisions
-        from cyclic_stability.review_report import write_review_report
-
         try:
-            decisions = finalize_decisions(
-                self.store, self._initial_manifest, self.store.review_dir
-            )
-            pdf, summary = write_review_report(
-                self.store.state,
-                self._initial_manifest,
-                self.store.review_dir / "review-record.pdf",
-                self.store.review_dir / "review-summary.md",
+            decisions, pdf, summary = finalize_review_bundle(
+                self.store, self._initial_manifest
             )
         except (ValueError, OSError) as error:
             messagebox.showerror("Finalization failed", str(error), parent=parent)
@@ -989,5 +1135,6 @@ __all__ = [
     "ReviewController",
     "ReviewViewModel",
     "VisualPresentation",
+    "finalize_review_bundle",
     "keyboard_action",
 ]

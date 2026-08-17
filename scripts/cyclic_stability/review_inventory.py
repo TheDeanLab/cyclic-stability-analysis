@@ -217,6 +217,14 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
         )
         if automated_valid != registration_valid:
             raise ValueError("decision and registration validity disagree")
+        decision_reason = decision["automated_reason"]
+        registration_reason = registration["invalid_reason"]
+        if decision_reason != registration_reason:
+            raise ValueError("decision and registration automated reasons disagree")
+        if automated_valid and decision_reason:
+            raise ValueError("valid cases require empty automated reasons")
+        if not automated_valid and not decision_reason:
+            raise ValueError("invalid cases require an automated reason")
         directory = (
             qc_root / "cells" / case_key.cohort / case_key.cell_id / "qc" / "overlays"
         )
@@ -243,7 +251,7 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
                 raise ValueError(
                     "technical case must be invalid in both source tables and have no visual evidence"
                 )
-        reason = decision["automated_reason"] or registration["invalid_reason"]
+        reason = decision_reason
         flags = tuple(
             sorted((row["region"], row["warp_flags"]) for row in deformation_rows)
         )

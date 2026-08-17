@@ -497,6 +497,15 @@ class ReviewStore:
 
         write_operational_exports(self._state, self._initial_manifest, self._review_dir)
 
+    def _restore_memory_checkpoint(
+        self, state: ReviewState, manifest: ReviewManifest
+    ) -> None:
+        """Restore a validated in-memory checkpoint after bundle rollback."""
+        if state.active_manifest(self._initial_manifest) != manifest:
+            raise ValueError("review checkpoint manifest does not match its state")
+        self._state = state
+        self._manifest = manifest
+
     def _presentations(self) -> dict[str, Presentation]:
         """Return the immutable opaque presentation lookup without biological keys."""
         return {

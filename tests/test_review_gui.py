@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -15,6 +16,8 @@ from types import ModuleType
 import numpy as np
 import pytest
 import tifffile
+from cyclic_stability import review_gui, review_report
+from cyclic_stability.review_exports import finalize_decisions
 from cyclic_stability.review_gui import (
     EvidenceResolver,
     IncompleteAssessmentError,
@@ -23,7 +26,22 @@ from cyclic_stability.review_gui import (
     keyboard_action,
 )
 from cyclic_stability.review_store import ReviewStore
-from synthetic import fresh_review_store, write_review_qc_fixture
+from synthetic import (
+    completed_review_store,
+    fresh_review_store,
+    write_review_qc_fixture,
+)
+
+_BUNDLE_FILES = (
+    "review-state.json",
+    "review-state.previous.json",
+    "remediation-requests.csv",
+    "consistency-report.csv",
+    "qc-decisions.csv",
+    "qc-decisions.previous.csv",
+    "review-record.pdf",
+    "review-summary.md",
+)
 
 
 class RecordingReviewApplication(ReviewController):
@@ -57,6 +75,13 @@ def _entry_point_module() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _bundle_bytes(review_dir: Path) -> dict[str, bytes | None]:
+    return {
+        name: path.read_bytes() if (path := review_dir / name).exists() else None
+        for name in _BUNDLE_FILES
+    }
 
 
 def test_visual_view_model_exposes_no_biological_identity(tmp_path: Path) -> None:
@@ -194,6 +219,95 @@ def test_valid_dirty_edit_is_saved_on_close(
     assert fake_app.request_close()
     assert not fake_app.dirty
     assert fake_app.store.state.assessment_history[opaque_id][-1].status == "exclude"
+
+
+def test_reconciliation_persists_changed_draft_before_unlock(tmp_path: Path) -> None:
+    """A changed valid assessment is durable before reconciliation can open."""
+    store, manifest = fresh_review_store(tmp_path)
+    for presentation in manifest.visual_presentations:
+        store.assess(presentation.opaque_id, "accept", ("dapi-aligned",), "initial")
+    app = RecordingReviewApplication(store)
+    opaque_id = app.current.opaque_id
+    app.select_status("exclude", ("z-misalignment",), "changed")
+
+    app.prepare_reconciliation()
+
+    assert app.calls == ["persist"]
+    assert store.state.assessment_history[opaque_id][-1].status == "exclude"
+    assert store.state.assessment_history[opaque_id][-1].notes == "changed"
+    assert app.all_assessed
+
+
+def test_reconciliation_blocks_incomplete_dirty_edit(tmp_path: Path) -> None:
+    """Persisted completeness cannot hide an incomplete changed visual draft."""
+    store, manifest = fresh_review_store(tmp_path)
+    for presentation in manifest.visual_presentations:
+        store.assess(presentation.opaque_id, "accept", ("dapi-aligned",), "initial")
+    app = RecordingReviewApplication(store)
+    opaque_id = app.current.opaque_id
+    event_count = len(store.state.assessment_history[opaque_id])
+    app.select_status("exclude", (), "unfinished change")
+
+    with pytest.raises(IncompleteAssessmentError, match="reason"):
+        app.prepare_reconciliation()
+
+    assert app.calls == ["persist"]
+    assert len(store.state.assessment_history[opaque_id]) == event_count
+    assert app.dirty
+
+
+def test_finalization_bundle_rolls_back_every_layer_after_report_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A post-CSV report failure restores exact durable and in-memory state."""
+    store, manifest = completed_review_store(tmp_path)
+    review_dir = store.review_dir
+    finalize_decisions(store, manifest, review_dir)
+    (review_dir / "qc-decisions.previous.csv").write_bytes(b"prior decision backup\n")
+    (review_dir / "review-record.pdf").write_bytes(b"prior PDF\n")
+    (review_dir / "review-summary.md").write_text("prior Markdown\n", encoding="utf-8")
+    prior_state = store.state
+    prior_manifest = store.manifest
+    prior_files = _bundle_bytes(review_dir)
+    prior_staged = {path.name for path in review_dir.glob(".*tmp")}
+
+    def fail_report(*_args: object, **_kwargs: object) -> None:
+        assert store.state != prior_state
+        (review_dir / "review-record.pdf").write_bytes(b"partial replacement PDF\n")
+        (review_dir / "review-summary.md").write_text(
+            "partial replacement Markdown\n", encoding="utf-8"
+        )
+        (review_dir / ".review-record.pdf.injected.tmp").write_bytes(b"staged debris\n")
+        raise OSError("injected combined report failure")
+
+    monkeypatch.setattr(review_report, "write_review_report", fail_report)
+
+    with pytest.raises(OSError, match="combined report failure"):
+        review_gui.finalize_review_bundle(store, manifest)
+
+    assert store.state == prior_state
+    assert store.manifest == prior_manifest
+    assert _bundle_bytes(review_dir) == prior_files
+    assert {path.name for path in review_dir.glob(".*tmp")} == prior_staged
+
+
+def test_finalization_bundle_publishes_current_outputs_and_export_history(
+    tmp_path: Path,
+) -> None:
+    """A successful bundle publishes all three outputs and records their CSV."""
+    store, manifest = completed_review_store(tmp_path)
+
+    decisions, pdf, summary = review_gui.finalize_review_bundle(store, manifest)
+
+    assert decisions == store.review_dir / "qc-decisions.csv"
+    assert pdf == store.review_dir / "review-record.pdf"
+    assert summary == store.review_dir / "review-summary.md"
+    assert pdf.read_bytes().startswith(b"%PDF")
+    assert summary.read_text(encoding="utf-8").startswith("# Blinded QC review record")
+    assert (
+        store.state.export_history[-1].sha256
+        == hashlib.sha256(decisions.read_bytes()).hexdigest()
+    )
 
 
 def test_validate_only_creates_and_resumes_without_tk(

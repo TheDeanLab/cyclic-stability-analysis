@@ -204,6 +204,77 @@ def test_inventory_rejects_decision_registration_disagreement(tmp_path: Path) ->
         build_review_manifest(qc_root, seed=1)
 
 
+def test_inventory_rejects_automated_reason_disagreement(tmp_path: Path) -> None:
+    """Equal invalid booleans cannot conceal conflicting producer reasons."""
+    qc_root = write_review_qc_fixture(tmp_path / "qc-only")
+    visual = lambda row: (
+        row["cohort"] == "golgi"
+        and row["cell_id"] == "Cell1"
+        and row["acquisition_round"] == "1"
+    )
+    _rewrite_review_rows(
+        qc_root / "qc" / "decision-requests.csv",
+        visual,
+        {
+            "automated_valid": "False",
+            "automated_reason": "nonpositive-jacobian",
+        },
+    )
+    _rewrite_review_rows(
+        qc_root / "qc" / "registration-qc.csv",
+        visual,
+        {
+            "automated_valid": "False",
+            "invalid_reason": "different-raw-reason",
+        },
+    )
+
+    with pytest.raises(ValueError, match="automated reasons disagree"):
+        build_review_manifest(qc_root, seed=1)
+
+
+def test_inventory_requires_empty_reasons_for_valid_case(tmp_path: Path) -> None:
+    """A valid producer row cannot carry a stale matching invalid reason."""
+    qc_root = write_review_qc_fixture(tmp_path / "qc-only")
+    visual = lambda row: (
+        row["cohort"] == "golgi"
+        and row["cell_id"] == "Cell1"
+        and row["acquisition_round"] == "1"
+    )
+    _rewrite_review_rows(
+        qc_root / "qc" / "decision-requests.csv",
+        visual,
+        {"automated_reason": "stale-producer-reason"},
+    )
+    _rewrite_review_rows(
+        qc_root / "qc" / "registration-qc.csv",
+        visual,
+        {"invalid_reason": "stale-producer-reason"},
+    )
+
+    with pytest.raises(ValueError, match="valid cases require empty automated reasons"):
+        build_review_manifest(qc_root, seed=1)
+
+
+def test_inventory_requires_reason_for_invalid_case(tmp_path: Path) -> None:
+    """Matching empty strings are not evidence for an automated-invalid case."""
+    qc_root = write_review_qc_fixture(tmp_path / "qc-only")
+    visual = lambda row: (
+        row["cohort"] == "golgi"
+        and row["cell_id"] == "Cell1"
+        and row["acquisition_round"] == "1"
+    )
+    for filename in ("decision-requests.csv", "registration-qc.csv"):
+        _rewrite_review_rows(
+            qc_root / "qc" / filename,
+            visual,
+            {"automated_valid": "False"},
+        )
+
+    with pytest.raises(ValueError, match="invalid cases require an automated reason"):
+        build_review_manifest(qc_root, seed=1)
+
+
 def test_inventory_rejects_grayscale_overlay_with_width_three(tmp_path: Path) -> None:
     """An X dimension of three is not evidence of RGB TIFF samples."""
     qc_root = write_review_qc_fixture(tmp_path / "qc-only")
