@@ -88,27 +88,34 @@ def write_review_qc_fixture(root: Path) -> Path:
     for cohort in ("golgi", "lamin"):
         for cell_number in range(1, 6):
             for round_number in (1, 3, 4, 5):
-                hard_invalid = cohort == "lamin" and cell_number == 1 and round_number == 1
+                hard_invalid = (
+                    cohort == "lamin" and cell_number == 1 and round_number == 1
+                )
                 rows.append(
                     {
                         "cohort": cohort,
                         "cell_id": f"Cell{cell_number}",
                         "acquisition_round": round_number,
                         "automated_valid": not hard_invalid,
-                        "automated_reason": "invalid-affine-reflection" if hard_invalid else "",
+                        "automated_reason": "invalid-affine-reflection"
+                        if hard_invalid
+                        else "",
                         "decision": "",
                     }
                 )
                 if hard_invalid:
                     continue
-                overlay_dir = root / "cells" / cohort / f"Cell{cell_number}" / "qc" / "overlays"
+                overlay_dir = (
+                    root / "cells" / cohort / f"Cell{cell_number}" / "qc" / "overlays"
+                )
                 overlay_dir.mkdir(parents=True, exist_ok=True)
                 for channel in ("dapi", "tubulin"):
                     for stage in ("pre", "affine", "nonlinear"):
                         for view in ("xy", "xz", "yz"):
                             image = np.full((8, 12, 3), round_number, dtype=np.uint8)
                             tifffile.imwrite(
-                                overlay_dir / f"{round_number:02d}-{channel}-{stage}-{view}.tif",
+                                overlay_dir
+                                / f"{round_number:02d}-{channel}-{stage}-{view}.tif",
                                 image,
                                 photometric="rgb",
                             )
@@ -128,9 +135,18 @@ def test_manifest_is_complete_randomized_and_target_blind(tmp_path: Path) -> Non
     manifest = build_review_manifest(qc_root, seed=8142026)
     assert len(manifest.case_revisions) == 40
     assert len(manifest.visual_presentations) == 43
-    assert sum(item.repeat_of is not None for item in manifest.visual_presentations) == 4
-    assert len({item.repeat_of for item in manifest.visual_presentations if item.repeat_of}) == 4
-    assert all(item.opaque_id.startswith("QC-") for item in manifest.visual_presentations)
+    assert (
+        sum(item.repeat_of is not None for item in manifest.visual_presentations) == 4
+    )
+    assert (
+        len(
+            {item.repeat_of for item in manifest.visual_presentations if item.repeat_of}
+        )
+        == 4
+    )
+    assert all(
+        item.opaque_id.startswith("QC-") for item in manifest.visual_presentations
+    )
     assert all("Cell" not in item.opaque_id for item in manifest.visual_presentations)
 
 
@@ -138,7 +154,9 @@ def test_inventory_rejects_non_allowlisted_tiff(tmp_path: Path) -> None:
     qc_root = write_review_qc_fixture(tmp_path / "qc-only")
     extra = qc_root / "cells/golgi/Cell1/qc/overlays/01-647-golgi-nonlinear-xy.tif"
     extra.write_bytes(b"target must never be read")
-    with pytest.raises(ValueError, match="overlay basename outside target-blind allowlist"):
+    with pytest.raises(
+        ValueError, match="overlay basename outside target-blind allowlist"
+    ):
         build_review_manifest(qc_root, seed=1)
 ```
 
@@ -203,7 +221,9 @@ def _overlay_paths(directory: Path, round_number: int) -> tuple[Path, ...]:
         if OVERLAY_NAME.fullmatch(path.name) is None
     )
     if unexpected:
-        raise ValueError(f"overlay basename outside target-blind allowlist: {unexpected}")
+        raise ValueError(
+            f"overlay basename outside target-blind allowlist: {unexpected}"
+        )
     return expected
 ```
 
@@ -252,7 +272,9 @@ Define `fixed_clock() -> datetime` in this test module, returning the timezone-a
 ```python
 def test_review_state_is_pretty_atomic_and_resumable(tmp_path: Path) -> None:
     manifest = build_review_manifest(write_review_qc_fixture(tmp_path / "qc"), seed=7)
-    store = ReviewStore.create(tmp_path / "review", manifest, "Reviewer", now=fixed_clock)
+    store = ReviewStore.create(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
     opaque_id = manifest.visual_presentations[0].opaque_id
     store.assess(opaque_id, "accept", ("dapi-aligned", "tubulin-aligned"), "clear")
     text = (tmp_path / "review/review-state.json").read_text(encoding="utf-8")
@@ -264,7 +286,9 @@ def test_review_state_is_pretty_atomic_and_resumable(tmp_path: Path) -> None:
     assert payload["repository_identity"]["commit"]
     if payload["repository_identity"]["dirty"]:
         assert payload["repository_identity"]["diff_sha256"]
-    reopened = ReviewStore.open(tmp_path / "review", manifest, "Reviewer", now=fixed_clock)
+    reopened = ReviewStore.open(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
     assert reopened.state.assessment_history[opaque_id][-1].status == "accept"
 
 
@@ -396,10 +420,14 @@ Extend `tests/synthetic.py` with these exact reusable fixture interfaces before 
 The helpers use only public reviewer APIs and are imported by later report and GUI tests.
 
 ```python
-def test_remediation_is_nonfinal_and_new_revision_preserves_history(tmp_path: Path) -> None:
+def test_remediation_is_nonfinal_and_new_revision_preserves_history(
+    tmp_path: Path,
+) -> None:
     qc_root = write_review_qc_fixture(tmp_path / "qc-v1")
     manifest = build_review_manifest(qc_root, seed=9)
-    store = ReviewStore.create(tmp_path / "review", manifest, "Reviewer", now=fixed_clock)
+    store = ReviewStore.create(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
     presentation = manifest.visual_presentations[0]
     store.assess(
         presentation.opaque_id,
@@ -410,10 +438,15 @@ def test_remediation_is_nonfinal_and_new_revision_preserves_history(tmp_path: Pa
     with pytest.raises(ValueError, match="registration improvement remains unresolved"):
         finalize_decisions(store, manifest, tmp_path / "review")
     revised_root = write_review_qc_fixture(tmp_path / "qc-v2")
-    rewrite_review_case_pixels(revised_root, manifest.presentation_cases[presentation.opaque_id])
+    rewrite_review_case_pixels(
+        revised_root, manifest.presentation_cases[presentation.opaque_id]
+    )
     attach_revision_root(store, revised_root)
     assert len(store.state.case_histories[presentation.case_token].revisions) == 2
-    assert store.state.assessment_history[presentation.opaque_id][0].notes == "retry registration"
+    assert (
+        store.state.assessment_history[presentation.opaque_id][0].notes
+        == "retry registration"
+    )
 
 
 def test_final_csv_has_one_binary_row_per_biological_case(tmp_path: Path) -> None:
@@ -422,7 +455,13 @@ def test_final_csv_has_one_binary_row_per_biological_case(tmp_path: Path) -> Non
     rows = list(csv.DictReader(output.open(newline="", encoding="utf-8")))
     assert len(rows) == 40
     assert set(rows[0]) == {
-        "cohort", "cell_id", "acquisition_round", "decision", "reasons", "reviewer", "reviewed_at"
+        "cohort",
+        "cell_id",
+        "acquisition_round",
+        "decision",
+        "reasons",
+        "reviewer",
+        "reviewed_at",
     }
     assert {row["decision"] for row in rows} <= {"accept", "exclude"}
 ```
@@ -441,10 +480,22 @@ Write deterministic CSVs atomically after every state change. `remediation-reque
 
 ```python
 REMEDIATION_COLUMNS = (
-    "cohort", "cell_id", "acquisition_round", "revision_id", "reasons", "notes", "reviewer", "reviewed_at"
+    "cohort",
+    "cell_id",
+    "acquisition_round",
+    "revision_id",
+    "reasons",
+    "notes",
+    "reviewer",
+    "reviewed_at",
 )
 CONSISTENCY_COLUMNS = (
-    "base_opaque_id", "repeat_opaque_id", "base_status", "repeat_status", "agreement", "adjudicated_decision"
+    "base_opaque_id",
+    "repeat_opaque_id",
+    "base_status",
+    "repeat_status",
+    "agreement",
+    "adjudicated_decision",
 )
 ```
 
@@ -580,7 +631,9 @@ def test_visual_view_model_exposes_no_biological_identity(tmp_path: Path) -> Non
     assert "lamin" not in payload
 
 
-def test_navigation_persists_before_changing_case(fake_app: RecordingReviewApplication) -> None:
+def test_navigation_persists_before_changing_case(
+    fake_app: RecordingReviewApplication,
+) -> None:
     fake_app.select_status("accept", ("dapi-aligned",), "reviewed")
     fake_app.next_case()
     assert fake_app.calls[:2] == ["persist", "render-next"]
