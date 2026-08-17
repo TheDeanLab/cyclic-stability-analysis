@@ -147,13 +147,24 @@ def _overlay_evidence(qc_root: Path, path: Path) -> OverlayEvidence:
     except FileNotFoundError as error:
         raise ValueError(f"missing required overlay: {path.name}") from error
     try:
-        decoded = tifffile.imread(io.BytesIO(verified.content))
+        with tifffile.TiffFile(io.BytesIO(verified.content)) as tiff:
+            decoded = tiff.asarray()
+            semantic_rgb = (
+                len(tiff.series) == 1
+                and len(tiff.pages) == 1
+                and len(tiff.series[0].pages) == 1
+                and tiff.series[0].axes == "YXS"
+                and tiff.pages[0].axes == "YXS"
+                and tiff.pages[0].photometric == tifffile.PHOTOMETRIC.RGB
+                and tiff.pages[0].samplesperpixel == 3
+            )
     except (OSError, ValueError, tifffile.TiffFileError) as error:
         raise ValueError(
             f"overlay must be a fully decoded RGB uint8 image: {path.name}"
         ) from error
     if (
-        decoded.ndim != 3
+        not semantic_rgb
+        or decoded.ndim != 3
         or decoded.shape[-1] != 3
         or any(dimension < 1 for dimension in decoded.shape)
         or decoded.dtype != np.dtype(np.uint8)

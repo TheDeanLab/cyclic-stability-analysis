@@ -10,6 +10,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import tifffile
 from cyclic_stability import review_evidence
@@ -161,6 +162,24 @@ def test_inventory_rejects_truncated_rgb_payload(tmp_path: Path) -> None:
     overlay.write_bytes(content[:-32])
 
     with pytest.raises(ValueError, match="fully decoded RGB"):
+        build_review_manifest(qc_root, seed=1)
+
+
+def test_inventory_rejects_multiframe_grayscale_that_decodes_hwc(
+    tmp_path: Path,
+) -> None:
+    """An HxWx3 decoded shape cannot disguise grayscale frames as RGB samples."""
+    qc_root = write_review_qc_fixture(tmp_path / "qc-only")
+    overlay = qc_root / "cells/golgi/Cell1/qc/overlays/01-dapi-pre-xy.tif"
+    frames = np.arange(8 * 12 * 3, dtype=np.uint8).reshape(8, 12, 3)
+    tifffile.imwrite(overlay, frames, photometric="minisblack")
+    with tifffile.TiffFile(overlay) as tif:
+        assert tif.asarray().shape == (8, 12, 3)
+        assert len(tif.pages) == 8
+        assert tif.pages[0].photometric.name == "MINISBLACK"
+        assert tif.pages[0].samplesperpixel == 1
+
+    with pytest.raises(ValueError, match="RGB"):
         build_review_manifest(qc_root, seed=1)
 
 
