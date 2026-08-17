@@ -59,6 +59,15 @@ _EXPECTED_CASE_KEYS = frozenset(
     for cell_number in range(1, 6)
     for acquisition_round in (1, 3, 4, 5)
 )
+_TECHNICAL_AFFINE_REFLECTION_REASONS = frozenset(
+    {
+        "invalid-affine-reflection",
+        (
+            "unreadable or invalid affine geometry: affine matrix is improper "
+            "(contains a reflection)"
+        ),
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,7 +419,7 @@ def _case_outcome(
         if (
             revision.overlays
             or revision.automated_valid
-            or revision.automated_reason != "invalid-affine-reflection"
+            or revision.automated_reason not in _TECHNICAL_AFFINE_REFLECTION_REASONS
             or adjudication is None
             or adjudication.status != "exclude"
             or adjudication.reasons != ("invalid-affine-reflection",)

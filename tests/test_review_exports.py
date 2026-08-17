@@ -31,6 +31,11 @@ from synthetic import (
     write_review_qc_fixture,
 )
 
+_RAW_AFFINE_REFLECTION_REASON = (
+    "unreadable or invalid affine geometry: affine matrix is improper "
+    "(contains a reflection)"
+)
+
 
 def _read_rows(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as handle:
@@ -56,6 +61,41 @@ def _complete_visual_assessments(
             else ("dapi-aligned",)
         )
         store.assess(presentation.opaque_id, status, reasons, status)
+
+
+def _completed_with_technical_reason(
+    tmp_path: Path, reason: str
+) -> tuple[ReviewStore, ReviewManifest]:
+    qc_root = write_review_qc_fixture(tmp_path / "qc")
+    for filename, reason_column in (
+        ("decision-requests.csv", "automated_reason"),
+        ("registration-qc.csv", "invalid_reason"),
+    ):
+        path = qc_root / "qc" / filename
+        rows = _read_rows(path)
+        for row in rows:
+            if (
+                row["cohort"] == "lamin"
+                and row["cell_id"] == "Cell1"
+                and row["acquisition_round"] == "1"
+            ):
+                row[reason_column] = reason
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=tuple(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+    manifest = build_review_manifest(qc_root, seed=7)
+    store = ReviewStore.create(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
+    _complete_visual_assessments(store, manifest)
+    store.adjudicate(
+        _technical_case(manifest),
+        "exclude",
+        ("invalid-affine-reflection",),
+        "hard invalid",
+    )
+    return store, manifest
 
 
 def test_remediation_is_nonfinal_and_new_revision_preserves_history(
@@ -540,6 +580,40 @@ def test_hard_invalid_technical_case_requires_exclusion(tmp_path: Path) -> None:
         store.adjudicate(technical, "accept", ("dapi-aligned",), "incorrect")
     with pytest.raises(ValueError, match="invalid-affine-reflection"):
         store.adjudicate(technical, "exclude", ("dapi-aligned",), "wrong reason")
+
+
+def test_exact_raw_affine_reflection_reason_finalizes_canonically(
+    tmp_path: Path,
+) -> None:
+    """Known producer wording stays in provenance but exports a controlled token."""
+    store, manifest = _completed_with_technical_reason(
+        tmp_path, _RAW_AFFINE_REFLECTION_REASON
+    )
+
+    output = finalize_decisions(store, manifest, tmp_path / "review")
+
+    technical_revision = next(
+        history.revisions[-1]
+        for history in store.state.case_histories.values()
+        if not history.revisions[-1].overlays
+    )
+    technical_row = next(
+        row
+        for row in _read_rows(output)
+        if row["cohort"] == "lamin"
+        and row["cell_id"] == "Cell1"
+        and row["acquisition_round"] == "1"
+    )
+    assert technical_revision.automated_reason == _RAW_AFFINE_REFLECTION_REASON
+    assert technical_row["reasons"] == "invalid-affine-reflection"
+
+
+def test_unrelated_raw_technical_reason_remains_invalid(tmp_path: Path) -> None:
+    """A non-reflection producer failure cannot inherit the controlled exception."""
+    store, manifest = _completed_with_technical_reason(tmp_path, "nonpositive-jacobian")
+
+    with pytest.raises(ValueError, match="hard-invalid technical case"):
+        finalize_decisions(store, manifest, tmp_path / "review")
 
 
 def test_finalization_rejects_tampered_technical_exclusion_reason(
