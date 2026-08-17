@@ -8,7 +8,9 @@ import re
 from pathlib import Path
 
 import matplotlib
+import numpy as np
 import pytest
+import tifffile
 from cyclic_stability import review_evidence, review_report
 from cyclic_stability.review_exports import (
     _consistency_rows,
@@ -115,6 +117,32 @@ def test_report_opens_only_allowlisted_overlays_and_maps_biology_last(
     )
     text = summary.read_text(encoding="utf-8")
     assert text.rindex("## Unblinded provenance appendix") < text.index("Cell1")
+
+
+def test_report_decodes_verified_overlay_with_review_palette(tmp_path: Path) -> None:
+    """PDF image decoding uses magenta reference and green moving signal."""
+    qc_root = write_review_qc_fixture(tmp_path / "qc")
+    path = qc_root / "cells/golgi/Cell1/qc/overlays/01-dapi-pre-xy.tif"
+    source = np.empty((8, 12, 3), dtype=np.uint8)
+    source[..., 0] = 20
+    source[..., 1] = 30
+    source[..., 2] = 7
+    tifffile.imwrite(path, source, photometric="rgb")
+    original_bytes = path.read_bytes()
+    manifest = build_review_manifest(qc_root, seed=5)
+    overlay = next(
+        overlay
+        for presentation in manifest.visual_presentations
+        for overlay in presentation.overlays
+        if Path(overlay.path) == path
+    )
+
+    displayed = review_report._display_overlay(overlay)
+
+    assert np.array_equal(displayed[..., 0], source[..., 0])
+    assert np.array_equal(displayed[..., 1], source[..., 1])
+    assert np.array_equal(displayed[..., 2], source[..., 0])
+    assert path.read_bytes() == original_bytes
 
 
 def test_report_rejects_unfinalized_state_without_publication(tmp_path: Path) -> None:

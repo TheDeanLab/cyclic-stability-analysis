@@ -21,7 +21,13 @@ from cyclic_stability.review_exports import (
     _latest_assessment,
 )
 from cyclic_stability.review_inventory import read_overlay_bytes
-from cyclic_stability.review_models import Presentation, ReviewManifest, ReviewState
+from cyclic_stability.review_models import (
+    OverlayEvidence,
+    Presentation,
+    ReviewManifest,
+    ReviewState,
+)
+from cyclic_stability.review_palette import apply_review_palette
 
 _CHANNELS = ("dapi", "tubulin")
 _STAGES = ("pre", "affine", "nonlinear")
@@ -111,9 +117,7 @@ def _render_visual_page(
         for stage_index, stage in enumerate(_STAGES):
             for view_index, view in enumerate(_VIEWS):
                 overlay = overlays[(channel, stage, view)]
-                images.append(
-                    np.asarray(tifffile.imread(io.BytesIO(read_overlay_bytes(overlay))))
-                )
+                images.append(_display_overlay(overlay))
         axis = axes[channel_index]
         mosaic = _overlay_mosaic(images)
         axis.imshow(mosaic)
@@ -128,6 +132,12 @@ def _render_visual_page(
         axis.set_title(f"{channel.upper()} overlays: stage by view", fontsize=9)
     pdf.savefig(figure)
     plt.close(figure)
+
+
+def _display_overlay(overlay: OverlayEvidence) -> np.ndarray:
+    """Decode verified evidence and apply the shared review display palette."""
+    decoded = np.asarray(tifffile.imread(io.BytesIO(read_overlay_bytes(overlay))))
+    return apply_review_palette(decoded)
 
 
 def _overlay_mosaic(images: Sequence[np.ndarray]) -> np.ndarray:

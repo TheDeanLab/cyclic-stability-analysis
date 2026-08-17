@@ -192,9 +192,7 @@ Create the evidence-owning composition:
 
 ```python
 def _display_overlay(overlay: OverlayEvidence) -> NDArray[np.uint8]:
-    decoded = np.asarray(
-        tifffile.imread(io.BytesIO(read_overlay_bytes(overlay)))
-    )
+    decoded = np.asarray(tifffile.imread(io.BytesIO(read_overlay_bytes(overlay))))
     return apply_review_palette(decoded)
 ```
 

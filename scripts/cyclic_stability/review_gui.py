@@ -17,6 +17,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Literal, cast
 
+import numpy as np
 from PIL import Image, ImageTk
 
 from cyclic_stability.review_inventory import OVERLAY_NAME, read_overlay_bytes
@@ -29,6 +30,7 @@ from cyclic_stability.review_models import (
     ReviewManifest,
     ReviewState,
 )
+from cyclic_stability.review_palette import apply_review_palette
 from cyclic_stability.review_store import ReviewStore
 from cyclic_stability.review_transaction import (
     PendingFinalization,
@@ -241,7 +243,7 @@ class EvidenceResolver:
             or image.height < 1
         ):
             raise ValueError("review evidence must be a nonempty RGB image")
-        return image
+        return Image.fromarray(apply_review_palette(np.asarray(image)), mode="RGB")
 
     def _record(self, token: str) -> _ResolvedEvidence:
         """Return one role-checked manifest record without exposing its path."""

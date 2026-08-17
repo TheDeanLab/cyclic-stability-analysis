@@ -27,6 +27,7 @@ from cyclic_stability.review_gui import (
     ReviewViewModel,
     keyboard_action,
 )
+from cyclic_stability.review_inventory import build_review_manifest
 from cyclic_stability.review_store import ReviewStore
 from synthetic import (
     completed_review_store,
@@ -193,16 +194,39 @@ def test_evidence_resolver_accepts_only_tokens_and_revalidates_digest(
 
 
 def test_evidence_thumbnail_is_rgb_and_preserves_aspect_ratio(tmp_path: Path) -> None:
-    """Thumbnail loading retains the source aspect ratio without exposing paths."""
-    store, _manifest = fresh_review_store(tmp_path)
-    presentation = ReviewViewModel.from_store(store).presentations[0]
-    resolver = EvidenceResolver(store.manifest)
-    token = presentation.evidence_tokens["tubulin"]["nonlinear"]["yz"]
+    """GUI images use the review palette without changing source evidence."""
+    qc_root = write_review_qc_fixture(tmp_path / "qc")
+    path = qc_root / "cells/golgi/Cell1/qc/overlays/01-dapi-pre-xy.tif"
+    source = np.empty((8, 12, 3), dtype=np.uint8)
+    source[..., 0] = 20
+    source[..., 1] = 30
+    source[..., 2] = 7
+    tifffile.imwrite(path, source, photometric="rgb")
+    original_bytes = path.read_bytes()
+    manifest = build_review_manifest(qc_root, seed=5)
+    presentation = next(
+        item
+        for item in manifest.visual_presentations
+        if any(Path(overlay.path) == path for overlay in item.overlays)
+    )
+    token = review_gui._evidence_token(
+        presentation,
+        next(
+            overlay for overlay in presentation.overlays if Path(overlay.path) == path
+        ),
+    )
+    resolver = EvidenceResolver(manifest)
 
+    displayed = np.asarray(resolver.load_image(token))
     thumbnail = resolver.load_thumbnail(token, (6, 6))
 
+    assert np.array_equal(displayed[..., 0], source[..., 0])
+    assert np.array_equal(displayed[..., 1], source[..., 1])
+    assert np.array_equal(displayed[..., 2], source[..., 0])
     assert thumbnail.mode == "RGB"
     assert thumbnail.size == (6, 4)
+    assert np.array_equal(np.asarray(thumbnail)[0, 0], [20, 30, 20])
+    assert path.read_bytes() == original_bytes
 
 
 def test_evidence_resolver_rejects_symlinked_ancestor_without_target_read(
