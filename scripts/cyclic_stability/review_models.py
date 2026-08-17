@@ -14,6 +14,12 @@ _ROUNDS = frozenset({1, 3, 4, 5})
 _CHANNELS = frozenset({"dapi", "tubulin"})
 _STAGES = frozenset({"pre", "affine", "nonlinear"})
 _VIEWS = frozenset({"xy", "xz", "yz"})
+_OVERLAY_PRODUCT = frozenset(
+    (channel, stage, view)
+    for channel in _CHANNELS
+    for stage in _STAGES
+    for view in _VIEWS
+)
 
 
 def _mapping(payload: object, keys: frozenset[str], name: str) -> Mapping[str, object]:
@@ -26,6 +32,16 @@ def _string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a nonempty string")
     return value
+
+
+def _validate_overlay_product(
+    overlays: tuple[OverlayEvidence, ...], *, allow_empty: bool
+) -> None:
+    if allow_empty and not overlays:
+        return
+    descriptors = {(item.channel, item.stage, item.view) for item in overlays}
+    if len(overlays) != 18 or descriptors != _OVERLAY_PRODUCT:
+        raise ValueError("overlays must be the exact 2 x 3 x 3 overlay product")
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -180,8 +196,7 @@ class CaseRevision:
     def __post_init__(self) -> None:
         _string(self.case_token, "case_token")
         _string(self.revision_id, "revision_id")
-        if len(self.overlays) not in (0, 18):
-            raise ValueError("a case revision must contain zero or eighteen overlays")
+        _validate_overlay_product(self.overlays, allow_empty=True)
         if not isinstance(self.automated_valid, bool):
             raise TypeError("automated_valid must be a boolean")
         if not isinstance(self.automated_reason, str):
@@ -230,7 +245,9 @@ class CaseRevision:
         for item in data["deformation_flags"]:
             if not isinstance(item, list) or len(item) != 2:
                 raise ValueError("deformation flag must be a two-item list")
-            flags.append((_string(item[0], "region"), _string(item[1], "warp_flags")))
+            if not isinstance(item[1], str):
+                raise TypeError("warp_flags must be a string")
+            flags.append((_string(item[0], "region"), item[1]))
         return cls(
             CaseKey.from_dict(data["case_key"]),
             _string(data["case_token"], "case_token"),
@@ -268,8 +285,7 @@ class Presentation:
         _string(self.opaque_id, "opaque_id")
         _string(self.case_token, "case_token")
         _string(self.revision_id, "revision_id")
-        if len(self.overlays) != 18:
-            raise ValueError("a visual presentation must contain eighteen overlays")
+        _validate_overlay_product(self.overlays, allow_empty=False)
         if self.repeat_of is not None:
             _string(self.repeat_of, "repeat_of")
 

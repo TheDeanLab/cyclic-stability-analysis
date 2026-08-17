@@ -49,6 +49,13 @@ _DEFORMATION_COLUMNS = frozenset(
     {"cohort", "cell_id", "acquisition_round", "region", "warp_flags"}
 )
 _REGIONS = frozenset({"whole", "seam", "interior"})
+_EXPECTED_CASE_KEYS = frozenset(
+    CaseKey(cohort, f"Cell{cell_number}", acquisition_round)
+    for cohort in ("golgi", "lamin")
+    for cell_number in range(1, 6)
+    for acquisition_round in (1, 3, 4, 5)
+)
+_TECHNICAL_CASE = CaseKey("lamin", "Cell1", 1)
 
 
 def _csv_rows(
@@ -125,7 +132,13 @@ def _overlay_evidence(path: Path) -> OverlayEvidence:
             f"overlay basename outside target-blind allowlist: {path.name}"
         )
     with tifffile.TiffFile(path) as image:
-        if len(image.series) != 1 or image.series[0].shape[-1:] != (3,):
+        if (
+            len(image.series) != 1
+            or image.series[0].axes[-1:] != "S"
+            or image.series[0].shape[-1:] != (3,)
+            or image.pages[0].samplesperpixel != 3
+            or image.pages[0].photometric.name != "RGB"
+        ):
             raise ValueError(f"overlay must be RGB: {path.name}")
     round_text, channel, stage, view = match.groups()
     del round_text
@@ -169,10 +182,13 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
     )
     for row in _csv_rows(qc_root / "qc" / "deformation.csv", _DEFORMATION_COLUMNS):
         deformation_by_case[_case_key(row)].append(row)
-    if set(decision_rows) != set(registration_rows):
-        raise ValueError("decision and registration case keys must match exactly")
-    if len(decision_rows) != 40:
-        raise ValueError("QC inventory must contain exactly 40 cases")
+    if (
+        set(decision_rows) != _EXPECTED_CASE_KEYS
+        or set(registration_rows) != _EXPECTED_CASE_KEYS
+    ):
+        raise ValueError(
+            "QC inventory must contain the expected ten-cell moving-round key set"
+        )
 
     revisions: dict[CaseKey, CaseRevision] = {}
     visual_count = 0
@@ -185,6 +201,8 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
         registration_valid = _boolean(
             registration["automated_valid"], "registration automated_valid"
         )
+        if automated_valid != registration_valid:
+            raise ValueError("decision and registration validity disagree")
         directory = (
             qc_root / "cells" / case_key.cohort / case_key.cell_id / "qc" / "overlays"
         )
@@ -195,6 +213,8 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
             missing = expected_paths[overlay_exists.index(False)]
             raise ValueError(f"missing required overlay: {missing.name}")
         if all(overlay_exists):
+            if not registration_valid:
+                raise ValueError("visual case must be valid in both source tables")
             overlays = tuple(_overlay_evidence(path) for path in expected_paths)
             visual_count += 1
             if {row["region"] for row in deformation_rows} != _REGIONS or len(
@@ -205,9 +225,11 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
                 )
         else:
             overlays = ()
-            if registration_valid or deformation_rows:
+            if case_key != _TECHNICAL_CASE:
+                raise ValueError("only Lamin Cell1 round 1 may be the technical case")
+            if automated_valid or registration_valid or deformation_rows:
                 raise ValueError(
-                    "technical case must be invalid and have no visual evidence"
+                    "technical case must be invalid in both source tables and have no visual evidence"
                 )
         flags = tuple(
             sorted((row["region"], row["warp_flags"]) for row in deformation_rows)
