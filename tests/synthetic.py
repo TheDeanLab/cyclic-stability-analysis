@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -36,6 +37,130 @@ CORRESPONDENCE_COLUMNS = (
     "workflow_dataset_id",
     "identity_method",
 )
+
+REVIEW_DECISION_COLUMNS = (
+    "cohort",
+    "cell_id",
+    "acquisition_round",
+    "automated_valid",
+    "automated_reason",
+    "decision",
+)
+REVIEW_REGISTRATION_COLUMNS = (
+    "cohort",
+    "cell_id",
+    "acquisition_round",
+    "workflow_round",
+    "is_reference",
+    "automated_valid",
+    "invalid_reason",
+)
+REVIEW_DEFORMATION_COLUMNS = (
+    "cohort",
+    "cell_id",
+    "acquisition_round",
+    "region",
+    "warp_flags",
+)
+
+
+def _write_review_rows(
+    path: Path,
+    columns: tuple[str, ...],
+    rows: Iterable[Mapping[str, object]],
+) -> None:
+    """Write review evidence rows in their fixed production column order."""
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_review_tables(
+    qc: Path, decision_rows: Sequence[Mapping[str, object]]
+) -> None:
+    """Derive fixed-schema registration and deformation evidence from decisions."""
+    registration_rows: list[dict[str, object]] = []
+    deformation_rows: list[dict[str, object]] = []
+    for row in decision_rows:
+        hard_invalid = not bool(row["automated_valid"])
+        registration_rows.append(
+            {
+                "cohort": row["cohort"],
+                "cell_id": row["cell_id"],
+                "acquisition_round": row["acquisition_round"],
+                "workflow_round": row["acquisition_round"],
+                "is_reference": False,
+                "automated_valid": not hard_invalid,
+                "invalid_reason": row["automated_reason"] if hard_invalid else "",
+            }
+        )
+        if hard_invalid:
+            continue
+        for region in ("whole", "seam", "interior"):
+            deformation_rows.append(
+                {
+                    "cohort": row["cohort"],
+                    "cell_id": row["cell_id"],
+                    "acquisition_round": row["acquisition_round"],
+                    "region": region,
+                    "warp_flags": "",
+                }
+            )
+    _write_review_rows(
+        qc / "decision-requests.csv", REVIEW_DECISION_COLUMNS, decision_rows
+    )
+    _write_review_rows(
+        qc / "registration-qc.csv", REVIEW_REGISTRATION_COLUMNS, registration_rows
+    )
+    _write_review_rows(
+        qc / "deformation.csv", REVIEW_DEFORMATION_COLUMNS, deformation_rows
+    )
+
+
+def write_review_qc_fixture(root: Path) -> Path:
+    """Write the complete 40-case target-blind QC inventory."""
+    import tifffile
+
+    qc = root / "qc"
+    qc.mkdir(parents=True)
+    rows: list[dict[str, object]] = []
+    for cohort in ("golgi", "lamin"):
+        for cell_number in range(1, 6):
+            for round_number in (1, 3, 4, 5):
+                hard_invalid = (
+                    cohort == "lamin" and cell_number == 1 and round_number == 1
+                )
+                rows.append(
+                    {
+                        "cohort": cohort,
+                        "cell_id": f"Cell{cell_number}",
+                        "acquisition_round": round_number,
+                        "automated_valid": not hard_invalid,
+                        "automated_reason": (
+                            "invalid-affine-reflection" if hard_invalid else ""
+                        ),
+                        "decision": "",
+                    }
+                )
+                if hard_invalid:
+                    continue
+                overlay_dir = (
+                    root / "cells" / cohort / f"Cell{cell_number}" / "qc" / "overlays"
+                )
+                overlay_dir.mkdir(parents=True, exist_ok=True)
+                for channel in ("dapi", "tubulin"):
+                    for stage in ("pre", "affine", "nonlinear"):
+                        for view in ("xy", "xz", "yz"):
+                            image = np.full((8, 12, 3), round_number, dtype=np.uint8)
+                            tifffile.imwrite(
+                                overlay_dir
+                                / f"{round_number:02d}-{channel}-{stage}-{view}.tif",
+                                image,
+                                photometric="rgb",
+                            )
+    _write_review_tables(qc, rows)
+    return root
 
 
 def _fake_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
