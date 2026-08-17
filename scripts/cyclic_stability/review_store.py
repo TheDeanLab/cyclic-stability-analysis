@@ -20,6 +20,8 @@ from cyclic_stability.review_models import (
     AssessmentStatus,
     CaseHistory,
     CaseKey,
+    CaseRevision,
+    ExportRecord,
     Presentation,
     RecoveryEvent,
     RepositoryIdentity,
@@ -160,7 +162,8 @@ class ReviewStore:
         state: ReviewState,
     ) -> None:
         self._review_dir = review_dir
-        self._manifest = manifest
+        self._initial_manifest = manifest
+        self._manifest = state.active_manifest(manifest)
         self._reviewer = reviewer
         self._now = now
         self._state = state
@@ -169,6 +172,33 @@ class ReviewStore:
     def state(self) -> ReviewState:
         """Return the immutable latest state successfully committed to disk."""
         return self._state
+
+    @property
+    def manifest(self) -> ReviewManifest:
+        """Return the exact active manifest validated against persisted state."""
+        return self._manifest
+
+    @property
+    def review_dir(self) -> Path:
+        """Return the resolved directory owned by this review lifecycle."""
+        return self._review_dir.resolve()
+
+    def validate_current_bindings(
+        self, manifest: ReviewManifest | None = None
+    ) -> ReviewState:
+        """Revalidate manifest, reviewer, repository, and active-state bindings."""
+        if manifest is None:
+            manifest = self._initial_manifest
+        if manifest != self._initial_manifest:
+            raise ValueError("initial review manifest does not match review store")
+        state = ReviewState.from_dict(self._state.to_dict(), manifest)
+        if state.reviewer != self._reviewer:
+            raise ValueError("reviewer does not match persisted review state")
+        if state.repository_identity != _repository_identity():
+            raise ValueError("repository identity changed since review creation")
+        if state.active_manifest(manifest) != self._manifest:
+            raise ValueError("active review manifest does not match persisted state")
+        return state
 
     @classmethod
     def create(
@@ -200,16 +230,21 @@ class ReviewStore:
             1,
             1,
             manifest.manifest_identity,
+            manifest.manifest_identity,
             reviewer,
             _repository_identity(),
             created_at,
             {},
             histories,
             (),
+            (),
+            (),
         )
         _atomic_pretty_json(review_dir / _MANIFEST_NAME, manifest.to_dict())
         _atomic_pretty_json(current, state.to_dict())
-        return cls(review_dir, manifest, reviewer, now, state)
+        store = cls(review_dir, manifest, reviewer, now, state)
+        store._write_operational_exports()
+        return store
 
     @classmethod
     def open(
@@ -257,7 +292,9 @@ class ReviewStore:
                 ),
             )
             _atomic_pretty_json(current_path, state.to_dict())
-        return cls(review_dir, manifest, reviewer, now, state)
+        store = cls(review_dir, manifest, reviewer, now, state)
+        store._write_operational_exports()
+        return store
 
     def assess(
         self,
@@ -306,12 +343,23 @@ class ReviewStore:
         )
         if case_token is None:
             raise ValueError("adjudication case is absent from immutable manifest")
-        if not any(
+        case_history = self._state.case_histories[case_token]
+        latest_revision = case_history.revisions[-1]
+        technical = not latest_revision.overlays and not latest_revision.automated_valid
+        if technical:
+            if decision != "exclude":
+                raise ValueError("hard-invalid technical case must be excluded")
+            if reasons != ("invalid-affine-reflection",):
+                raise ValueError(
+                    "hard-invalid technical exclusion requires invalid-affine-reflection"
+                )
+        elif not any(
             self._manifest.presentation_cases[opaque_id] == case_key
-            for opaque_id in self._state.assessment_history
+            and history[-1].revision_id == latest_revision.revision_id
+            for opaque_id, history in self._state.assessment_history.items()
+            if history
         ):
             raise ValueError("adjudication requires a visual assessment")
-        case_history = self._state.case_histories[case_token]
         adjudication = Adjudication(
             uuid.uuid4().hex,
             case_key,
@@ -331,15 +379,110 @@ class ReviewStore:
         self._persist(state)
         return state
 
+    def attach_revisions(
+        self,
+        revisions: tuple[CaseRevision, ...],
+        presentations: tuple[Presentation, ...],
+    ) -> ReviewState:
+        """Atomically append validated remediation revisions and presentations."""
+        if not revisions or len(revisions) != len(presentations):
+            raise ValueError("revision attachment must contain paired revisions")
+        ordered = tuple(
+            sorted(
+                zip(revisions, presentations),
+                key=lambda pair: pair[0].case_token,
+            )
+        )
+        revisions = tuple(pair[0] for pair in ordered)
+        presentations = tuple(pair[1] for pair in ordered)
+        if len({item.case_token for item in revisions}) != len(revisions):
+            raise ValueError("revision attachment contains duplicate cases")
+        pairs = dict(zip((item.case_token for item in revisions), presentations))
+        histories = dict(self._state.case_histories)
+        for revision in revisions:
+            history = histories.get(revision.case_token)
+            presentation = pairs[revision.case_token]
+            if history is None or revision.case_key != history.case_key:
+                raise ValueError("revision case identity changed")
+            if revision.revision_id in {item.revision_id for item in history.revisions}:
+                raise ValueError("revision evidence identity is not new")
+            if (
+                presentation.case_token != revision.case_token
+                or presentation.revision_id != revision.revision_id
+                or presentation.overlays != revision.overlays
+                or presentation.repeat_of is not None
+            ):
+                raise ValueError("revision presentation does not match evidence")
+            pending = any(
+                assessment_history[-1].status == "needs-registration-improvement"
+                and assessment_history[-1].revision_id
+                == history.revisions[-1].revision_id
+                for opaque_id, assessment_history in self._state.assessment_history.items()
+                if assessment_history
+                and self._manifest.presentation_cases[opaque_id] == history.case_key
+            )
+            if not pending:
+                raise ValueError(
+                    "revision case is not awaiting registration improvement"
+                )
+            histories[revision.case_token] = replace(
+                history, revisions=history.revisions + (revision,)
+            )
+        attached_presentations = self._state.attached_presentations + presentations
+        cases = dict(self._initial_manifest.presentation_cases)
+        cases.update(
+            {
+                presentation.opaque_id: histories[presentation.case_token].case_key
+                for presentation in attached_presentations
+            }
+        )
+        appended_revisions = tuple(
+            revision
+            for token in sorted(histories)
+            for revision in histories[token].revisions[1:]
+        )
+        active = ReviewManifest(
+            self._initial_manifest.seed,
+            self._initial_manifest.case_revisions + appended_revisions,
+            self._initial_manifest.visual_presentations + attached_presentations,
+            cases,
+        )
+        state = replace(
+            self._state,
+            manifest_identity=active.manifest_identity,
+            case_histories=histories,
+            attached_presentations=attached_presentations,
+        )
+        ReviewState.from_dict(state.to_dict(), self._initial_manifest)
+        self._persist(state)
+        return state
+
+    def record_export(self, sha256: str) -> ReviewState:
+        """Append one validated final-export identity and persist it durably."""
+        record = ExportRecord(sha256, _utc_now(self._now))
+        state = replace(
+            self._state, export_history=self._state.export_history + (record,)
+        )
+        self._persist(state)
+        return state
+
     def _persist(self, state: ReviewState) -> None:
         """Write the backup before promotion and update memory only after success."""
         current_path = self._review_dir / _CURRENT_NAME
         if current_path.exists():
             current_payload = _read_payload(current_path)
-            ReviewState.from_dict(current_payload, self._manifest)
+            ReviewState.from_dict(current_payload, self._initial_manifest)
             _atomic_pretty_json(self._review_dir / _PREVIOUS_NAME, current_payload)
         _atomic_pretty_json(current_path, state.to_dict())
         self._state = state
+        self._manifest = state.active_manifest(self._initial_manifest)
+        self._write_operational_exports()
+
+    def _write_operational_exports(self) -> None:
+        """Synchronize deterministic derived queues after a committed state change."""
+        from cyclic_stability.review_exports import write_operational_exports
+
+        write_operational_exports(self._state, self._initial_manifest, self._review_dir)
 
     def _presentations(self) -> dict[str, Presentation]:
         """Return the immutable opaque presentation lookup without biological keys."""

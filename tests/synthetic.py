@@ -5,12 +5,16 @@ from __future__ import annotations
 import csv
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
 from cyclic_stability.images import BackgroundSummary
 from cyclic_stability.lysosome import DetectionSet, LysosomeObject
 from cyclic_stability.models import CellSpec, NuclearConfig, RoundSpec
+from cyclic_stability.review_inventory import build_review_manifest
+from cyclic_stability.review_models import CaseKey, ReviewManifest
+from cyclic_stability.review_store import ReviewStore
 from cyclic_stability.task import CellTask, TaskOutput
 from cyclic_stability.units import theoretical_resolution
 from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
@@ -161,6 +165,60 @@ def write_review_qc_fixture(root: Path) -> Path:
                             )
     _write_review_tables(qc, rows)
     return root
+
+
+def fixed_clock() -> datetime:
+    """Return the deterministic UTC time used by reviewer fixtures."""
+    return datetime(2026, 8, 17, 12, 0, 0, tzinfo=UTC)
+
+
+def rewrite_review_case_pixels(qc_root: Path, case_key: CaseKey) -> None:
+    """Rewrite all allowlisted overlays for one case with distinct RGB pixels."""
+    import tifffile
+
+    overlay_dir = (
+        qc_root / "cells" / case_key.cohort / case_key.cell_id / "qc" / "overlays"
+    )
+    paths = sorted(overlay_dir.glob(f"{case_key.acquisition_round:02d}-*.tif"))
+    assert len(paths) == 18
+    for index, path in enumerate(paths, start=1):
+        image = (np.arange(8 * 12 * 3, dtype=np.uint16).reshape(8, 12, 3) + index) % 256
+        tifffile.imwrite(path, image.astype(np.uint8), photometric="rgb")
+
+
+def fresh_review_store(
+    tmp_path: Path, *, seed: int = 7
+) -> tuple[ReviewStore, ReviewManifest]:
+    """Return a new deterministic target-blind review store and manifest."""
+    manifest = build_review_manifest(
+        write_review_qc_fixture(tmp_path / "qc"), seed=seed
+    )
+    store = ReviewStore.create(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
+    return store, manifest
+
+
+def completed_review_store(
+    tmp_path: Path,
+) -> tuple[ReviewStore, ReviewManifest]:
+    """Return a fully assessed store ready for strict finalization."""
+    store, manifest = fresh_review_store(tmp_path)
+    for presentation in manifest.visual_presentations:
+        store.assess(
+            presentation.opaque_id,
+            "accept",
+            ("dapi-aligned", "tubulin-aligned"),
+            "clear",
+        )
+    technical = next(item for item in manifest.case_revisions if not item.overlays)
+    store.adjudicate(
+        technical.case_key,
+        "exclude",
+        ("invalid-affine-reflection",),
+        "hard-invalid affine",
+    )
+    return store, manifest
 
 
 def _fake_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:

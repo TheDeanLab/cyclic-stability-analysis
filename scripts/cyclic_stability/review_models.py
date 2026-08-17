@@ -411,6 +411,44 @@ class ReviewManifest:
             raise ValueError("presentation opaque IDs must be unique")
         if set(identifiers) != set(self.presentation_cases):
             raise ValueError("presentation mapping must exactly match presentations")
+        revisions: dict[tuple[str, str], CaseRevision] = {}
+        token_cases: dict[str, CaseKey] = {}
+        for revision in self.case_revisions:
+            revision_key = (revision.case_token, revision.revision_id)
+            if revision_key in revisions:
+                raise ValueError("manifest revision IDs must be unique per case")
+            if (
+                revision.case_token in token_cases
+                and token_cases[revision.case_token] != revision.case_key
+            ):
+                raise ValueError(
+                    "manifest case token maps to multiple biological cases"
+                )
+            revisions[revision_key] = revision
+            token_cases[revision.case_token] = revision.case_key
+        presentations = {
+            presentation.opaque_id: presentation
+            for presentation in self.visual_presentations
+        }
+        for presentation in self.visual_presentations:
+            revision = revisions.get(
+                (presentation.case_token, presentation.revision_id)
+            )
+            if revision is None or presentation.overlays != revision.overlays:
+                raise ValueError("presentation revision is absent from manifest")
+            if self.presentation_cases[presentation.opaque_id] != revision.case_key:
+                raise ValueError("presentation mapping does not match its revision")
+            if presentation.repeat_of is not None:
+                base = presentations.get(presentation.repeat_of)
+                if (
+                    base is None
+                    or base.repeat_of is not None
+                    or base.case_token != presentation.case_token
+                    or base.revision_id != presentation.revision_id
+                ):
+                    raise ValueError(
+                        "concealed repeat does not match a base presentation"
+                    )
         object.__setattr__(
             self, "presentation_cases", MappingProxyType(dict(self.presentation_cases))
         )
@@ -743,23 +781,55 @@ class RecoveryEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ExportRecord:
+    """One final CSV identity recorded only after successful reopen validation."""
+
+    sha256: str
+    exported_at: datetime
+
+    def __post_init__(self) -> None:
+        _sha256(self.sha256, "export sha256")
+        _utc_timestamp(self.exported_at, "export timestamp")
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a strict JSON-compatible representation."""
+        return {
+            "sha256": self.sha256,
+            "exported_at": self.exported_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> ExportRecord:
+        """Parse one strictly validated JSON-compatible representation."""
+        data = _mapping(payload, frozenset({"sha256", "exported_at"}), "export record")
+        return cls(
+            _sha256(data["sha256"], "export sha256"),
+            _timestamp_from_dict(data["exported_at"], "export timestamp"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewState:
-    """Strict, append-preserving persisted state for one immutable manifest."""
+    """Strict append-preserving state with one validated active manifest."""
 
     schema_version: int
     format_version: int
+    initial_manifest_identity: str
     manifest_identity: str
     reviewer: str
     repository_identity: RepositoryIdentity
     created_at: datetime
     assessment_history: Mapping[str, tuple[Assessment, ...]]
     case_histories: Mapping[str, CaseHistory]
+    attached_presentations: tuple[Presentation, ...]
     recovery_events: tuple[RecoveryEvent, ...]
+    export_history: tuple[ExportRecord, ...]
 
     def __post_init__(self) -> None:
         if self.schema_version != 1 or self.format_version != 1:
             raise ValueError("review state schema or format version is unsupported")
-        _sha256(self.manifest_identity, "manifest identity")
+        _sha256(self.initial_manifest_identity, "initial manifest identity")
+        _sha256(self.manifest_identity, "active manifest identity")
         _string(self.reviewer, "reviewer")
         _utc_timestamp(self.created_at, "review state creation timestamp")
         if not isinstance(self.repository_identity, RepositoryIdentity):
@@ -797,6 +867,18 @@ class ReviewState:
             raise ValueError("review state has duplicate event IDs")
         if any(not isinstance(event, RecoveryEvent) for event in self.recovery_events):
             raise ValueError("recovery events have an invalid schema")
+        if any(
+            not isinstance(presentation, Presentation)
+            for presentation in self.attached_presentations
+        ):
+            raise ValueError("attached presentations have an invalid schema")
+        attached_ids = tuple(
+            presentation.opaque_id for presentation in self.attached_presentations
+        )
+        if len(attached_ids) != len(set(attached_ids)):
+            raise ValueError("attached presentation opaque IDs must be unique")
+        if any(not isinstance(record, ExportRecord) for record in self.export_history):
+            raise ValueError("export history has an invalid schema")
         object.__setattr__(self, "assessment_history", MappingProxyType(assessments))
         object.__setattr__(self, "case_histories", MappingProxyType(histories))
 
@@ -805,6 +887,7 @@ class ReviewState:
         return {
             "schema_version": self.schema_version,
             "format_version": self.format_version,
+            "initial_manifest_identity": self.initial_manifest_identity,
             "manifest_identity": self.manifest_identity,
             "reviewer": self.reviewer,
             "repository_identity": self.repository_identity.to_dict(),
@@ -817,7 +900,11 @@ class ReviewState:
                 case_token: history.to_dict()
                 for case_token, history in sorted(self.case_histories.items())
             },
+            "attached_presentations": [
+                item.to_dict() for item in self.attached_presentations
+            ],
             "recovery_events": [item.to_dict() for item in self.recovery_events],
+            "export_history": [item.to_dict() for item in self.export_history],
         }
 
     @classmethod
@@ -829,13 +916,16 @@ class ReviewState:
                 {
                     "schema_version",
                     "format_version",
+                    "initial_manifest_identity",
                     "manifest_identity",
                     "reviewer",
                     "repository_identity",
                     "created_at",
                     "assessment_history",
                     "case_histories",
+                    "attached_presentations",
                     "recovery_events",
+                    "export_history",
                 }
             ),
             "review state",
@@ -851,7 +941,9 @@ class ReviewState:
         if (
             not isinstance(data["assessment_history"], Mapping)
             or not isinstance(data["case_histories"], Mapping)
+            or not isinstance(data["attached_presentations"], list)
             or not isinstance(data["recovery_events"], list)
+            or not isinstance(data["export_history"], list)
         ):
             raise TypeError("review state collections have invalid types")
         assessment_history: dict[str, tuple[Assessment, ...]] = {}
@@ -864,7 +956,8 @@ class ReviewState:
         state = cls(
             data["schema_version"],
             data["format_version"],
-            _sha256(data["manifest_identity"], "manifest identity"),
+            _sha256(data["initial_manifest_identity"], "initial manifest identity"),
+            _sha256(data["manifest_identity"], "active manifest identity"),
             _string(data["reviewer"], "reviewer"),
             RepositoryIdentity.from_dict(data["repository_identity"]),
             _timestamp_from_dict(data["created_at"], "review state creation timestamp"),
@@ -875,17 +968,87 @@ class ReviewState:
                 )
                 for case_token, history in data["case_histories"].items()
             },
+            tuple(
+                Presentation.from_dict(item) for item in data["attached_presentations"]
+            ),
             tuple(RecoveryEvent.from_dict(item) for item in data["recovery_events"]),
+            tuple(ExportRecord.from_dict(item) for item in data["export_history"]),
         )
         state._validate_manifest(manifest)
         return state
 
-    def _validate_manifest(self, manifest: ReviewManifest) -> None:
-        if self.manifest_identity != manifest.manifest_identity:
+    def active_manifest(self, manifest: ReviewManifest) -> ReviewManifest:
+        """Reconstruct the exact active manifest from initial and appended state."""
+        if self.initial_manifest_identity != manifest.manifest_identity:
             raise ReviewStateBindingError("reviewed evidence identity changed")
+        initial_revisions = {item.case_token: item for item in manifest.case_revisions}
+        if set(self.case_histories) != set(initial_revisions):
+            raise ReviewStateBindingError(
+                "case histories contain biological keys absent from immutable manifest"
+            )
+        appended_revisions: list[CaseRevision] = []
+        for token in sorted(self.case_histories):
+            history = self.case_histories[token]
+            initial = initial_revisions[token]
+            if history.case_key != initial.case_key or history.revisions[0] != initial:
+                raise ReviewStateBindingError(
+                    "case history does not match immutable manifest"
+                )
+            appended_revisions.extend(history.revisions[1:])
+        appended_by_key = {
+            (item.case_token, item.revision_id): item for item in appended_revisions
+        }
+        if len(appended_by_key) != len(appended_revisions):
+            raise ReviewStateBindingError(
+                "case history revisions do not match active manifest"
+            )
+        attached_by_key = {
+            (item.case_token, item.revision_id): item
+            for item in self.attached_presentations
+        }
+        if len(attached_by_key) != len(self.attached_presentations):
+            raise ReviewStateBindingError(
+                "attached presentations do not match active manifest"
+            )
+        if set(attached_by_key) != set(appended_by_key):
+            raise ReviewStateBindingError(
+                "case history revisions do not match active manifest"
+            )
+        for key, presentation in attached_by_key.items():
+            revision = appended_by_key[key]
+            if presentation.overlays != revision.overlays or presentation.repeat_of:
+                raise ReviewStateBindingError(
+                    "attached presentations do not match active manifest"
+                )
+        cases = dict(manifest.presentation_cases)
+        cases.update(
+            {
+                presentation.opaque_id: self.case_histories[
+                    presentation.case_token
+                ].case_key
+                for presentation in self.attached_presentations
+            }
+        )
+        try:
+            active = ReviewManifest(
+                manifest.seed,
+                manifest.case_revisions + tuple(appended_revisions),
+                manifest.visual_presentations + self.attached_presentations,
+                cases,
+            )
+        except (TypeError, ValueError) as error:
+            raise ReviewStateBindingError(
+                "attached revisions do not match active manifest"
+            ) from error
+        if self.manifest_identity != active.manifest_identity:
+            raise ReviewStateBindingError("reviewed evidence identity changed")
+        return active
+
+    def _validate_manifest(self, manifest: ReviewManifest) -> None:
+        active = self.active_manifest(manifest)
         presentations = {
             presentation.opaque_id: presentation
-            for presentation in manifest.visual_presentations
+            for presentation in active.visual_presentations
         }
         if not set(self.assessment_history) <= set(presentations):
             raise ReviewStateBindingError(
@@ -904,21 +1067,7 @@ class ReviewState:
                 raise ReviewStateBindingError(
                     "assessment reviewer does not match persisted review state"
                 )
-        revisions = {item.case_token: item for item in manifest.case_revisions}
-        if set(self.case_histories) != set(revisions):
-            raise ReviewStateBindingError(
-                "case histories contain biological keys absent from immutable manifest"
-            )
-        for token, history in self.case_histories.items():
-            revision = revisions[token]
-            if history.case_key != revision.case_key:
-                raise ReviewStateBindingError(
-                    "case history does not match immutable manifest"
-                )
-            if history.revisions != (revision,):
-                raise ReviewStateBindingError(
-                    "case history initial revisions do not match immutable manifest"
-                )
+        for history in self.case_histories.values():
             if any(
                 adjudication.reviewer != self.reviewer
                 for adjudication in history.adjudications

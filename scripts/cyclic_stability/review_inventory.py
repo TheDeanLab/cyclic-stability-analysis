@@ -154,10 +154,24 @@ def _case_token(seed: int, case_key: CaseKey) -> str:
 
 
 def _revision_id(
-    case_key: CaseKey, overlays: tuple[OverlayEvidence, ...], automated_reason: str
+    case_key: CaseKey,
+    overlays: tuple[OverlayEvidence, ...],
+    automated_valid: bool,
+    automated_reason: str,
+    deformation_flags: tuple[tuple[str, str], ...],
 ) -> str:
-    evidence = ",".join(item.identity.sha256 for item in overlays)
-    return f"REV-{_digest(repr(case_key.to_dict()), evidence, automated_reason)[:20]}"
+    overlay_evidence = ",".join(
+        f"{item.channel}:{item.stage}:{item.view}:{item.identity.sha256}"
+        for item in overlays
+    )
+    technical_evidence = repr(
+        {
+            "automated_valid": automated_valid,
+            "automated_reason": automated_reason,
+            "deformation_flags": deformation_flags,
+        }
+    )
+    return f"REV-{_digest(repr(case_key.to_dict()), overlay_evidence, technical_evidence)[:20]}"
 
 
 def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
@@ -231,14 +245,14 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
                 raise ValueError(
                     "technical case must be invalid in both source tables and have no visual evidence"
                 )
+        reason = decision["automated_reason"] or registration["invalid_reason"]
         flags = tuple(
             sorted((row["region"], row["warp_flags"]) for row in deformation_rows)
         )
-        reason = decision["automated_reason"] or registration["invalid_reason"]
         revisions[case_key] = CaseRevision(
             case_key,
             _case_token(0, case_key),
-            _revision_id(case_key, overlays, reason),
+            _revision_id(case_key, overlays, automated_valid, reason, flags),
             overlays,
             automated_valid,
             reason,

@@ -240,7 +240,7 @@ def test_repository_identity_tracks_untracked_symlink_payloads(
 
 
 def test_state_model_rejects_extra_unmanifested_case_revision(tmp_path: Path) -> None:
-    """Task 2 state permits exactly the immutable manifest's initial revisions."""
+    """Extra revisions require an exactly matching persisted active manifest."""
     manifest = build_review_manifest(write_review_qc_fixture(tmp_path / "qc"), seed=7)
     store = ReviewStore.create(
         tmp_path / "review", manifest, "Reviewer", now=fixed_clock
@@ -251,7 +251,7 @@ def test_state_model_rejects_extra_unmanifested_case_revision(tmp_path: Path) ->
     forged["revision_id"] = "REV-forged"
     history["revisions"].append(forged)
 
-    with pytest.raises(ValueError, match="initial revisions"):
+    with pytest.raises(ValueError, match="active manifest"):
         ReviewState.from_dict(payload, manifest)
 
 
