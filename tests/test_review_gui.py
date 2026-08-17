@@ -592,6 +592,43 @@ def test_validate_only_creates_and_resumes_without_tk(
     )
 
 
+def test_hpc_launcher_selects_dynamic_tk_python(tmp_path: Path) -> None:
+    """The GUI launcher avoids uv's static-Tk standalone interpreter."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\"\n",
+        encoding="utf-8",
+    )
+    fake_uv.chmod(0o755)
+    launcher = Path(__file__).resolve().parents[1] / "launch_review.sh"
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:/usr/bin:/bin"
+    environment["USER"] = "Reviewer"
+
+    result = subprocess.run(
+        ("bash", str(launcher)),
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    arguments = result.stdout.splitlines()
+    expected_python = (
+        "/project/bioinformatics/Danuser_lab/Dean/dean/conda-envs/"
+        "cyclic-review-gui-py312/bin/python3.12"
+    )
+    assert arguments[:4] == [
+        "run",
+        "--python",
+        expected_python,
+        "--script",
+    ]
+
+
 def test_cli_owns_create_resume_and_revision_argument_lifecycle(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
