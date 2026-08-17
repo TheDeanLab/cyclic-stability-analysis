@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, cast
 
 _COHORTS = frozenset({"golgi", "lamin"})
 _ROUNDS = frozenset({1, 3, 4, 5})
@@ -21,6 +22,37 @@ _OVERLAY_PRODUCT = frozenset(
     for view in _VIEWS
 )
 
+AssessmentStatus = Literal[
+    "accept",
+    "needs-registration-improvement",
+    "exclude",
+    "needs-adjudication",
+]
+FINAL_STATUSES = frozenset({"accept", "exclude"})
+_ASSESSMENT_STATUSES = frozenset(
+    {
+        "accept",
+        "needs-registration-improvement",
+        "exclude",
+        "needs-adjudication",
+    }
+)
+REASON_TOKENS = frozenset(
+    {
+        "dapi-aligned",
+        "tubulin-aligned",
+        "no-interior-artifact",
+        "persistent-interior-misalignment",
+        "nonlinear-worse-than-affine",
+        "seam-artifact",
+        "tearing-or-duplication",
+        "z-misalignment",
+        "identity-mismatch",
+        "insufficient-common-support",
+        "invalid-affine-reflection",
+    }
+)
+
 
 def _mapping(payload: object, keys: frozenset[str], name: str) -> Mapping[str, object]:
     if not isinstance(payload, Mapping) or set(payload) != keys:
@@ -31,6 +63,41 @@ def _mapping(payload: object, keys: frozenset[str], name: str) -> Mapping[str, o
 def _string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a nonempty string")
+    return value
+
+
+def _sha256(value: object, name: str) -> str:
+    value = _string(value, name)
+    if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _utc_timestamp(value: object, name: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError(f"{name} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() != UTC.utcoffset(value):
+        raise ValueError(f"{name} must be a UTC timestamp")
+    return value
+
+
+def _timestamp_from_dict(value: object, name: str) -> datetime:
+    text = _string(value, name)
+    try:
+        return _utc_timestamp(datetime.fromisoformat(text), name)
+    except ValueError as error:
+        raise ValueError(f"{name} must be an ISO-8601 UTC timestamp") from error
+
+
+def _reason_tokens(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple) or not value:
+        raise ValueError("assessment reasons must be nonempty")
+    if any(not isinstance(item, str) for item in value):
+        raise TypeError("assessment reasons must be strings")
+    if len(value) != len(set(value)):
+        raise ValueError("assessment reasons must be unique")
+    if not set(value) <= REASON_TOKENS:
+        raise ValueError("assessment reasons must be allowlisted")
     return value
 
 
@@ -393,3 +460,449 @@ class ReviewManifest:
             ),
             presentation_cases,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryIdentity:
+    """Immutable Git commit and exact dirty-tree binary-diff identity."""
+
+    commit: str
+    dirty: bool
+    diff_sha256: str | None
+
+    def __post_init__(self) -> None:
+        commit = _string(self.commit, "repository commit")
+        if len(commit) != 40 or any(
+            character not in "0123456789abcdef" for character in self.commit
+        ):
+            raise ValueError("repository commit must be a lowercase Git SHA-1")
+        if not isinstance(self.dirty, bool):
+            raise TypeError("repository dirty must be a boolean")
+        if self.dirty:
+            if self.diff_sha256 is None:
+                raise ValueError("dirty repository identity requires a diff_sha256")
+            _sha256(self.diff_sha256, "repository diff_sha256")
+        elif self.diff_sha256 is not None:
+            raise ValueError("clean repository identity cannot contain a diff_sha256")
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a strict JSON-compatible representation."""
+        return {
+            "commit": self.commit,
+            "dirty": self.dirty,
+            "diff_sha256": self.diff_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> RepositoryIdentity:
+        """Parse one strictly validated JSON-compatible representation."""
+        data = _mapping(
+            payload,
+            frozenset({"commit", "dirty", "diff_sha256"}),
+            "repository identity",
+        )
+        if not isinstance(data["dirty"], bool):
+            raise TypeError("repository dirty must be a boolean")
+        if data["diff_sha256"] is not None and not isinstance(data["diff_sha256"], str):
+            raise TypeError("repository diff_sha256 must be a string or null")
+        return cls(
+            _string(data["commit"], "repository commit"),
+            data["dirty"],
+            data["diff_sha256"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Assessment:
+    """One immutable, blinded visual assessment of a presentation revision."""
+
+    event_id: str
+    opaque_id: str
+    revision_id: str
+    status: AssessmentStatus
+    reasons: tuple[str, ...]
+    notes: str
+    reviewer: str
+    assessed_at: datetime
+
+    def __post_init__(self) -> None:
+        _string(self.event_id, "assessment event_id")
+        _string(self.opaque_id, "assessment opaque_id")
+        _string(self.revision_id, "assessment revision_id")
+        if self.status not in _ASSESSMENT_STATUSES:
+            raise ValueError("assessment status is not allowlisted")
+        _reason_tokens(self.reasons)
+        if not isinstance(self.notes, str):
+            raise TypeError("assessment notes must be a string")
+        _string(self.reviewer, "assessment reviewer")
+        _utc_timestamp(self.assessed_at, "assessment timestamp")
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a strict JSON-compatible representation."""
+        return {
+            "event_id": self.event_id,
+            "opaque_id": self.opaque_id,
+            "revision_id": self.revision_id,
+            "status": self.status,
+            "reasons": list(self.reasons),
+            "notes": self.notes,
+            "reviewer": self.reviewer,
+            "assessed_at": self.assessed_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> Assessment:
+        """Parse one strictly validated JSON-compatible representation."""
+        data = _mapping(
+            payload,
+            frozenset(
+                {
+                    "event_id",
+                    "opaque_id",
+                    "revision_id",
+                    "status",
+                    "reasons",
+                    "notes",
+                    "reviewer",
+                    "assessed_at",
+                }
+            ),
+            "assessment",
+        )
+        if not isinstance(data["reasons"], list):
+            raise TypeError("assessment reasons must be a list")
+        return cls(
+            _string(data["event_id"], "assessment event_id"),
+            _string(data["opaque_id"], "assessment opaque_id"),
+            _string(data["revision_id"], "assessment revision_id"),
+            cast(AssessmentStatus, _string(data["status"], "assessment status")),
+            tuple(data["reasons"]),
+            data["notes"] if isinstance(data["notes"], str) else _invalid_string(),
+            _string(data["reviewer"], "assessment reviewer"),
+            _timestamp_from_dict(data["assessed_at"], "assessment timestamp"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Adjudication:
+    """One immutable reconciliation decision for a biological case history."""
+
+    event_id: str
+    case_key: CaseKey
+    revision_id: str
+    status: Literal["accept", "exclude"]
+    reasons: tuple[str, ...]
+    notes: str
+    reviewer: str
+    adjudicated_at: datetime
+
+    def __post_init__(self) -> None:
+        _string(self.event_id, "adjudication event_id")
+        _string(self.revision_id, "adjudication revision_id")
+        if self.status not in FINAL_STATUSES:
+            raise ValueError("adjudication status must be accept or exclude")
+        _reason_tokens(self.reasons)
+        if not isinstance(self.notes, str):
+            raise TypeError("adjudication notes must be a string")
+        _string(self.reviewer, "adjudication reviewer")
+        _utc_timestamp(self.adjudicated_at, "adjudication timestamp")
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a strict JSON-compatible representation."""
+        return {
+            "event_id": self.event_id,
+            "case_key": self.case_key.to_dict(),
+            "revision_id": self.revision_id,
+            "status": self.status,
+            "reasons": list(self.reasons),
+            "notes": self.notes,
+            "reviewer": self.reviewer,
+            "adjudicated_at": self.adjudicated_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> Adjudication:
+        """Parse one strictly validated JSON-compatible representation."""
+        data = _mapping(
+            payload,
+            frozenset(
+                {
+                    "event_id",
+                    "case_key",
+                    "revision_id",
+                    "status",
+                    "reasons",
+                    "notes",
+                    "reviewer",
+                    "adjudicated_at",
+                }
+            ),
+            "adjudication",
+        )
+        if not isinstance(data["reasons"], list):
+            raise TypeError("adjudication reasons must be a list")
+        return cls(
+            _string(data["event_id"], "adjudication event_id"),
+            CaseKey.from_dict(data["case_key"]),
+            _string(data["revision_id"], "adjudication revision_id"),
+            cast(
+                Literal["accept", "exclude"],
+                _string(data["status"], "adjudication status"),
+            ),
+            tuple(data["reasons"]),
+            data["notes"] if isinstance(data["notes"], str) else _invalid_string(),
+            _string(data["reviewer"], "adjudication reviewer"),
+            _timestamp_from_dict(data["adjudicated_at"], "adjudication timestamp"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CaseHistory:
+    """Immutable revisions and reconciliation events for one biological case."""
+
+    case_key: CaseKey
+    case_token: str
+    revisions: tuple[CaseRevision, ...]
+    adjudications: tuple[Adjudication, ...]
+
+    def __post_init__(self) -> None:
+        _string(self.case_token, "case history case_token")
+        if not self.revisions:
+            raise ValueError("case history must contain at least one revision")
+        if any(
+            revision.case_key != self.case_key or revision.case_token != self.case_token
+            for revision in self.revisions
+        ):
+            raise ValueError("case history revisions must match its biological key")
+        if any(item.case_key != self.case_key for item in self.adjudications):
+            raise ValueError("case history adjudications must match its biological key")
+        revision_ids = tuple(item.revision_id for item in self.revisions)
+        if len(revision_ids) != len(set(revision_ids)):
+            raise ValueError("case history revision IDs must be unique")
+        if any(item.revision_id not in revision_ids for item in self.adjudications):
+            raise ValueError("adjudication revision is absent from case history")
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a strict JSON-compatible representation."""
+        return {
+            "case_key": self.case_key.to_dict(),
+            "case_token": self.case_token,
+            "revisions": [item.to_dict() for item in self.revisions],
+            "adjudications": [item.to_dict() for item in self.adjudications],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> CaseHistory:
+        """Parse one strictly validated JSON-compatible representation."""
+        data = _mapping(
+            payload,
+            frozenset({"case_key", "case_token", "revisions", "adjudications"}),
+            "case history",
+        )
+        if not isinstance(data["revisions"], list) or not isinstance(
+            data["adjudications"], list
+        ):
+            raise TypeError("case history collections must be lists")
+        return cls(
+            CaseKey.from_dict(data["case_key"]),
+            _string(data["case_token"], "case history case_token"),
+            tuple(CaseRevision.from_dict(item) for item in data["revisions"]),
+            tuple(Adjudication.from_dict(item) for item in data["adjudications"]),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryEvent:
+    """One timestamped recovery of the last valid review-state snapshot."""
+
+    recovered_at: datetime
+    message: str
+
+    def __post_init__(self) -> None:
+        _utc_timestamp(self.recovered_at, "recovery timestamp")
+        _string(self.message, "recovery message")
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a strict JSON-compatible representation."""
+        return {"recovered_at": self.recovered_at.isoformat(), "message": self.message}
+
+    @classmethod
+    def from_dict(cls, payload: object) -> RecoveryEvent:
+        """Parse one strictly validated JSON-compatible representation."""
+        data = _mapping(
+            payload, frozenset({"recovered_at", "message"}), "recovery event"
+        )
+        return cls(
+            _timestamp_from_dict(data["recovered_at"], "recovery timestamp"),
+            _string(data["message"], "recovery message"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewState:
+    """Strict, append-preserving persisted state for one immutable manifest."""
+
+    schema_version: int
+    format_version: int
+    manifest_identity: str
+    reviewer: str
+    repository_identity: RepositoryIdentity
+    created_at: datetime
+    assessment_history: Mapping[str, tuple[Assessment, ...]]
+    case_histories: Mapping[str, CaseHistory]
+    recovery_events: tuple[RecoveryEvent, ...]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1 or self.format_version != 1:
+            raise ValueError("review state schema or format version is unsupported")
+        _sha256(self.manifest_identity, "manifest identity")
+        _string(self.reviewer, "reviewer")
+        _utc_timestamp(self.created_at, "review state creation timestamp")
+        if not isinstance(self.repository_identity, RepositoryIdentity):
+            raise TypeError(
+                "review state repository_identity must be a RepositoryIdentity"
+            )
+        histories = dict(self.case_histories)
+        if any(
+            not isinstance(case_token, str)
+            or not isinstance(history, CaseHistory)
+            or case_token != history.case_token
+            for case_token, history in histories.items()
+        ):
+            raise ValueError("case histories have an invalid schema")
+        assessments = {
+            opaque_id: tuple(history)
+            for opaque_id, history in self.assessment_history.items()
+        }
+        event_ids = [
+            assessment.event_id
+            for opaque_id, history in assessments.items()
+            for assessment in history
+            if isinstance(opaque_id, str)
+            and assessment.opaque_id == opaque_id
+            and isinstance(assessment, Assessment)
+        ]
+        if len(event_ids) != sum(len(history) for history in assessments.values()):
+            raise ValueError("assessment history has an invalid schema")
+        event_ids.extend(
+            adjudication.event_id
+            for history in histories.values()
+            for adjudication in history.adjudications
+        )
+        if len(event_ids) != len(set(event_ids)):
+            raise ValueError("review state has duplicate event IDs")
+        if any(not isinstance(event, RecoveryEvent) for event in self.recovery_events):
+            raise ValueError("recovery events have an invalid schema")
+        object.__setattr__(self, "assessment_history", MappingProxyType(assessments))
+        object.__setattr__(self, "case_histories", MappingProxyType(histories))
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a strict JSON-compatible representation."""
+        return {
+            "schema_version": self.schema_version,
+            "format_version": self.format_version,
+            "manifest_identity": self.manifest_identity,
+            "reviewer": self.reviewer,
+            "repository_identity": self.repository_identity.to_dict(),
+            "created_at": self.created_at.isoformat(),
+            "assessment_history": {
+                opaque_id: [item.to_dict() for item in history]
+                for opaque_id, history in sorted(self.assessment_history.items())
+            },
+            "case_histories": {
+                case_token: history.to_dict()
+                for case_token, history in sorted(self.case_histories.items())
+            },
+            "recovery_events": [item.to_dict() for item in self.recovery_events],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object, manifest: ReviewManifest) -> ReviewState:
+        """Parse state strictly and verify it against an immutable manifest."""
+        data = _mapping(
+            payload,
+            frozenset(
+                {
+                    "schema_version",
+                    "format_version",
+                    "manifest_identity",
+                    "reviewer",
+                    "repository_identity",
+                    "created_at",
+                    "assessment_history",
+                    "case_histories",
+                    "recovery_events",
+                }
+            ),
+            "review state",
+        )
+        if not isinstance(data["schema_version"], int) or isinstance(
+            data["schema_version"], bool
+        ):
+            raise TypeError("review state schema_version must be an integer")
+        if not isinstance(data["format_version"], int) or isinstance(
+            data["format_version"], bool
+        ):
+            raise TypeError("review state format_version must be an integer")
+        if (
+            not isinstance(data["assessment_history"], Mapping)
+            or not isinstance(data["case_histories"], Mapping)
+            or not isinstance(data["recovery_events"], list)
+        ):
+            raise TypeError("review state collections have invalid types")
+        assessment_history: dict[str, tuple[Assessment, ...]] = {}
+        for opaque_id, history in data["assessment_history"].items():
+            if not isinstance(history, list):
+                raise TypeError("assessment history entries must be lists")
+            assessment_history[_string(opaque_id, "assessment opaque_id")] = tuple(
+                Assessment.from_dict(item) for item in history
+            )
+        state = cls(
+            data["schema_version"],
+            data["format_version"],
+            _sha256(data["manifest_identity"], "manifest identity"),
+            _string(data["reviewer"], "reviewer"),
+            RepositoryIdentity.from_dict(data["repository_identity"]),
+            _timestamp_from_dict(data["created_at"], "review state creation timestamp"),
+            assessment_history,
+            {
+                _string(case_token, "case history case_token"): CaseHistory.from_dict(
+                    history
+                )
+                for case_token, history in data["case_histories"].items()
+            },
+            tuple(RecoveryEvent.from_dict(item) for item in data["recovery_events"]),
+        )
+        state._validate_manifest(manifest)
+        return state
+
+    def _validate_manifest(self, manifest: ReviewManifest) -> None:
+        if self.manifest_identity != manifest.manifest_identity:
+            raise ValueError("reviewed evidence identity changed")
+        presentations = {
+            presentation.opaque_id: presentation
+            for presentation in manifest.visual_presentations
+        }
+        if not set(self.assessment_history) <= set(presentations):
+            raise ValueError("assessment history contains unknown opaque IDs")
+        for opaque_id, history in self.assessment_history.items():
+            presentation = presentations[opaque_id]
+            if any(
+                assessment.revision_id != presentation.revision_id
+                for assessment in history
+            ):
+                raise ValueError(
+                    "assessment revision is absent from immutable manifest"
+                )
+        revisions = {item.case_token: item for item in manifest.case_revisions}
+        if set(self.case_histories) != set(revisions):
+            raise ValueError(
+                "case histories contain biological keys absent from immutable manifest"
+            )
+        for token, history in self.case_histories.items():
+            revision = revisions[token]
+            if (
+                history.case_key != revision.case_key
+                or history.revisions[0] != revision
+            ):
+                raise ValueError("case history does not match immutable manifest")
