@@ -632,6 +632,7 @@ class Adjudication:
     event_id: str
     case_key: CaseKey
     revision_id: str
+    assessment_event_ids: tuple[str, ...]
     status: Literal["accept", "exclude"]
     reasons: tuple[str, ...]
     notes: str
@@ -641,6 +642,14 @@ class Adjudication:
     def __post_init__(self) -> None:
         _string(self.event_id, "adjudication event_id")
         _string(self.revision_id, "adjudication revision_id")
+        if any(
+            not isinstance(item, str) or not item for item in self.assessment_event_ids
+        ):
+            raise ValueError(
+                "adjudication assessment event IDs must be nonempty strings"
+            )
+        if len(self.assessment_event_ids) != len(set(self.assessment_event_ids)):
+            raise ValueError("adjudication assessment event IDs must be unique")
         if self.status not in FINAL_STATUSES:
             raise ValueError("adjudication status must be accept or exclude")
         _reason_tokens(self.reasons)
@@ -655,6 +664,7 @@ class Adjudication:
             "event_id": self.event_id,
             "case_key": self.case_key.to_dict(),
             "revision_id": self.revision_id,
+            "assessment_event_ids": list(self.assessment_event_ids),
             "status": self.status,
             "reasons": list(self.reasons),
             "notes": self.notes,
@@ -672,6 +682,7 @@ class Adjudication:
                     "event_id",
                     "case_key",
                     "revision_id",
+                    "assessment_event_ids",
                     "status",
                     "reasons",
                     "notes",
@@ -681,12 +692,15 @@ class Adjudication:
             ),
             "adjudication",
         )
-        if not isinstance(data["reasons"], list):
-            raise TypeError("adjudication reasons must be a list")
+        if not isinstance(data["reasons"], list) or not isinstance(
+            data["assessment_event_ids"], list
+        ):
+            raise TypeError("adjudication collections must be lists")
         return cls(
             _string(data["event_id"], "adjudication event_id"),
             CaseKey.from_dict(data["case_key"]),
             _string(data["revision_id"], "adjudication revision_id"),
+            tuple(data["assessment_event_ids"]),
             cast(
                 Literal["accept", "exclude"],
                 _string(data["status"], "adjudication status"),
@@ -1067,6 +1081,11 @@ class ReviewState:
                 raise ReviewStateBindingError(
                     "assessment reviewer does not match persisted review state"
                 )
+        assessments_by_id = {
+            assessment.event_id: assessment
+            for assessment_history in self.assessment_history.values()
+            for assessment in assessment_history
+        }
         for history in self.case_histories.values():
             if any(
                 adjudication.reviewer != self.reviewer
@@ -1075,3 +1094,20 @@ class ReviewState:
                 raise ReviewStateBindingError(
                     "adjudication reviewer does not match persisted review state"
                 )
+            for adjudication in history.adjudications:
+                for event_id in adjudication.assessment_event_ids:
+                    assessment = assessments_by_id.get(event_id)
+                    presentation = (
+                        presentations.get(assessment.opaque_id)
+                        if assessment is not None
+                        else None
+                    )
+                    if (
+                        assessment is None
+                        or presentation is None
+                        or assessment.revision_id != adjudication.revision_id
+                        or presentation.case_token != history.case_token
+                    ):
+                        raise ReviewStateBindingError(
+                            "adjudication assessment snapshot does not match its case revision"
+                        )

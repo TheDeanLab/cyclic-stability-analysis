@@ -118,8 +118,12 @@ def _latest_assessment(state: ReviewState, opaque_id: str) -> Assessment | None:
     return history[-1] if history else None
 
 
-def _latest_adjudication(history: CaseHistory, revision_id: str) -> Adjudication | None:
-    return next(
+def _adjudication_state(
+    history: CaseHistory,
+    revision_id: str,
+    assessment_event_ids: tuple[str, ...],
+) -> tuple[Adjudication | None, bool]:
+    latest = next(
         (
             item
             for item in reversed(history.adjudications)
@@ -127,6 +131,11 @@ def _latest_adjudication(history: CaseHistory, revision_id: str) -> Adjudication
         ),
         None,
     )
+    if latest is None:
+        return None, False
+    if latest.assessment_event_ids != assessment_event_ids:
+        return None, True
+    return latest, False
 
 
 def _presentations_for_revision(
@@ -208,7 +217,18 @@ def _consistency_rows(
             else "disagree"
         )
         history = state.case_histories[repeat.case_token]
-        adjudication = _latest_adjudication(history, repeat.revision_id)
+        revision = next(
+            item for item in history.revisions if item.revision_id == repeat.revision_id
+        )
+        assessment_event_ids = tuple(
+            assessment.event_id
+            for presentation in _presentations_for_revision(active, revision)
+            if (assessment := _latest_assessment(state, presentation.opaque_id))
+            is not None
+        )
+        adjudication, _ = _adjudication_state(
+            history, repeat.revision_id, assessment_event_ids
+        )
         rows.append(
             {
                 "base_opaque_id": base.opaque_id,
@@ -284,6 +304,14 @@ def attach_revision_root(store: ReviewStore, revision_root: Path) -> ReviewState
     """Attach changed evidence for every currently unresolved remediation case."""
     state = store.validate_current_bindings()
     active = store.manifest
+    identity_error: ValueError | None = None
+    try:
+        _validate_current_evidence(active)
+    except ValueError as error:
+        identity_error = error
+    _validate_revision_root_namespace(active, revision_root)
+    if identity_error is not None:
+        raise identity_error
     pending = _pending_case_histories(state, active)
     if not pending:
         raise ValueError("no cases await registration improvement")
@@ -315,8 +343,38 @@ def attach_revision_root(store: ReviewStore, revision_root: Path) -> ReviewState
     return result
 
 
+def _review_evidence_roots(active: ReviewManifest) -> frozenset[Path]:
+    roots: set[Path] = set()
+    for revision in active.case_revisions:
+        for overlay in revision.overlays:
+            path = Path(overlay.identity.path)
+            try:
+                roots.add(path.parents[5])
+            except IndexError as error:
+                raise ValueError(
+                    "reviewed evidence path has an invalid namespace"
+                ) from error
+    return frozenset(roots)
+
+
+def _validate_revision_root_namespace(
+    active: ReviewManifest, revision_root: Path
+) -> None:
+    candidate = revision_root.resolve()
+    if any(
+        candidate == prior
+        or candidate.is_relative_to(prior)
+        or prior.is_relative_to(candidate)
+        for prior in _review_evidence_roots(active)
+    ):
+        raise ValueError(
+            "revision attachment requires a distinct revision root namespace"
+        )
+
+
 def _validate_current_evidence(active: ReviewManifest) -> None:
     seen: set[EvidenceIdentity] = set()
+    changed = False
     for revision in active.case_revisions:
         for overlay in revision.overlays:
             identity = overlay.identity
@@ -325,15 +383,17 @@ def _validate_current_evidence(active: ReviewManifest) -> None:
             seen.add(identity)
             path = Path(identity.path)
             if OVERLAY_NAME.fullmatch(path.name) is None:
-                raise ValueError(
-                    "reviewed evidence basename is outside target-blind allowlist"
-                )
+                changed = True
+                continue
             try:
                 current = EvidenceIdentity.from_path(path)
-            except OSError as error:
-                raise ValueError("reviewed evidence identity changed") from error
+            except OSError:
+                changed = True
+                continue
             if current != identity:
-                raise ValueError("reviewed evidence identity changed")
+                changed = True
+    if changed:
+        raise ValueError("reviewed evidence identity changed")
 
 
 def _case_outcome(
@@ -342,17 +402,22 @@ def _case_outcome(
     history: CaseHistory,
 ) -> _Outcome:
     revision = history.revisions[-1]
-    adjudication = _latest_adjudication(history, revision.revision_id)
     presentations = _presentations_for_revision(active, revision)
     if not presentations:
+        adjudication, stale = _adjudication_state(history, revision.revision_id, ())
+        if stale:
+            raise ValueError("adjudication is stale for the latest assessments")
         if (
             revision.overlays
             or revision.automated_valid
             or revision.automated_reason != "invalid-affine-reflection"
             or adjudication is None
             or adjudication.status != "exclude"
+            or adjudication.reasons != ("invalid-affine-reflection",)
         ):
-            raise ValueError("hard-invalid technical case requires explicit exclusion")
+            raise ValueError(
+                "hard-invalid technical case requires explicit exclusion with invalid-affine-reflection"
+            )
         return _Outcome(
             adjudication.status,
             adjudication.reasons,
@@ -366,6 +431,13 @@ def _case_outcome(
     if any(item is None for item in assessments):
         raise ValueError("original case lacks a final assessment")
     complete = tuple(item for item in assessments if item is not None)
+    adjudication, stale = _adjudication_state(
+        history,
+        revision.revision_id,
+        tuple(item.event_id for item in complete),
+    )
+    if stale:
+        raise ValueError("adjudication is stale for the latest assessments")
     if any(item.status == "needs-registration-improvement" for item in complete):
         raise ValueError("registration improvement remains unresolved")
     statuses = {item.status for item in complete}
@@ -430,6 +502,18 @@ def _final_rows(state: ReviewState, active: ReviewManifest) -> list[dict[str, ob
     return rows
 
 
+def _validate_initial_repeats(manifest: ReviewManifest) -> None:
+    repeats = tuple(
+        item for item in manifest.visual_presentations if item.repeat_of is not None
+    )
+    if len(repeats) != 4:
+        raise ValueError("initial manifest must contain exactly four concealed repeats")
+    repeated_cases = {manifest.presentation_cases[item.opaque_id] for item in repeats}
+    base_ids = {item.repeat_of for item in repeats}
+    if len(base_ids) != 4 or len(repeated_cases) != 4:
+        raise ValueError("concealed repeats must represent four distinct cases")
+
+
 def _read_final_csv(
     path: Path, expected: Sequence[Mapping[str, object]] | None = None
 ) -> list[dict[str, str]]:
@@ -481,6 +565,7 @@ def finalize_decisions(
     if review_dir.resolve() != store.review_dir:
         raise ValueError("final output must remain in the owned review directory")
     state = store.validate_current_bindings(manifest)
+    _validate_initial_repeats(manifest)
     active = state.active_manifest(manifest)
     _validate_current_evidence(active)
     rows = _final_rows(state, active)

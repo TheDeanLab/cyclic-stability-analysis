@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -20,7 +21,7 @@ from cyclic_stability.review_exports import (
     write_operational_exports,
 )
 from cyclic_stability.review_inventory import build_review_manifest
-from cyclic_stability.review_models import CaseKey, RepositoryIdentity
+from cyclic_stability.review_models import CaseKey, RepositoryIdentity, ReviewManifest
 from cyclic_stability.review_store import ReviewStore
 from synthetic import (
     completed_review_store,
@@ -396,6 +397,135 @@ def test_repeat_disagreement_requires_current_revision_adjudication(
     assert report_row["adjudicated_decision"] == "exclude"
 
 
+def test_later_assessment_invalidates_stale_adjudication(tmp_path: Path) -> None:
+    """An adjudication cannot override assessments recorded after its snapshot."""
+    store, manifest = fresh_review_store(tmp_path)
+    repeated = next(
+        item for item in manifest.visual_presentations if item.repeat_of is not None
+    )
+    _complete_visual_assessments(
+        store,
+        manifest,
+        statuses={repeated.opaque_id: "exclude"},
+    )
+    store.adjudicate(
+        _technical_case(manifest),
+        "exclude",
+        ("invalid-affine-reflection",),
+        "hard invalid",
+    )
+    case_key = manifest.presentation_cases[repeated.opaque_id]
+    store.adjudicate(case_key, "exclude", ("z-misalignment",), "reconciled")
+    store.assess(repeated.opaque_id, "accept", ("dapi-aligned",), "changed")
+
+    with pytest.raises(ValueError, match="adjudication is stale"):
+        finalize_decisions(store, manifest, tmp_path / "review")
+
+    store.adjudicate(case_key, "accept", ("dapi-aligned",), "reconciled again")
+    output = finalize_decisions(store, manifest, tmp_path / "review")
+    row = next(
+        item
+        for item in _read_rows(output)
+        if (item["cohort"], item["cell_id"], item["acquisition_round"])
+        == (case_key.cohort, case_key.cell_id, str(case_key.acquisition_round))
+    )
+    assert row["decision"] == "accept"
+
+
+def test_same_root_revision_rewrite_is_rejected_without_state_change(
+    tmp_path: Path,
+) -> None:
+    """Remediation cannot replace immutable evidence behind preserved history."""
+    qc_root = write_review_qc_fixture(tmp_path / "qc")
+    manifest = build_review_manifest(qc_root, seed=7)
+    store = ReviewStore.create(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
+    pending = manifest.visual_presentations[0]
+    store.assess(
+        pending.opaque_id,
+        "needs-registration-improvement",
+        ("persistent-interior-misalignment",),
+        "retry",
+    )
+    before_bytes = (tmp_path / "review/review-state.json").read_bytes()
+    before_state = store.state
+    before_identity = pending.overlays[0].identity
+    rewrite_review_case_pixels(qc_root, manifest.presentation_cases[pending.opaque_id])
+
+    with pytest.raises(ValueError, match="distinct revision root"):
+        attach_revision_root(store, qc_root)
+
+    assert store.state == before_state
+    assert (tmp_path / "review/review-state.json").read_bytes() == before_bytes
+    assert pending.overlays[0].identity == before_identity
+
+
+@pytest.mark.parametrize("repeat_count", [0, 3])
+def test_finalization_requires_exactly_four_initial_repeats(
+    tmp_path: Path, repeat_count: int
+) -> None:
+    """Zero or too few concealed controls cannot satisfy finalization."""
+    manifest = build_review_manifest(
+        write_review_qc_fixture(tmp_path / "qc"),
+        seed=7,
+        repeat_count=repeat_count,
+    )
+    store = ReviewStore.create(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
+    _complete_visual_assessments(store, manifest)
+    store.adjudicate(
+        _technical_case(manifest),
+        "exclude",
+        ("invalid-affine-reflection",),
+        "hard invalid",
+    )
+
+    with pytest.raises(ValueError, match="exactly four concealed repeats"):
+        finalize_decisions(store, manifest, tmp_path / "review")
+
+
+def test_finalization_requires_repeats_from_four_distinct_cases(
+    tmp_path: Path,
+) -> None:
+    """Four repeat records cannot reuse one biological base as two controls."""
+    original = build_review_manifest(write_review_qc_fixture(tmp_path / "qc"), seed=7)
+    repeats = [
+        item for item in original.visual_presentations if item.repeat_of is not None
+    ]
+    first, second = repeats[:2]
+    forged_second = replace(
+        second,
+        case_token=first.case_token,
+        revision_id=first.revision_id,
+        overlays=first.overlays,
+        repeat_of=first.repeat_of,
+    )
+    presentations = tuple(
+        forged_second if item.opaque_id == second.opaque_id else item
+        for item in original.visual_presentations
+    )
+    cases = dict(original.presentation_cases)
+    cases[second.opaque_id] = cases[first.opaque_id]
+    manifest = ReviewManifest(
+        original.seed, original.case_revisions, presentations, cases
+    )
+    store = ReviewStore.create(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
+    _complete_visual_assessments(store, manifest)
+    store.adjudicate(
+        _technical_case(manifest),
+        "exclude",
+        ("invalid-affine-reflection",),
+        "hard invalid",
+    )
+
+    with pytest.raises(ValueError, match="four distinct cases"):
+        finalize_decisions(store, manifest, tmp_path / "review")
+
+
 def test_hard_invalid_technical_case_requires_exclusion(tmp_path: Path) -> None:
     """The no-overlay affine failure is final only through explicit exclusion."""
     store, manifest = fresh_review_store(tmp_path)
@@ -410,6 +540,28 @@ def test_hard_invalid_technical_case_requires_exclusion(tmp_path: Path) -> None:
         store.adjudicate(technical, "accept", ("dapi-aligned",), "incorrect")
     with pytest.raises(ValueError, match="invalid-affine-reflection"):
         store.adjudicate(technical, "exclude", ("dapi-aligned",), "wrong reason")
+
+
+def test_finalization_rejects_tampered_technical_exclusion_reason(
+    tmp_path: Path,
+) -> None:
+    """Finalization independently enforces the technical exclusion reason."""
+    _store, manifest = completed_review_store(tmp_path)
+    current = tmp_path / "review/review-state.json"
+    payload = json.loads(current.read_text(encoding="utf-8"))
+    technical_history = next(
+        history
+        for history in payload["case_histories"].values()
+        if not history["revisions"][-1]["overlays"]
+    )
+    technical_history["adjudications"][-1]["reasons"] = ["dapi-aligned"]
+    current.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    reopened = ReviewStore.open(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
+
+    with pytest.raises(ValueError, match="invalid-affine-reflection"):
+        finalize_decisions(reopened, manifest, tmp_path / "review")
 
 
 def test_finalization_revalidates_current_evidence_identities(tmp_path: Path) -> None:

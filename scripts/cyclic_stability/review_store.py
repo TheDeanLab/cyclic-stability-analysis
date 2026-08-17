@@ -360,10 +360,23 @@ class ReviewStore:
             if history
         ):
             raise ValueError("adjudication requires a visual assessment")
+        assessment_event_ids = tuple(
+            assessment_history[-1].event_id
+            for presentation in self._manifest.visual_presentations
+            if presentation.case_token == case_token
+            and presentation.revision_id == latest_revision.revision_id
+            and (
+                assessment_history := self._state.assessment_history.get(
+                    presentation.opaque_id, ()
+                )
+            )
+            and assessment_history[-1].revision_id == latest_revision.revision_id
+        )
         adjudication = Adjudication(
             uuid.uuid4().hex,
             case_key,
             case_history.revisions[-1].revision_id,
+            assessment_event_ids,
             decision,
             reasons,
             notes,
