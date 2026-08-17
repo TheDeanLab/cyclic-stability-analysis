@@ -70,41 +70,23 @@ def _final_decisions(
     }
 
 
-def _presentation_title(
+def _blinded_presentation_lines(
     state: ReviewState,
     active: ReviewManifest,
     presentation: Presentation,
     decisions: Mapping[tuple[str, str, int], str],
-) -> str:
+) -> tuple[str, ...]:
+    """Build visual-page text entirely from opaque and structured fields."""
     assessment = _latest_assessment(state, presentation.opaque_id)
     assert assessment is not None
     case_key = active.presentation_cases[presentation.opaque_id]
     final = decisions[(case_key.cohort, case_key.cell_id, case_key.acquisition_round)]
     reasons = ", ".join(assessment.reasons)
-    return "\n".join(
-        (
-            f"{presentation.opaque_id}  |  revision {presentation.revision_id}",
-            f"Provisional decision: {assessment.status}; final decision: {final}",
-            f"Reasons: {reasons or 'none'}; notes: {assessment.notes or 'none'}",
-        )
+    return (
+        f"{presentation.opaque_id}  |  revision {presentation.revision_id}",
+        f"Provisional decision: {assessment.status}; final decision: {final}",
+        f"Structured reasons: {reasons or 'none'}",
     )
-
-
-def _validate_blinded_notes(state: ReviewState, active: ReviewManifest) -> None:
-    """Reject reviewer prose that would expose a case on a blinded visual page."""
-    biological_terms = {"target channel"}
-    biological_terms.update(
-        case_key.cohort.lower() for case_key in active.presentation_cases.values()
-    )
-    biological_terms.update(
-        case_key.cell_id.lower() for case_key in active.presentation_cases.values()
-    )
-    for presentation in active.visual_presentations:
-        assessment = _latest_assessment(state, presentation.opaque_id)
-        if assessment is not None and any(
-            term in assessment.notes.lower() for term in biological_terms
-        ):
-            raise ValueError("target-blind report notes contain biological identifiers")
 
 
 def _render_visual_page(
@@ -119,7 +101,9 @@ def _render_visual_page(
         (item.channel, item.stage, item.view): item for item in presentation.overlays
     }
     figure, axes = plt.subplots(2, 1, figsize=(11, 14), constrained_layout=True)
-    figure.suptitle(_presentation_title(state, active, presentation, decisions))
+    figure.suptitle(
+        "\n".join(_blinded_presentation_lines(state, active, presentation, decisions))
+    )
     for channel_index, channel in enumerate(_CHANNELS):
         images: list[np.ndarray] = []
         for stage_index, stage in enumerate(_STAGES):
@@ -206,25 +190,46 @@ def _render_technical_summary(
     plt.close(figure)
 
 
-def _render_unblinded_provenance(pdf: PdfPages, active: ReviewManifest) -> None:
+def _unblinded_provenance_lines(
+    state: ReviewState, active: ReviewManifest
+) -> tuple[str, ...]:
+    """Build the sole free-text and biological identity section of the record."""
+    lines = [
+        "UNBLINDED PROVENANCE APPENDIX",
+        "",
+        "Opaque ID | cohort | cell | round | notes",
+    ]
+    for presentation in active.visual_presentations:
+        case_key = active.presentation_cases[presentation.opaque_id]
+        assessment = _latest_assessment(state, presentation.opaque_id)
+        lines.append(
+            " | ".join(
+                (
+                    presentation.opaque_id,
+                    case_key.cohort,
+                    case_key.cell_id,
+                    str(case_key.acquisition_round),
+                    assessment.notes if assessment is not None else "",
+                )
+            )
+        )
+    return tuple(lines)
+
+
+def _render_unblinded_provenance(
+    pdf: PdfPages, state: ReviewState, active: ReviewManifest
+) -> None:
     """Render the sole biological mapping, after every blinded PDF page."""
     figure, axis = plt.subplots(figsize=(11, 8.5))
     axis.set_axis_off()
-    lines = ["UNBLINDED PROVENANCE APPENDIX", "", "Opaque ID | cohort | cell | round"]
-    lines.extend(
-        " | ".join(
-            (
-                presentation.opaque_id,
-                active.presentation_cases[presentation.opaque_id].cohort,
-                active.presentation_cases[presentation.opaque_id].cell_id,
-                str(
-                    active.presentation_cases[presentation.opaque_id].acquisition_round
-                ),
-            )
-        )
-        for presentation in active.visual_presentations
+    axis.text(
+        0.03,
+        0.97,
+        "\n".join(_unblinded_provenance_lines(state, active)),
+        va="top",
+        family="monospace",
+        fontsize=8,
     )
-    axis.text(0.03, 0.97, "\n".join(lines), va="top", family="monospace", fontsize=8)
     pdf.savefig(figure)
     plt.close(figure)
 
@@ -241,7 +246,7 @@ def _render_pdf(
         for presentation in active.visual_presentations:
             _render_visual_page(pdf, state, active, presentation, decisions)
         _render_technical_summary(pdf, state, active, consistency, final_rows)
-        _render_unblinded_provenance(pdf, active)
+        _render_unblinded_provenance(pdf, state, active)
 
 
 def _summary_text(
@@ -271,6 +276,7 @@ def _summary_text(
         f"- Last review activity: {_latest_activity(state)}",
         f"- Repository commit: {repository.commit}",
         f"- Repository dirty at review creation: {repository.dirty}",
+        f"- Repository dirty diff SHA-256: {repository.diff_sha256 or 'none'}",
         "",
         "## Final revision IDs",
         "",
@@ -295,20 +301,68 @@ def _summary_text(
         for row in consistency
     )
     lines.extend(("", "## Unblinded provenance appendix", ""))
+    lines.extend(("### Presentation provenance", ""))
+    lines.extend(f"- {line}" for line in _unblinded_provenance_lines(state, active)[2:])
+    lines.extend(("", "### Exclusion details", ""))
     lines.extend(
         "- "
         + " | ".join(
             (
-                presentation.opaque_id,
-                active.presentation_cases[presentation.opaque_id].cohort,
-                active.presentation_cases[presentation.opaque_id].cell_id,
-                str(
-                    active.presentation_cases[presentation.opaque_id].acquisition_round
-                ),
+                str(row["cohort"]),
+                str(row["cell_id"]),
+                str(row["acquisition_round"]),
+                str(row["decision"]),
+                str(row["reasons"]),
+                str(row["reviewer"]),
+                str(row["reviewed_at"]),
             )
         )
-        for presentation in active.visual_presentations
+        for row in final_rows
+        if row["decision"] == "exclude"
     )
+    lines.extend(("", "### Remediation revision history", ""))
+    for history in sorted(
+        state.case_histories.values(), key=lambda item: item.case_key
+    ):
+        if len(history.revisions) < 2:
+            continue
+        case_key = history.case_key
+        lines.append(
+            f"- Case: {case_key.cohort} | {case_key.cell_id} | {case_key.acquisition_round}"
+        )
+        for revision in history.revisions:
+            lines.append(
+                "  - "
+                + " | ".join(
+                    (
+                        revision.revision_id,
+                        f"automated_valid={revision.automated_valid}",
+                        f"automated_reason={revision.automated_reason or 'none'}",
+                        f"deformation_flags={dict(revision.deformation_flags)}",
+                    )
+                )
+            )
+            for presentation in active.visual_presentations:
+                if (
+                    presentation.case_token != history.case_token
+                    or presentation.revision_id != revision.revision_id
+                ):
+                    continue
+                assessment = _latest_assessment(state, presentation.opaque_id)
+                if assessment is not None:
+                    lines.append(
+                        "    - "
+                        + " | ".join(
+                            (
+                                presentation.opaque_id,
+                                assessment.status,
+                                ";".join(assessment.reasons),
+                                assessment.notes,
+                                assessment.reviewer,
+                                assessment.assessed_at.isoformat(),
+                            )
+                        )
+                    )
     return "\n".join(lines) + "\n"
 
 
@@ -350,7 +404,6 @@ def write_review_report(
     _validate_current_evidence(active)
     final_rows = _final_rows(validated, active)
     consistency = _consistency_rows(validated, active)
-    _validate_blinded_notes(validated, active)
 
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)

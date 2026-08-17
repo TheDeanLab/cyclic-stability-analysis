@@ -9,8 +9,18 @@ import matplotlib
 import pytest
 import tifffile
 from cyclic_stability import review_report
+from cyclic_stability.review_exports import (
+    _consistency_rows,
+    _final_rows,
+    attach_revision_root,
+)
 from cyclic_stability.review_report import write_review_report
-from synthetic import completed_review_store, fresh_review_store
+from synthetic import (
+    completed_review_store,
+    fresh_review_store,
+    rewrite_review_case_pixels,
+    write_review_qc_fixture,
+)
 
 
 def test_report_is_target_blind_and_uses_truetype_fonts(tmp_path: Path) -> None:
@@ -81,24 +91,100 @@ def test_report_rejects_unfinalized_state_without_publication(tmp_path: Path) ->
     assert (pdf_path.read_bytes(), summary_path.read_bytes()) == before
 
 
-def test_report_rejects_biological_text_in_blinded_page_notes(tmp_path: Path) -> None:
-    """Reviewer notes cannot leak a cohort or cell identifier onto visual pages."""
+def test_blinded_page_content_excludes_notes_and_unblinded_appendix_keeps_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Free text never reaches visual builders and is appended after them."""
     store, manifest = completed_review_store(tmp_path)
     presentation = manifest.visual_presentations[0]
     store.assess(
         presentation.opaque_id,
         "accept",
         ("dapi-aligned",),
-        "Golgi Cell1 remains aligned",
+        "LAMP1 puncta remain offset",
+    )
+    active = store.state.active_manifest(manifest)
+    final_rows = _final_rows(store.state, active)
+    decisions = review_report._final_decisions(final_rows)
+
+    blinded = review_report._blinded_presentation_lines(
+        store.state, active, presentation, decisions
+    )
+    appendix = review_report._unblinded_provenance_lines(store.state, active)
+    assert "LAMP1 puncta remain offset" not in "\n".join(blinded)
+    assert "LAMP1 puncta remain offset" in "\n".join(appendix)
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        review_report, "_render_visual_page", lambda *args: calls.append("visual")
+    )
+    monkeypatch.setattr(
+        review_report,
+        "_render_technical_summary",
+        lambda *args: calls.append("technical"),
+    )
+    monkeypatch.setattr(
+        review_report,
+        "_render_unblinded_provenance",
+        lambda *args: calls.append("unblinded"),
+    )
+    review_report._render_pdf(
+        tmp_path / "ordered.pdf",
+        store.state,
+        active,
+        final_rows,
+        _consistency_rows(store.state, active),
+    )
+    assert calls == ["visual"] * len(active.visual_presentations) + [
+        "technical",
+        "unblinded",
+    ]
+
+
+def test_unblinded_markdown_records_exclusions_remediation_and_repository_identity(
+    tmp_path: Path,
+) -> None:
+    """Archival Markdown contains the complete final provenance record."""
+    store, manifest = completed_review_store(tmp_path)
+    active = store.state.active_manifest(manifest)
+    final_rows = _final_rows(store.state, active)
+    summary = review_report._summary_text(
+        store.state, active, final_rows, _consistency_rows(store.state, active)
+    )
+    repository = store.state.repository_identity
+
+    assert "### Exclusion details" in summary
+    assert "lamin | Cell1 | 1 | exclude | invalid-affine-reflection" in summary
+    assert (
+        f"- Repository dirty diff SHA-256: {repository.diff_sha256 or 'none'}"
+        in summary
     )
 
-    with pytest.raises(ValueError, match="target-blind"):
-        write_review_report(
-            store.state,
-            manifest,
-            tmp_path / "review/review-record.pdf",
-            tmp_path / "review/review-summary.md",
-        )
+    pending, initial = fresh_review_store(tmp_path / "remediation")
+    presentation = initial.visual_presentations[0]
+    pending.assess(
+        presentation.opaque_id,
+        "needs-registration-improvement",
+        ("persistent-interior-misalignment",),
+        "rerun needed",
+    )
+    revised_root = write_review_qc_fixture(tmp_path / "revised")
+    rewrite_review_case_pixels(
+        revised_root, initial.presentation_cases[presentation.opaque_id]
+    )
+    attach_revision_root(pending, revised_root)
+    remediation_summary = review_report._summary_text(
+        pending.state,
+        pending.manifest,
+        (),
+        _consistency_rows(pending.state, pending.manifest),
+    )
+    history = pending.state.case_histories[presentation.case_token]
+
+    assert "### Remediation revision history" in remediation_summary
+    assert history.revisions[0].revision_id in remediation_summary
+    assert history.revisions[1].revision_id in remediation_summary
+    assert "rerun needed" in remediation_summary
 
 
 @pytest.mark.parametrize("staged_writer", ("_render_pdf", "_write_summary"))
