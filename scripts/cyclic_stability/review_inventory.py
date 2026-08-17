@@ -227,8 +227,6 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
             missing = expected_paths[overlay_exists.index(False)]
             raise ValueError(f"missing required overlay: {missing.name}")
         if all(overlay_exists):
-            if not registration_valid:
-                raise ValueError("visual case must be valid in both source tables")
             overlays = tuple(_overlay_evidence(path) for path in expected_paths)
             visual_count += 1
             if {row["region"] for row in deformation_rows} != _REGIONS or len(

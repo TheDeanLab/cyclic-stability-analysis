@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import tifffile
 from cyclic_stability.review_inventory import build_review_manifest
-from cyclic_stability.review_models import CaseRevision, Presentation
+from cyclic_stability.review_models import CaseKey, CaseRevision, Presentation
 from synthetic import write_review_qc_fixture
 
 
@@ -131,21 +131,41 @@ def test_inventory_requires_the_exact_ten_cell_moving_round_keys(
         build_review_manifest(qc_root, seed=1)
 
 
-def test_inventory_rejects_invalid_visual_case(tmp_path: Path) -> None:
-    """A visual case must be valid in both decision and registration evidence."""
+def test_inventory_preserves_automated_invalid_visual_case(tmp_path: Path) -> None:
+    """Complete visual evidence remains reviewable with its automated warning."""
     qc_root = write_review_qc_fixture(tmp_path / "qc-only")
     visual = lambda row: (
         row["cohort"] == "golgi"
         and row["cell_id"] == "Cell1"
         and row["acquisition_round"] == "1"
     )
-    for filename in ("decision-requests.csv", "registration-qc.csv"):
-        _rewrite_review_rows(
-            qc_root / "qc" / filename, visual, {"automated_valid": "False"}
-        )
+    _rewrite_review_rows(
+        qc_root / "qc" / "decision-requests.csv",
+        visual,
+        {
+            "automated_valid": "False",
+            "automated_reason": "nonpositive-jacobian",
+        },
+    )
+    _rewrite_review_rows(
+        qc_root / "qc" / "registration-qc.csv",
+        visual,
+        {
+            "automated_valid": "False",
+            "invalid_reason": "nonpositive-jacobian",
+        },
+    )
 
-    with pytest.raises(ValueError, match="visual case must be valid"):
-        build_review_manifest(qc_root, seed=1)
+    manifest = build_review_manifest(qc_root, seed=1)
+
+    revision = next(
+        item
+        for item in manifest.case_revisions
+        if item.case_key == CaseKey("golgi", "Cell1", 1)
+    )
+    assert len(revision.overlays) == 18
+    assert not revision.automated_valid
+    assert revision.automated_reason == "nonpositive-jacobian"
 
 
 def test_inventory_rejects_non_hard_invalid_technical_case(tmp_path: Path) -> None:
