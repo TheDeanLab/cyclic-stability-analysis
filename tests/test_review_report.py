@@ -15,8 +15,8 @@ from cyclic_stability.review_exports import (
     _final_rows,
     attach_revision_root,
 )
-from cyclic_stability.review_report import write_review_report
 from cyclic_stability.review_inventory import build_review_manifest
+from cyclic_stability.review_report import write_review_report
 from cyclic_stability.review_store import ReviewStore
 from synthetic import (
     completed_review_store,
