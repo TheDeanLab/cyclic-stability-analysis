@@ -459,3 +459,13 @@ def test_normal_launch_without_display_is_concise(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "GUI-enabled session" in result.stderr
     assert "Traceback" not in result.stderr
+
+
+def test_readme_documents_review_remediation_and_finalization() -> None:
+    """The operator guide documents the complete blinded-review lifecycle."""
+    text = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+    assert "review_registration_qc.py" in text
+    assert "Needs registration improvement" in text
+    assert "--add-revision-root" in text
+    assert "qc-decisions.csv" in text
+    assert "VNC" in text and "does not configure" in text
