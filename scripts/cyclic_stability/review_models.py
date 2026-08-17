@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -174,10 +175,18 @@ class EvidenceIdentity:
     @classmethod
     def from_path(cls, path: Path) -> EvidenceIdentity:
         """Return a content identity for an existing evidence file."""
-        with path.open("rb") as stream:
-            digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        stat = path.stat()
-        return cls(str(path.resolve()), stat.st_size, stat.st_mtime_ns, digest)
+        from cyclic_stability.review_evidence import (
+            overlay_qc_root,
+            read_verified_evidence,
+        )
+
+        verified = read_verified_evidence(overlay_qc_root(path), path)
+        return cls(
+            str(verified.path),
+            verified.size,
+            verified.mtime_ns,
+            verified.sha256,
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a strict JSON-compatible representation."""
@@ -796,28 +805,58 @@ class RecoveryEvent:
 
 @dataclass(frozen=True, slots=True)
 class ExportRecord:
-    """One final CSV identity recorded only after successful reopen validation."""
+    """One terminal export bound to its exact pre-export review-state digest."""
 
     sha256: str
+    finalized_state_sha256: str
+    pdf_sha256: str | None
+    summary_sha256: str | None
     exported_at: datetime
 
     def __post_init__(self) -> None:
         _sha256(self.sha256, "export sha256")
+        _sha256(self.finalized_state_sha256, "finalized state sha256")
+        if (self.pdf_sha256 is None) != (self.summary_sha256 is None):
+            raise ValueError("final report digests must be recorded together")
+        if self.pdf_sha256 is not None:
+            _sha256(self.pdf_sha256, "final PDF sha256")
+            _sha256(self.summary_sha256, "final Markdown sha256")
         _utc_timestamp(self.exported_at, "export timestamp")
 
     def to_dict(self) -> dict[str, object]:
         """Return a strict JSON-compatible representation."""
         return {
             "sha256": self.sha256,
+            "finalized_state_sha256": self.finalized_state_sha256,
+            "pdf_sha256": self.pdf_sha256,
+            "summary_sha256": self.summary_sha256,
             "exported_at": self.exported_at.isoformat(),
         }
 
     @classmethod
     def from_dict(cls, payload: object) -> ExportRecord:
         """Parse one strictly validated JSON-compatible representation."""
-        data = _mapping(payload, frozenset({"sha256", "exported_at"}), "export record")
+        data = _mapping(
+            payload,
+            frozenset(
+                {
+                    "sha256",
+                    "finalized_state_sha256",
+                    "pdf_sha256",
+                    "summary_sha256",
+                    "exported_at",
+                }
+            ),
+            "export record",
+        )
+        for name in ("pdf_sha256", "summary_sha256"):
+            if data[name] is not None and not isinstance(data[name], str):
+                raise TypeError(f"{name} must be a string or null")
         return cls(
             _sha256(data["sha256"], "export sha256"),
+            _sha256(data["finalized_state_sha256"], "finalized state sha256"),
+            data["pdf_sha256"],
+            data["summary_sha256"],
             _timestamp_from_dict(data["exported_at"], "export timestamp"),
         )
 
@@ -893,8 +932,29 @@ class ReviewState:
             raise ValueError("attached presentation opaque IDs must be unique")
         if any(not isinstance(record, ExportRecord) for record in self.export_history):
             raise ValueError("export history has an invalid schema")
+        if len(self.export_history) > 1:
+            raise ValueError("a review may contain only one terminal export record")
         object.__setattr__(self, "assessment_history", MappingProxyType(assessments))
         object.__setattr__(self, "case_histories", MappingProxyType(histories))
+        if (
+            self.export_history
+            and self.export_history[0].finalized_state_sha256
+            != self.finalizable_state_sha256
+        ):
+            raise ValueError("export record does not match the finalized review state")
+
+    @property
+    def finalizable_state_sha256(self) -> str:
+        """Return the canonical digest of this state without terminal export metadata."""
+        payload = self.to_dict()
+        payload["export_history"] = []
+        content = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(content).hexdigest()
 
     def to_dict(self) -> dict[str, object]:
         """Return a strict JSON-compatible representation."""

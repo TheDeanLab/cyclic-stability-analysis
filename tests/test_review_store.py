@@ -117,6 +117,44 @@ def test_open_recovers_previous_valid_state_after_malformed_current(
     assert len(reopened.state.recovery_events) == 1
 
 
+def test_open_recovers_valid_manifest_only_initialization(tmp_path: Path) -> None:
+    """A durable manifest with no state is a recoverable initialization checkpoint."""
+    manifest = build_review_manifest(write_review_qc_fixture(tmp_path / "qc"), seed=7)
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    (review_dir / "randomization-manifest.json").write_text(
+        json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    store = ReviewStore.open(review_dir, manifest, "Reviewer", now=fixed_clock)
+
+    assert store.state.initial_manifest_identity == manifest.manifest_identity
+    assert (review_dir / "review-state.json").exists()
+
+
+def test_manifest_only_recovery_rejects_conflicting_directory_content(
+    tmp_path: Path,
+) -> None:
+    """Initialization recovery never overwrites an unrelated nonempty directory."""
+    manifest = build_review_manifest(write_review_qc_fixture(tmp_path / "qc"), seed=7)
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    manifest_path = review_dir / "randomization-manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    conflict = review_dir / "unrelated.txt"
+    conflict.write_text("preserve me\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="manifest-only.*conflicting"):
+        ReviewStore.open(review_dir, manifest, "Reviewer", now=fixed_clock)
+
+    assert conflict.read_text(encoding="utf-8") == "preserve me\n"
+    assert not (review_dir / "review-state.json").exists()
+
+
 def test_open_rejects_when_current_and_previous_are_malformed(tmp_path: Path) -> None:
     """Two malformed snapshots fail closed rather than merging untrusted state."""
     manifest = build_review_manifest(write_review_qc_fixture(tmp_path / "qc"), seed=7)

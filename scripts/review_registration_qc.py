@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import secrets
 import sys
@@ -102,7 +101,7 @@ def _validate_initial_manifest(
 
 
 def _validate_active_evidence(manifest: ReviewManifest) -> None:
-    from cyclic_stability.review_inventory import OVERLAY_NAME
+    from cyclic_stability.review_inventory import read_overlay_bytes
 
     validated: set[tuple[str, str]] = set()
     for presentation in manifest.visual_presentations:
@@ -112,22 +111,7 @@ def _validate_active_evidence(manifest: ReviewManifest) -> None:
             if key in validated:
                 continue
             validated.add(key)
-            path = Path(identity.path)
-            match = OVERLAY_NAME.fullmatch(path.name)
-            if (
-                match is None
-                or match.group(2) != overlay.channel
-                or match.group(3) != overlay.stage
-                or match.group(4) != overlay.view
-            ):
-                raise ValueError("review evidence basename is no longer allowlisted")
-            try:
-                with path.open("rb") as stream:
-                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
-            except OSError as error:
-                raise ValueError("review evidence is unavailable") from error
-            if digest != identity.sha256:
-                raise ValueError("reviewed evidence identity changed")
+            read_overlay_bytes(overlay)
 
 
 def _open_lifecycle(args: argparse.Namespace) -> tuple[ReviewStore, ReviewManifest]:
@@ -160,7 +144,7 @@ def _open_lifecycle(args: argparse.Namespace) -> tuple[ReviewStore, ReviewManife
     return store, manifest
 
 
-def _validated_counts(manifest: ReviewManifest) -> tuple[int, int, int]:
+def _validated_counts(manifest: ReviewManifest) -> tuple[int, int, int, int, int, int]:
     cases = len(manifest.case_revisions)
     visual = sum(
         presentation.repeat_of is None for presentation in manifest.visual_presentations
@@ -169,7 +153,10 @@ def _validated_counts(manifest: ReviewManifest) -> tuple[int, int, int]:
         presentation.repeat_of is not None
         for presentation in manifest.visual_presentations
     )
-    return cases, visual, repeats
+    presentations = len(manifest.visual_presentations)
+    technical = sum(not revision.overlays for revision in manifest.case_revisions)
+    overlays = sum(len(revision.overlays) for revision in manifest.case_revisions)
+    return cases, visual, repeats, presentations, technical, overlays
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -227,10 +214,19 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, TypeError, ValueError) as error:
         print(f"review preflight failed: {error}", file=sys.stderr)
         return 2
-    case_count, visual_count, repeat_count = _validated_counts(manifest)
+    (
+        case_count,
+        visual_count,
+        repeat_count,
+        presentation_count,
+        technical_count,
+        overlay_count,
+    ) = _validated_counts(manifest)
     print(
         f"validated {case_count} cases, {visual_count} visual cases, "
-        f"and {repeat_count} repeats"
+        f"and {repeat_count} repeats; {presentation_count} uniformly blinded "
+        f"presentations, {technical_count} technical case, {overlay_count} fully "
+        "decoded allowlisted overlays, 0 target basenames, and 0 symlinks"
     )
     if args.validate_only:
         return 0

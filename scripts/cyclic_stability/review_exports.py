@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from cyclic_stability.review_inventory import OVERLAY_NAME, read_revision_cases
+from cyclic_stability.review_inventory import read_overlay_bytes, read_revision_cases
 from cyclic_stability.review_models import (
     FINAL_STATUSES,
     REASON_TOKENS,
@@ -265,6 +265,35 @@ def write_operational_exports(
     return remediation, consistency
 
 
+def validate_operational_exports(
+    state: ReviewState, manifest: ReviewManifest, review_dir: Path
+) -> None:
+    """Reopen both operational CSVs and compare them to exact current rows."""
+    validated, active = _validated_active_manifest(state, manifest)
+    expected = (
+        (
+            review_dir / "remediation-requests.csv",
+            REMEDIATION_COLUMNS,
+            _remediation_rows(validated, active),
+        ),
+        (
+            review_dir / "consistency-report.csv",
+            CONSISTENCY_COLUMNS,
+            _consistency_rows(validated, active),
+        ),
+    )
+    for path, columns, rows in expected:
+        try:
+            with path.open(newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                actual = list(reader)
+        except (OSError, csv.Error) as error:
+            raise ValueError("operational review CSV could not be reopened") from error
+        wanted = [{column: str(row[column]) for column in columns} for row in rows]
+        if tuple(reader.fieldnames or ()) != columns or actual != wanted:
+            raise ValueError("operational review CSV does not match review state")
+
+
 def _revision_opaque_id(seed: int, revision: CaseRevision) -> str:
     digest = hashlib.sha256(
         "\0".join((str(seed), revision.revision_id, revision.case_token)).encode(
@@ -312,6 +341,8 @@ def _pending_case_histories(
 def attach_revision_root(store: ReviewStore, revision_root: Path) -> ReviewState:
     """Attach changed evidence for every currently unresolved remediation case."""
     state = store.validate_current_bindings()
+    if state.export_history:
+        raise ValueError("review is finalized and immutable")
     active = store.manifest
     identity_error: ValueError | None = None
     try:
@@ -386,20 +417,17 @@ def _validate_current_evidence(active: ReviewManifest) -> None:
     changed = False
     for revision in active.case_revisions:
         for overlay in revision.overlays:
-            identity = overlay.identity
-            if identity in seen:
+            if overlay.identity in seen:
                 continue
-            seen.add(identity)
-            path = Path(identity.path)
-            if OVERLAY_NAME.fullmatch(path.name) is None:
-                changed = True
-                continue
+            seen.add(overlay.identity)
             try:
-                current = EvidenceIdentity.from_path(path)
-            except OSError:
+                read_overlay_bytes(overlay)
+            except FileNotFoundError:
                 changed = True
                 continue
-            if current != identity:
+            except ValueError as error:
+                if "symlink" in str(error) or "escapes" in str(error):
+                    raise
                 changed = True
     if changed:
         raise ValueError("reviewed evidence identity changed")
@@ -574,6 +602,8 @@ def finalize_decisions(
     if review_dir.resolve() != store.review_dir:
         raise ValueError("final output must remain in the owned review directory")
     state = store.validate_current_bindings(manifest)
+    if state.export_history:
+        raise ValueError("review is finalized and immutable")
     _validate_initial_repeats(manifest)
     active = state.active_manifest(manifest)
     _validate_current_evidence(active)
@@ -597,5 +627,6 @@ __all__ = [
     "REMEDIATION_COLUMNS",
     "attach_revision_root",
     "finalize_decisions",
+    "validate_operational_exports",
     "write_operational_exports",
 ]

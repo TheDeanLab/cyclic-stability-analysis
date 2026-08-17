@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
 import tifffile
-from cyclic_stability import review_exports, review_store
+from cyclic_stability import review_evidence, review_exports, review_store
 from cyclic_stability.review_exports import (
     CONSISTENCY_COLUMNS,
     FINAL_COLUMNS,
@@ -654,6 +656,38 @@ def test_finalization_revalidates_current_evidence_identities(tmp_path: Path) ->
     assert store.state.export_history == ()
 
 
+def test_finalization_rejects_overlay_symlink_without_reading_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Resume-time evidence drift rejects a final symlink before target reads."""
+    store, manifest = completed_review_store(tmp_path)
+    overlay = Path(manifest.visual_presentations[0].overlays[0].path)
+    target = tmp_path / "resume-target.tif"
+    shutil.copy2(overlay, target)
+    overlay.unlink()
+    overlay.symlink_to(target)
+    target_reads: list[Path] = []
+    real_open = io.open
+    real_read = review_evidence.os.read
+
+    def guarded_open(file: object, *args: object, **kwargs: object):
+        if not isinstance(file, int) and Path(file).resolve() == target.resolve():
+            target_reads.append(Path(file))
+        return real_open(file, *args, **kwargs)
+
+    def guarded_read(descriptor: int, count: int) -> bytes:
+        opened = Path(review_evidence.os.readlink(f"/proc/self/fd/{descriptor}"))
+        if opened.is_absolute() and opened == target.resolve():
+            target_reads.append(target)
+        return real_read(descriptor, count)
+
+    monkeypatch.setattr(io, "open", guarded_open)
+    monkeypatch.setattr(review_evidence.os, "read", guarded_read)
+    with pytest.raises(ValueError, match="symlink"):
+        finalize_decisions(store, manifest, tmp_path / "review")
+    assert target_reads == []
+
+
 def test_finalization_revalidates_repository_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -684,22 +718,60 @@ def test_finalization_cannot_write_outside_the_owned_review_directory(
 def test_finalization_preserves_previous_valid_csv_and_records_validated_export(
     tmp_path: Path,
 ) -> None:
-    """Repeated finalization backs up valid bytes and appends their verified digest."""
+    """Finalization records one exact state digest and is not repeatable."""
     store, manifest = completed_review_store(tmp_path)
+    finalized_state_sha256 = hashlib.sha256(
+        json.dumps(
+            store.state.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
     output = finalize_decisions(store, manifest, tmp_path / "review")
     first = output.read_bytes()
     assert tuple(_read_rows(output)[0]) == FINAL_COLUMNS
     assert store.state.export_history[-1].sha256 == hashlib.sha256(first).hexdigest()
+    assert (
+        store.state.export_history[-1].finalized_state_sha256 == finalized_state_sha256
+    )
     assert store.state.export_history[-1].exported_at == fixed_clock()
 
-    finalize_decisions(store, manifest, tmp_path / "review")
+    with pytest.raises(ValueError, match="finalized"):
+        finalize_decisions(store, manifest, tmp_path / "review")
 
-    assert (tmp_path / "review/qc-decisions.previous.csv").read_bytes() == first
     reopened = ReviewStore.open(
         tmp_path / "review", manifest, "Reviewer", now=fixed_clock
     )
     assert reopened.state.export_history == store.state.export_history
-    assert len(reopened.state.export_history) == 2
+    assert len(reopened.state.export_history) == 1
+
+
+def test_successful_finalization_rejects_every_public_state_mutator(
+    tmp_path: Path,
+) -> None:
+    """Assessment, adjudication, revision attachment, and export are terminal."""
+    store, manifest = completed_review_store(tmp_path)
+    finalize_decisions(store, manifest, store.review_dir)
+    presentation = manifest.visual_presentations[0]
+    case_key = manifest.presentation_cases[presentation.opaque_id]
+
+    with pytest.raises(ValueError, match="finalized"):
+        store.assess(
+            presentation.opaque_id,
+            "exclude",
+            ("z-misalignment",),
+            "late edit",
+        )
+    with pytest.raises(ValueError, match="finalized"):
+        store.adjudicate(case_key, "exclude", ("z-misalignment",), "late")
+    with pytest.raises(ValueError, match="finalized"):
+        store.attach_revisions(
+            (manifest.case_revisions[0],),
+            (presentation,),
+        )
+    with pytest.raises(ValueError, match="finalized"):
+        store.record_export("a" * 64)
 
 
 def test_invalid_reopened_csv_is_not_recorded_or_promoted(

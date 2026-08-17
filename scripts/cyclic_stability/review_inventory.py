@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import random
 import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
+import numpy as np
 import tifffile
 
+from cyclic_stability.review_evidence import (
+    list_verified_directory,
+    overlay_qc_root,
+    read_verified_evidence,
+)
 from cyclic_stability.review_models import (
     CaseKey,
     CaseRevision,
@@ -104,45 +111,82 @@ def _index_rows(
     return indexed
 
 
-def _overlay_paths(directory: Path, round_number: int) -> tuple[Path, ...]:
+def _overlay_paths(
+    qc_root: Path, directory: Path, round_number: int
+) -> tuple[tuple[Path, ...], tuple[bool, ...]]:
     expected = tuple(
         directory / f"{round_number:02d}-{channel}-{stage}-{view}.tif"
         for channel in ("dapi", "tubulin")
         for stage in ("pre", "affine", "nonlinear")
         for view in ("xy", "xz", "yz")
     )
+    try:
+        names = set(list_verified_directory(qc_root, directory))
+    except FileNotFoundError:
+        names = set()
     unexpected = sorted(
-        path.name
-        for path in directory.glob("*.tif")
-        if OVERLAY_NAME.fullmatch(path.name) is None
+        name
+        for name in names
+        if name.endswith(".tif") and OVERLAY_NAME.fullmatch(name) is None
     )
     if unexpected:
         raise ValueError(
             f"overlay basename outside target-blind allowlist: {unexpected}"
         )
-    return expected
+    return expected, tuple(path.name in names for path in expected)
 
 
-def _overlay_evidence(path: Path) -> OverlayEvidence:
-    if not path.is_file():
-        raise ValueError(f"missing required overlay: {path.name}")
+def _overlay_evidence(qc_root: Path, path: Path) -> OverlayEvidence:
     match = OVERLAY_NAME.fullmatch(path.name)
     if match is None:
         raise ValueError(
             f"overlay basename outside target-blind allowlist: {path.name}"
         )
-    with tifffile.TiffFile(path) as image:
-        if (
-            len(image.series) != 1
-            or image.series[0].axes[-1:] != "S"
-            or image.series[0].shape[-1:] != (3,)
-            or image.pages[0].samplesperpixel != 3
-            or image.pages[0].photometric.name != "RGB"
-        ):
-            raise ValueError(f"overlay must be RGB: {path.name}")
+    try:
+        verified = read_verified_evidence(qc_root, path)
+    except FileNotFoundError as error:
+        raise ValueError(f"missing required overlay: {path.name}") from error
+    try:
+        decoded = tifffile.imread(io.BytesIO(verified.content))
+    except (OSError, ValueError, tifffile.TiffFileError) as error:
+        raise ValueError(
+            f"overlay must be a fully decoded RGB uint8 image: {path.name}"
+        ) from error
+    if (
+        decoded.ndim != 3
+        or decoded.shape[-1] != 3
+        or any(dimension < 1 for dimension in decoded.shape)
+        or decoded.dtype != np.dtype(np.uint8)
+    ):
+        raise ValueError(
+            f"overlay must be a fully decoded RGB uint8 image: {path.name}"
+        )
     round_text, channel, stage, view = match.groups()
     del round_text
-    return OverlayEvidence(channel, stage, view, EvidenceIdentity.from_path(path))
+    identity = EvidenceIdentity(
+        str(verified.path), verified.size, verified.mtime_ns, verified.sha256
+    )
+    return OverlayEvidence(channel, stage, view, identity)
+
+
+def read_overlay_bytes(overlay: OverlayEvidence) -> bytes:
+    """Return bytes whose path, metadata, digest, and role still match one overlay."""
+    path = Path(overlay.identity.path)
+    match = OVERLAY_NAME.fullmatch(path.name)
+    if (
+        match is None
+        or match.group(2) != overlay.channel
+        or match.group(3) != overlay.stage
+        or match.group(4) != overlay.view
+    ):
+        raise ValueError("review evidence basename is no longer allowlisted")
+    verified = read_verified_evidence(overlay_qc_root(path), path)
+    current = EvidenceIdentity(
+        str(verified.path), verified.size, verified.mtime_ns, verified.sha256
+    )
+    if current != overlay.identity:
+        raise ValueError("reviewed evidence identity changed")
+    return verified.content
 
 
 def _digest(*parts: str) -> str:
@@ -228,14 +272,17 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
         directory = (
             qc_root / "cells" / case_key.cohort / case_key.cell_id / "qc" / "overlays"
         )
-        expected_paths = _overlay_paths(directory, case_key.acquisition_round)
-        overlay_exists = tuple(path.is_file() for path in expected_paths)
+        expected_paths, overlay_exists = _overlay_paths(
+            qc_root, directory, case_key.acquisition_round
+        )
         deformation_rows = deformation_by_case.pop(case_key, [])
         if any(overlay_exists) and not all(overlay_exists):
             missing = expected_paths[overlay_exists.index(False)]
             raise ValueError(f"missing required overlay: {missing.name}")
         if all(overlay_exists):
-            overlays = tuple(_overlay_evidence(path) for path in expected_paths)
+            overlays = tuple(
+                _overlay_evidence(qc_root, path) for path in expected_paths
+            )
             visual_count += 1
             if {row["region"] for row in deformation_rows} != _REGIONS or len(
                 deformation_rows
@@ -297,38 +344,56 @@ def build_review_manifest(
         raise ValueError("repeat_count must select distinct visual cases")
     generator = random.Random(seed)
     generator.shuffle(visual_cases)
-    presentations: list[Presentation] = []
-    presentation_cases: dict[str, CaseKey] = {}
-    for ordinal, revision in enumerate(visual_cases, start=1):
-        opaque_id = f"QC-{ordinal:03d}-{_digest(str(seed), str(ordinal), revision.revision_id)[:10]}"
-        presentations.append(
-            Presentation(
-                opaque_id,
-                revision.case_token,
+    repeat_indexes = generator.sample(range(len(visual_cases)), repeat_count)
+    descriptors: list[tuple[str, int, CaseRevision]] = [
+        ("base", index, revision) for index, revision in enumerate(visual_cases)
+    ]
+    descriptors.extend(
+        ("repeat", index, visual_cases[index]) for index in repeat_indexes
+    )
+    generator.shuffle(descriptors)
+    assigned = tuple(
+        (
+            kind,
+            base_index,
+            revision,
+            "QC-"
+            + _digest(
+                str(seed),
+                "presentation",
+                str(position),
+                kind,
+                str(base_index),
                 revision.revision_id,
-                revision.overlays,
-                None,
-            )
+            )[:16],
         )
-        presentation_cases[opaque_id] = revision.case_key
-    repeat_bases = generator.sample(presentations, repeat_count)
-    for repeat_ordinal, base in enumerate(repeat_bases, start=1):
-        ordinal = len(presentations) + repeat_ordinal
-        opaque_id = (
-            f"QC-{ordinal:03d}-{_digest(str(seed), str(ordinal), base.opaque_id)[:10]}"
+        for position, (kind, base_index, revision) in enumerate(descriptors, start=1)
+    )
+    base_ids = {
+        base_index: opaque_id
+        for kind, base_index, _revision, opaque_id in assigned
+        if kind == "base"
+    }
+    presentations = [
+        Presentation(
+            opaque_id,
+            revision.case_token,
+            revision.revision_id,
+            revision.overlays,
+            base_ids[base_index] if kind == "repeat" else None,
         )
-        presentations.append(
-            Presentation(
-                opaque_id,
-                base.case_token,
-                base.revision_id,
-                base.overlays,
-                base.opaque_id,
-            )
-        )
-        presentation_cases[opaque_id] = presentation_cases[base.opaque_id]
-    generator.shuffle(presentations)
+        for kind, base_index, revision, opaque_id in assigned
+    ]
+    presentation_cases = {
+        opaque_id: revision.case_key
+        for _kind, _base_index, revision, opaque_id in assigned
+    }
     return ReviewManifest(seed, revisions, tuple(presentations), presentation_cases)
 
 
-__all__ = ["OVERLAY_NAME", "build_review_manifest", "read_revision_cases"]
+__all__ = [
+    "OVERLAY_NAME",
+    "build_review_manifest",
+    "read_overlay_bytes",
+    "read_revision_cases",
+]

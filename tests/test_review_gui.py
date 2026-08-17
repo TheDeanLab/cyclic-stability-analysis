@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -16,11 +17,12 @@ from types import ModuleType
 import numpy as np
 import pytest
 import tifffile
-from cyclic_stability import review_gui, review_report
+from cyclic_stability import review_evidence, review_exports, review_gui, review_report
 from cyclic_stability.review_exports import finalize_decisions
 from cyclic_stability.review_gui import (
     EvidenceResolver,
     IncompleteAssessmentError,
+    ReviewApplication,
     ReviewController,
     ReviewViewModel,
     keyboard_action,
@@ -59,6 +61,41 @@ class RecordingReviewApplication(ReviewController):
     def render_current(self, transition: str = "current") -> None:
         """Record which controller transition requested a render."""
         self.calls.append(f"render-{transition}")
+
+
+class AtomicRenderApplication(ReviewController):
+    """Widget-free harness whose visible evidence changes only after preload."""
+
+    def __init__(self, store: ReviewStore) -> None:
+        super().__init__(store, ReviewViewModel.from_store(store))
+        self.visible_opaque_id = self.current.opaque_id
+        self.fail_opaque_id: str | None = None
+
+    def render_current(self, transition: str = "current") -> None:
+        """Inject one candidate preload failure before visible evidence changes."""
+        del transition
+        candidate = self.current.opaque_id
+        if candidate == self.fail_opaque_id:
+            raise ValueError("injected candidate render failure")
+        self.visible_opaque_id = candidate
+
+
+class RecordingTree:
+    """Minimal Treeview boundary used to inspect reconciliation row values."""
+
+    def __init__(self) -> None:
+        self.rows: dict[str, tuple[str, ...]] = {}
+
+    def insert(
+        self,
+        _parent: str,
+        _index: str,
+        *,
+        iid: str,
+        values: tuple[str, ...],
+    ) -> None:
+        """Record one reconciliation row without creating Tk widgets."""
+        self.rows[iid] = values
 
 
 @pytest.fixture
@@ -132,9 +169,17 @@ def test_evidence_resolver_accepts_only_tokens_and_revalidates_digest(
     view = ReviewViewModel.from_store(store)
     resolver = EvidenceResolver(store.manifest)
     token = view.presentations[0].evidence_tokens["dapi"]["pre"]["xy"]
+    overlay = next(
+        item
+        for item in store.manifest.visual_presentations[0].overlays
+        if (item.channel, item.stage, item.view) == ("dapi", "pre", "xy")
+    )
+    path = Path(overlay.path)
 
-    path = resolver.resolve(token)
+    content = resolver.resolve(token)
 
+    assert isinstance(content, bytes)
+    assert content.startswith((b"II", b"MM"))
     assert re.fullmatch(r"(01|03|04|05)-dapi-pre-xy\.tif", path.name)
     with pytest.raises(ValueError, match="opaque evidence token"):
         resolver.resolve(str(path))
@@ -158,6 +203,47 @@ def test_evidence_thumbnail_is_rgb_and_preserves_aspect_ratio(tmp_path: Path) ->
 
     assert thumbnail.mode == "RGB"
     assert thumbnail.size == (6, 4)
+
+
+def test_evidence_resolver_rejects_symlinked_ancestor_without_target_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GUI image loading rejects an ancestor symlink before target bytes are read."""
+    store, _manifest = fresh_review_store(tmp_path)
+    presentation = store.manifest.visual_presentations[0]
+    overlay = presentation.overlays[0]
+    path = Path(overlay.path)
+    overlay_dir = path.parent
+    target_dir = tmp_path / "gui-target-overlays"
+    overlay_dir.rename(target_dir)
+    overlay_dir.symlink_to(target_dir, target_is_directory=True)
+    token = (
+        ReviewViewModel.from_store(store)
+        .presentations[0]
+        .evidence_tokens[overlay.channel][overlay.stage][overlay.view]
+    )
+    target_reads: list[Path] = []
+    real_open = io.open
+    real_read = review_evidence.os.read
+
+    def guarded_open(file: object, *args: object, **kwargs: object):
+        if not isinstance(file, int) and Path(file).resolve().is_relative_to(
+            target_dir.resolve()
+        ):
+            target_reads.append(Path(file))
+        return real_open(file, *args, **kwargs)
+
+    def guarded_read(descriptor: int, count: int) -> bytes:
+        opened = Path(review_evidence.os.readlink(f"/proc/self/fd/{descriptor}"))
+        if opened.is_absolute() and opened.is_relative_to(target_dir.resolve()):
+            target_reads.append(target_dir)
+        return real_read(descriptor, count)
+
+    monkeypatch.setattr(io, "open", guarded_open)
+    monkeypatch.setattr(review_evidence.os, "read", guarded_read)
+    with pytest.raises(ValueError, match="symlink"):
+        EvidenceResolver(store.manifest).load_image(token)
+    assert target_reads == []
 
 
 @pytest.mark.parametrize(
@@ -192,6 +278,54 @@ def test_navigation_persists_before_changing_case(
 
     assert fake_app.calls[:2] == ["persist", "render-next"]
     assert fake_app.store.state.assessment_history[opaque_id][-1].notes == "reviewed"
+
+
+def test_candidate_render_failure_restores_case_draft_and_visible_binding(
+    tmp_path: Path,
+) -> None:
+    """A failed candidate preload cannot bind old evidence to a new current ID."""
+    store, _manifest = fresh_review_store(tmp_path)
+    app = AtomicRenderApplication(store)
+    prior_id = app.current.opaque_id
+    app.select_status("accept", ("dapi-aligned",), "saved before navigation")
+    candidate_id = app._view_model.presentations[1].opaque_id
+    app.fail_opaque_id = candidate_id
+
+    with pytest.raises(ValueError, match="candidate render failure"):
+        app.next_case()
+
+    assert app.position == 0
+    assert app.current.opaque_id == prior_id
+    assert app.visible_opaque_id == prior_id
+    assert app.draft == ("accept", ("dapi-aligned",), "saved before navigation")
+    app.fail_opaque_id = None
+    app.select_status("exclude", ("z-misalignment",), "saved after failure")
+    app.persist_current()
+    assert store.state.assessment_history[prior_id][-1].status == "exclude"
+    assert candidate_id not in store.state.assessment_history
+
+
+def test_unchanged_save_preserves_event_count_and_current_adjudication(
+    tmp_path: Path,
+) -> None:
+    """Saving an unchanged form does not stale its case adjudication snapshot."""
+    store, manifest = fresh_review_store(tmp_path)
+    first = manifest.visual_presentations[0]
+    store.assess(first.opaque_id, "accept", ("dapi-aligned",), "unchanged")
+    case_key = manifest.presentation_cases[first.opaque_id]
+    store.adjudicate(case_key, "accept", ("dapi-aligned",), "current")
+    app = RecordingReviewApplication(store)
+    event_count = len(store.state.assessment_history[first.opaque_id])
+    adjudication = store.state.case_histories[first.case_token].adjudications[-1]
+
+    app.select_status("accept", ("dapi-aligned",), "unchanged")
+    app.persist_current()
+
+    assert len(store.state.assessment_history[first.opaque_id]) == event_count
+    assert (
+        store.state.assessment_history[first.opaque_id][-1].event_id
+        in adjudication.assessment_event_ids
+    )
 
 
 def test_incomplete_dirty_edit_blocks_navigation_and_close(
@@ -256,13 +390,61 @@ def test_reconciliation_blocks_incomplete_dirty_edit(tmp_path: Path) -> None:
     assert app.dirty
 
 
+def test_reconciliation_rows_show_current_and_stale_adjudication_details(
+    tmp_path: Path,
+) -> None:
+    """Technical and repeat rows expose controlled adjudication state and reasons."""
+    store, manifest = fresh_review_store(tmp_path)
+    technical = next(item for item in manifest.case_revisions if not item.overlays)
+    store.adjudicate(
+        technical.case_key,
+        "exclude",
+        ("invalid-affine-reflection",),
+        "hidden note",
+    )
+    repeated = next(
+        item for item in manifest.visual_presentations if item.repeat_of is not None
+    )
+    assert repeated.repeat_of is not None
+    store.assess(repeated.repeat_of, "accept", ("dapi-aligned",), "base")
+    store.assess(repeated.opaque_id, "exclude", ("z-misalignment",), "repeat")
+    repeated_case = manifest.presentation_cases[repeated.opaque_id]
+    store.adjudicate(repeated_case, "exclude", ("z-misalignment",), "hidden")
+    application = object.__new__(ReviewApplication)
+    application._store = store
+    current_tree = RecordingTree()
+
+    application._populate_reconciliation(current_tree)
+
+    technical_text = " | ".join(current_tree.rows[technical.case_token])
+    repeat_text = " | ".join(current_tree.rows[repeated.case_token])
+    assert "current" in technical_text
+    assert "exclude" in technical_text
+    assert "invalid-affine-reflection" in technical_text
+    assert "hidden note" not in technical_text
+    assert "current" in repeat_text
+    assert "z-misalignment" in repeat_text
+
+    store.assess(repeated.opaque_id, "accept", ("dapi-aligned",), "changed")
+    stale_tree = RecordingTree()
+    application._populate_reconciliation(stale_tree)
+    stale_text = " | ".join(stale_tree.rows[repeated.case_token])
+    assert "stale" in stale_text
+    assert "exclude" in stale_text
+    assert "z-misalignment" in stale_text
+
+
 def test_finalization_bundle_rolls_back_every_layer_after_report_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A post-CSV report failure restores exact durable and in-memory state."""
     store, manifest = completed_review_store(tmp_path)
     review_dir = store.review_dir
-    finalize_decisions(store, manifest, review_dir)
+    review_exports._atomic_csv(
+        review_dir / "qc-decisions.csv",
+        review_exports.FINAL_COLUMNS,
+        review_exports._final_rows(store.state, store.manifest),
+    )
     (review_dir / "qc-decisions.previous.csv").write_bytes(b"prior decision backup\n")
     (review_dir / "review-record.pdf").write_bytes(b"prior PDF\n")
     (review_dir / "review-summary.md").write_text("prior Markdown\n", encoding="utf-8")
@@ -308,6 +490,69 @@ def test_finalization_bundle_publishes_current_outputs_and_export_history(
         store.state.export_history[-1].sha256
         == hashlib.sha256(decisions.read_bytes()).hexdigest()
     )
+    assert (
+        store.state.export_history[-1].pdf_sha256
+        == hashlib.sha256(pdf.read_bytes()).hexdigest()
+    )
+    assert (
+        store.state.export_history[-1].summary_sha256
+        == hashlib.sha256(summary.read_bytes()).hexdigest()
+    )
+    assert not (store.review_dir / "pending-finalization.json").exists()
+
+
+@pytest.mark.parametrize("partial_report", (False, True))
+def test_reopen_recovers_pending_finalization_after_uncaught_process_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    partial_report: bool,
+) -> None:
+    """A durable journal restores the prior bundle after two crash phases."""
+    store, manifest = completed_review_store(tmp_path)
+    review_dir = store.review_dir
+    prior_state = store.state
+    prior_files = _bundle_bytes(review_dir)
+
+    def crash_report(
+        _state: object,
+        _manifest: object,
+        pdf_path: Path,
+        summary_path: Path,
+    ) -> None:
+        if partial_report:
+            pdf_path.write_bytes(b"%PDF partial crash output")
+            summary_path.write_text("partial crash output\n", encoding="utf-8")
+        raise SystemExit("injected node/process termination")
+
+    monkeypatch.setattr(review_report, "write_review_report", crash_report)
+    with pytest.raises(SystemExit, match="node/process termination"):
+        review_gui.finalize_review_bundle(store, manifest)
+
+    assert (review_dir / "pending-finalization.json").exists()
+    assert store.state != prior_state
+    reopened = ReviewStore.open(
+        review_dir,
+        manifest,
+        "Reviewer",
+        now=store._now,
+    )
+    assert reopened.state == prior_state
+    assert _bundle_bytes(review_dir) == prior_files
+    assert not (review_dir / "pending-finalization.json").exists()
+
+
+def test_finalized_controller_disables_every_mutating_route(tmp_path: Path) -> None:
+    """A finalized GUI remains viewable but exposes no assessment mutation state."""
+    store, manifest = completed_review_store(tmp_path)
+    finalize_decisions(store, manifest, store.review_dir)
+    controller = ReviewController(store, ReviewViewModel.from_store(store))
+
+    assert controller.finalized
+    assert not controller.mutation_controls_enabled
+    with pytest.raises(ValueError, match="finalized"):
+        controller.select_status("accept", ("dapi-aligned",), "late edit")
+    with pytest.raises(ValueError, match="finalized"):
+        controller.prepare_reconciliation()
 
 
 def test_validate_only_creates_and_resumes_without_tk(

@@ -10,9 +10,8 @@ and navigation behavior independently testable.
 from __future__ import annotations
 
 import hashlib
-import os
+import io
 import tkinter as tk
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -20,7 +19,7 @@ from typing import Literal, cast
 
 from PIL import Image, ImageTk
 
-from cyclic_stability.review_inventory import OVERLAY_NAME
+from cyclic_stability.review_inventory import OVERLAY_NAME, read_overlay_bytes
 from cyclic_stability.review_models import (
     REASON_TOKENS,
     AssessmentStatus,
@@ -31,6 +30,12 @@ from cyclic_stability.review_models import (
     ReviewState,
 )
 from cyclic_stability.review_store import ReviewStore
+from cyclic_stability.review_transaction import (
+    PendingFinalization,
+    begin_pending_finalization,
+    complete_pending_finalization,
+    restore_pending_finalization,
+)
 
 _CHANNELS = ("dapi", "tubulin")
 _STAGES = ("pre", "affine", "nonlinear")
@@ -66,17 +71,6 @@ _STATUS_KEYS: dict[str, AssessmentStatus] = {
     "e": "exclude",
     "u": "needs-adjudication",
 }
-_FINALIZATION_BUNDLE_NAMES = (
-    "review-state.json",
-    "review-state.previous.json",
-    "remediation-requests.csv",
-    "consistency-report.csv",
-    "qc-decisions.csv",
-    "qc-decisions.previous.csv",
-    "review-record.pdf",
-    "review-summary.md",
-)
-
 KeyboardAction = tuple[Literal["status", "navigate", "reason"], str]
 EvidenceTokenGrid = dict[str, dict[str, dict[str, str]]]
 
@@ -191,8 +185,7 @@ class _ResolvedEvidence:
 class _FinalizationCheckpoint:
     state: ReviewState
     active_manifest: ReviewManifest
-    files: dict[str, bytes | None]
-    staged_names: frozenset[str]
+    pending: PendingFinalization
 
 
 def _evidence_token(presentation: Presentation, overlay: OverlayEvidence) -> str:
@@ -228,8 +221,30 @@ class EvidenceResolver:
                     Path(overlay.identity.path).name, overlay
                 )
 
-    def resolve(self, token: str) -> Path:
-        """Return a revalidated allowlisted path for one opaque token."""
+    def resolve(self, token: str) -> bytes:
+        """Return revalidated bytes for one opaque token without exposing a path."""
+        record = self._record(token)
+        return read_overlay_bytes(record.overlay)
+
+    def load_image(self, token: str) -> Image.Image:
+        """Load one revalidated RGB TIFF as an independent Pillow image."""
+        try:
+            with Image.open(io.BytesIO(self.resolve(token))) as source:
+                source.load()
+                image = source.copy()
+        except (OSError, SyntaxError) as error:
+            raise ValueError("review evidence is not a readable image") from error
+        if (
+            image.mode != "RGB"
+            or image.getbands() != ("R", "G", "B")
+            or image.width < 1
+            or image.height < 1
+        ):
+            raise ValueError("review evidence must be a nonempty RGB image")
+        return image
+
+    def _record(self, token: str) -> _ResolvedEvidence:
+        """Return one role-checked manifest record without exposing its path."""
         record = self._evidence.get(token)
         if record is None:
             raise ValueError("unknown opaque evidence token")
@@ -244,32 +259,7 @@ class EvidenceResolver:
             or match.group(4) != overlay.view
         ):
             raise ValueError("review evidence basename is no longer allowlisted")
-        try:
-            with path.open("rb") as stream:
-                digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        except OSError as error:
-            raise ValueError("review evidence is unavailable") from error
-        if digest != overlay.identity.sha256:
-            raise ValueError("review evidence identity changed")
-        return path
-
-    def load_image(self, token: str) -> Image.Image:
-        """Load one revalidated RGB TIFF as an independent Pillow image."""
-        path = self.resolve(token)
-        try:
-            with Image.open(path) as source:
-                source.load()
-                image = source.copy()
-        except (OSError, SyntaxError) as error:
-            raise ValueError("review evidence is not a readable image") from error
-        if (
-            image.mode != "RGB"
-            or image.getbands() != ("R", "G", "B")
-            or image.width < 1
-            or image.height < 1
-        ):
-            raise ValueError("review evidence must be a nonempty RGB image")
-        return image
+        return record
 
     def load_thumbnail(self, token: str, maximum_size: tuple[int, int]) -> Image.Image:
         """Return an aspect-preserving thumbnail of one revalidated RGB TIFF."""
@@ -297,43 +287,12 @@ def keyboard_action(key: str) -> KeyboardAction | None:
     return None
 
 
-def _fsync_directory(directory: Path) -> None:
-    descriptor = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _checkpoint_finalization(store: ReviewStore) -> _FinalizationCheckpoint:
-    review_dir = store.review_dir
     return _FinalizationCheckpoint(
         store.state,
         store.manifest,
-        {
-            name: path.read_bytes() if (path := review_dir / name).exists() else None
-            for name in _FINALIZATION_BUNDLE_NAMES
-        },
-        frozenset(path.name for path in review_dir.glob(".*tmp")),
+        begin_pending_finalization(store.review_dir),
     )
-
-
-def _restore_file(path: Path, content: bytes | None) -> None:
-    if content is None:
-        if path.exists():
-            path.unlink()
-            _fsync_directory(path.parent)
-        return
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.rollback.tmp")
-    try:
-        with temporary.open("wb") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _restore_finalization(
@@ -341,12 +300,7 @@ def _restore_finalization(
 ) -> None:
     review_dir = store.review_dir
     try:
-        for name, content in checkpoint.files.items():
-            _restore_file(review_dir / name, content)
-        for path in review_dir.glob(".*tmp"):
-            if path.name not in checkpoint.staged_names:
-                path.unlink()
-        _fsync_directory(review_dir)
+        restore_pending_finalization(review_dir, checkpoint.pending)
     finally:
         # The durable snapshot is authoritative, but the live GUI must observe
         # the same exact immutable objects after rollback without a reopen.
@@ -413,6 +367,15 @@ def finalize_review_bundle(
             store.review_dir / "review-record.pdf",
             store.review_dir / "review-summary.md",
         )
+        store._bind_final_reports(
+            hashlib.sha256(pdf.read_bytes()).hexdigest(),
+            hashlib.sha256(summary.read_bytes()).hexdigest(),
+        )
+        store.validate_current_bindings(manifest)
+        from cyclic_stability.review_exports import validate_operational_exports
+
+        validate_operational_exports(store.state, manifest, store.review_dir)
+        complete_pending_finalization(store.review_dir)
     except Exception:
         _restore_finalization(store, checkpoint)
         raise
@@ -479,6 +442,16 @@ class ReviewController:
         """Return whether every active visual presentation has an assessment."""
         return self.completed_count == len(self._view_model.presentations)
 
+    @property
+    def finalized(self) -> bool:
+        """Return whether the durable store has entered its terminal state."""
+        return self._store.finalized
+
+    @property
+    def mutation_controls_enabled(self) -> bool:
+        """Return the state used by GUI assessment and reconciliation controls."""
+        return not self.finalized
+
     def select_status(
         self,
         status: AssessmentStatus,
@@ -486,6 +459,8 @@ class ReviewController:
         notes: str,
     ) -> None:
         """Replace the current draft and mark it dirty."""
+        if self.finalized:
+            raise ValueError("review is finalized and immutable")
         if status not in _STATUSES:
             raise ValueError("assessment status is not allowlisted")
         if not isinstance(notes, str):
@@ -499,6 +474,8 @@ class ReviewController:
 
     def toggle_reason(self, reason: str) -> None:
         """Toggle one standardized reason in the current draft."""
+        if self.finalized:
+            raise ValueError("review is finalized and immutable")
         if reason not in REASON_TOKENS:
             raise ValueError("assessment reason is not allowlisted")
         selected = set(self._reasons)
@@ -511,6 +488,8 @@ class ReviewController:
 
     def set_notes(self, notes: str) -> None:
         """Replace current notes and mark the draft dirty."""
+        if self.finalized:
+            raise ValueError("review is finalized and immutable")
         if not isinstance(notes, str):
             raise TypeError("assessment notes must be a string")
         self._draft_notes = notes
@@ -526,8 +505,16 @@ class ReviewController:
             raise IncompleteAssessmentError(
                 "select at least one structured reason before leaving this case"
             )
+        current = self.current
+        if (
+            current.status == self._status
+            and current.reasons == self._reasons
+            and current.notes == self._draft_notes
+        ):
+            self._dirty = False
+            return
         self._store.assess(
-            self.current.opaque_id,
+            current.opaque_id,
             self._status,
             self._reasons,
             self._draft_notes,
@@ -539,18 +526,36 @@ class ReviewController:
     def next_case(self) -> None:
         """Persist first, then advance and request a render."""
         self.persist_current()
+        prior_position = self._position
+        prior_draft = self.draft
+        prior_dirty = self._dirty
         if self._position < len(self._view_model.presentations) - 1:
             self._position += 1
             self._load_current_draft()
-        self.render_current("next")
+        try:
+            self.render_current("next")
+        except Exception:
+            self._position = prior_position
+            self._status, self._reasons, self._draft_notes = prior_draft
+            self._dirty = prior_dirty
+            raise
 
     def previous_case(self) -> None:
         """Persist first, then move backward and request a render."""
         self.persist_current()
+        prior_position = self._position
+        prior_draft = self.draft
+        prior_dirty = self._dirty
         if self._position > 0:
             self._position -= 1
             self._load_current_draft()
-        self.render_current("previous")
+        try:
+            self.render_current("previous")
+        except Exception:
+            self._position = prior_position
+            self._status, self._reasons, self._draft_notes = prior_draft
+            self._dirty = prior_dirty
+            raise
 
     def request_close(self) -> bool:
         """Persist a valid dirty draft before permitting application shutdown."""
@@ -559,6 +564,8 @@ class ReviewController:
 
     def prepare_reconciliation(self) -> None:
         """Persist the current draft before checking visual-pass completeness."""
+        if self.finalized:
+            raise ValueError("review is finalized and immutable")
         self.persist_current()
         if not self.all_assessed:
             raise IncompleteAssessmentError(
@@ -694,22 +701,27 @@ class ReviewApplication(ReviewController):
 
         controls = ttk.LabelFrame(outer, text="Provisional assessment", padding=8)
         controls.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self._assessment_controls: list[ttk.Widget] = []
         for column, status in enumerate(_STATUSES):
-            ttk.Radiobutton(
+            button = ttk.Radiobutton(
                 controls,
                 text=f"{_STATUS_LABELS[status]} ({'AREU'[column]})",
                 value=status,
                 variable=self._status_variable,
                 command=self._form_changed,
-            ).grid(row=0, column=column, padx=4, sticky="w")
+            )
+            button.grid(row=0, column=column, padx=4, sticky="w")
+            self._assessment_controls.append(button)
         for index, reason in enumerate(_COMMON_REASONS):
             key = "1234567890"[index]
-            ttk.Checkbutton(
+            button = ttk.Checkbutton(
                 controls,
                 text=f"{key}: {reason}",
                 variable=self._reason_variables[reason],
                 command=self._form_changed,
-            ).grid(row=1 + index // 5, column=index % 5, sticky="w", padx=4)
+            )
+            button.grid(row=1 + index // 5, column=index % 5, sticky="w", padx=4)
+            self._assessment_controls.append(button)
         ttk.Label(controls, text="Notes (unblinded provenance only):").grid(
             row=3, column=0, sticky="nw", pady=(6, 0)
         )
@@ -721,7 +733,8 @@ class ReviewApplication(ReviewController):
         actions = ttk.Frame(outer)
         actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(actions, text="Previous", command=self._previous).pack(side="left")
-        ttk.Button(actions, text="Save", command=self._save).pack(side="left", padx=5)
+        self._save_button = ttk.Button(actions, text="Save", command=self._save)
+        self._save_button.pack(side="left", padx=5)
         ttk.Button(actions, text="Next", command=self._next).pack(side="left")
         self._reconcile_button = ttk.Button(
             actions, text="Reconcile / finalize", command=self._open_reconciliation
@@ -744,6 +757,7 @@ class ReviewApplication(ReviewController):
                     )
         self._rendering = True
         try:
+            self._notes_widget.configure(state="normal")
             self._opaque_variable.set(
                 f"{current.opaque_id}  •  {current.revision_label}"
             )
@@ -761,13 +775,24 @@ class ReviewApplication(ReviewController):
                 self._image_labels[descriptor].configure(image=photo)
             self._photo_images = loaded
             self._save_variable.set("Unsaved" if self.dirty else "Saved")
+            control_state = "normal" if self.mutation_controls_enabled else "disabled"
+            for widget in self._assessment_controls:
+                widget.configure(state=control_state)
+            self._notes_widget.configure(state=control_state)
+            self._save_button.configure(state=control_state)
             self._reconcile_button.configure(
-                state="normal" if self.all_assessed else "disabled"
+                state=(
+                    "normal"
+                    if self.all_assessed and self.mutation_controls_enabled
+                    else "disabled"
+                )
             )
         finally:
             self._rendering = False
 
     def _sync_draft(self) -> None:
+        if self.finalized:
+            raise ValueError("review is finalized and immutable")
         status_text = self._status_variable.get()
         if status_text not in _STATUSES:
             self._status = None
@@ -790,7 +815,7 @@ class ReviewApplication(ReviewController):
         )
 
     def _form_changed(self) -> None:
-        if self._rendering:
+        if self._rendering or self.finalized:
             return
         self._sync_draft()
         self._save_variable.set("Unsaved")
@@ -856,6 +881,8 @@ class ReviewApplication(ReviewController):
         if action is None:
             return None
         kind, value = action
+        if not self.mutation_controls_enabled and kind in {"status", "reason"}:
+            return "break"
         if kind == "status":
             self._status_variable.set(value)
             self._form_changed()
@@ -945,6 +972,7 @@ class ReviewApplication(ReviewController):
             "seam",
             "interior",
             "provisional",
+            "adjudication",
             "repeat",
         )
         tree = ttk.Treeview(window, columns=columns, show="headings")
@@ -956,6 +984,7 @@ class ReviewApplication(ReviewController):
                 "Seam summary",
                 "Interior summary",
                 "Visual state(s)",
+                "Adjudication",
                 "Repeat agreement",
             ),
             strict=True,
@@ -1046,6 +1075,35 @@ class ReviewApplication(ReviewController):
                     )
                 )
             )
+            assessment_event_ids = tuple(
+                assessment_history[-1].event_id
+                for item in presentations
+                if (
+                    assessment_history := self.store.state.assessment_history.get(
+                        item.opaque_id, ()
+                    )
+                )
+            )
+            latest_adjudication = next(
+                (
+                    item
+                    for item in reversed(history.adjudications)
+                    if item.revision_id == revision.revision_id
+                ),
+                None,
+            )
+            if latest_adjudication is None:
+                adjudication = "not-adjudicated"
+            else:
+                adjudication_state = (
+                    "current"
+                    if latest_adjudication.assessment_event_ids == assessment_event_ids
+                    else "stale"
+                )
+                adjudication = (
+                    f"{adjudication_state}: {latest_adjudication.status} "
+                    f"({';'.join(latest_adjudication.reasons)})"
+                )
             repeated = tuple(
                 item for item in presentations if item.repeat_of is not None
             )
@@ -1071,7 +1129,8 @@ class ReviewApplication(ReviewController):
                     automated,
                     flags.get("seam", "not available"),
                     flags.get("interior", "not available"),
-                    ", ".join(statuses) if statuses else "requires adjudication",
+                    ", ".join(statuses) if statuses else "no visual assessment",
+                    adjudication,
                     ", ".join(agreements) if agreements else "not repeated",
                 ),
             )
@@ -1122,6 +1181,7 @@ class ReviewApplication(ReviewController):
         except (ValueError, OSError) as error:
             messagebox.showerror("Finalization failed", str(error), parent=parent)
             return
+        self.render_current()
         messagebox.showinfo(
             "Review finalized",
             f"Wrote {decisions.name}, {pdf.name}, and {summary.name}.",

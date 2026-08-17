@@ -29,6 +29,7 @@ from cyclic_stability.review_models import (
     ReviewState,
     ReviewStateBindingError,
 )
+from cyclic_stability.review_transaction import restore_pending_finalization
 
 _CURRENT_NAME = "review-state.json"
 _PREVIOUS_NAME = "review-state.previous.json"
@@ -198,7 +199,13 @@ class ReviewStore:
             raise ValueError("repository identity changed since review creation")
         if state.active_manifest(manifest) != self._manifest:
             raise ValueError("active review manifest does not match persisted state")
+        self._validate_finalized_files(state)
         return state
+
+    @property
+    def finalized(self) -> bool:
+        """Return whether the one terminal export record has been committed."""
+        return bool(self._state.export_history)
 
     @classmethod
     def create(
@@ -258,6 +265,7 @@ class ReviewStore:
         """Open a strictly validated state, recovering only from its last snapshot."""
         if not isinstance(reviewer, str) or not reviewer:
             raise ValueError("reviewer must be a nonempty string")
+        restore_pending_finalization(review_dir)
         current_path = review_dir / _CURRENT_NAME
         previous_path = review_dir / _PREVIOUS_NAME
         current_state, current_error = _load_state(current_path, manifest)
@@ -273,7 +281,21 @@ class ReviewStore:
             state = previous_state
             recovered = True
         elif current_error is None and previous_error is None:
-            raise ValueError("review state is missing")
+            manifest_path = review_dir / _MANIFEST_NAME
+            if not manifest_path.exists():
+                raise ValueError("review state is missing")
+            entries = {path.name for path in review_dir.iterdir()}
+            if entries != {_MANIFEST_NAME}:
+                raise ValueError(
+                    "manifest-only review directory contains conflicting content"
+                )
+            try:
+                persisted = ReviewManifest.from_dict(_read_payload(manifest_path))
+            except (TypeError, ValueError) as error:
+                raise ValueError("randomization manifest is malformed") from error
+            if persisted != manifest:
+                raise ValueError("reviewed evidence identity changed")
+            return cls.create(review_dir, manifest, reviewer, now=now)
         else:
             raise ValueError("review state is malformed")
         if state.reviewer != reviewer:
@@ -293,6 +315,7 @@ class ReviewStore:
             )
             _atomic_pretty_json(current_path, state.to_dict())
         store = cls(review_dir, manifest, reviewer, now, state)
+        store._validate_finalized_files(state)
         store._write_operational_exports()
         return store
 
@@ -304,6 +327,7 @@ class ReviewStore:
         notes: str,
     ) -> ReviewState:
         """Append and durably persist one blinded assessment for an opaque ID."""
+        self._require_mutable()
         presentation = self._presentations().get(opaque_id)
         if presentation is None:
             raise ValueError("assessment must use a known opaque presentation ID")
@@ -331,6 +355,7 @@ class ReviewStore:
         notes: str,
     ) -> ReviewState:
         """Append a final reconciliation event after at least one visual assessment."""
+        self._require_mutable()
         if not isinstance(case_key, CaseKey):
             raise TypeError("adjudication requires a CaseKey")
         case_token = next(
@@ -398,6 +423,7 @@ class ReviewStore:
         presentations: tuple[Presentation, ...],
     ) -> ReviewState:
         """Atomically append validated remediation revisions and presentations."""
+        self._require_mutable()
         if not revisions or len(revisions) != len(presentations):
             raise ValueError("revision attachment must contain paired revisions")
         ordered = tuple(
@@ -472,12 +498,64 @@ class ReviewStore:
 
     def record_export(self, sha256: str) -> ReviewState:
         """Append one validated final-export identity and persist it durably."""
-        record = ExportRecord(sha256, _utc_now(self._now))
+        self._require_mutable()
+        record = ExportRecord(
+            sha256,
+            self._state.finalizable_state_sha256,
+            None,
+            None,
+            _utc_now(self._now),
+        )
         state = replace(
             self._state, export_history=self._state.export_history + (record,)
         )
         self._persist(state)
         return state
+
+    def _bind_final_reports(self, pdf_sha256: str, summary_sha256: str) -> ReviewState:
+        """Bind both validated archival files to the sole terminal export record."""
+        if len(self._state.export_history) != 1:
+            raise ValueError("final decision export must precede report binding")
+        record = self._state.export_history[0]
+        if record.pdf_sha256 is not None or record.summary_sha256 is not None:
+            raise ValueError("final reports are already bound")
+        bound = replace(
+            record,
+            pdf_sha256=pdf_sha256,
+            summary_sha256=summary_sha256,
+        )
+        state = replace(self._state, export_history=(bound,))
+        self._persist(state)
+        return state
+
+    def _require_mutable(self) -> None:
+        """Reject every public state transition after terminal finalization."""
+        if self.finalized:
+            raise ValueError("review is finalized and immutable")
+
+    def _validate_finalized_files(self, state: ReviewState) -> None:
+        """Verify terminal state against every recorded final bundle digest."""
+        if not state.export_history:
+            return
+        record = state.export_history[0]
+        decisions = self._review_dir / "qc-decisions.csv"
+        if (
+            not decisions.is_file()
+            or hashlib.sha256(decisions.read_bytes()).hexdigest() != record.sha256
+        ):
+            raise ValueError("final decision export does not match review state")
+        if record.pdf_sha256 is None:
+            return
+        outputs = (
+            (self._review_dir / "review-record.pdf", record.pdf_sha256),
+            (self._review_dir / "review-summary.md", record.summary_sha256),
+        )
+        if any(
+            not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != expected
+            for path, expected in outputs
+        ):
+            raise ValueError("final report bundle does not match review state")
 
     def _persist(self, state: ReviewState) -> None:
         """Write the backup before promotion and update memory only after success."""

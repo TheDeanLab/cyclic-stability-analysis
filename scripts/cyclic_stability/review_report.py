@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import os
+import textwrap
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -17,8 +19,8 @@ from cyclic_stability.review_exports import (
     _consistency_rows,
     _final_rows,
     _latest_assessment,
-    _validate_current_evidence,
 )
+from cyclic_stability.review_inventory import read_overlay_bytes
 from cyclic_stability.review_models import Presentation, ReviewManifest, ReviewState
 
 _CHANNELS = ("dapi", "tubulin")
@@ -109,7 +111,9 @@ def _render_visual_page(
         for stage_index, stage in enumerate(_STAGES):
             for view_index, view in enumerate(_VIEWS):
                 overlay = overlays[(channel, stage, view)]
-                images.append(np.asarray(tifffile.imread(Path(overlay.path))))
+                images.append(
+                    np.asarray(tifffile.imread(io.BytesIO(read_overlay_bytes(overlay))))
+                )
         axis = axes[channel_index]
         mosaic = _overlay_mosaic(images)
         axis.imshow(mosaic)
@@ -188,6 +192,97 @@ def _render_technical_summary(
     axis.text(0.03, 0.97, "\n".join(lines), va="top", family="monospace", fontsize=10)
     pdf.savefig(figure)
     plt.close(figure)
+    wrapped: list[str] = []
+    for line in _technical_reconciliation_lines(state, active):
+        wrapped.extend(
+            textwrap.wrap(
+                line,
+                width=145,
+                subsequent_indent="  ",
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            or ("",)
+        )
+    for page_number, start in enumerate(range(0, len(wrapped), 34), start=1):
+        figure, axis = plt.subplots(figsize=(11, 8.5))
+        axis.set_axis_off()
+        page = [
+            f"Target-blind per-case technical reconciliation — page {page_number}",
+            "",
+            *wrapped[start : start + 34],
+        ]
+        axis.text(
+            0.02,
+            0.98,
+            "\n".join(page),
+            va="top",
+            family="monospace",
+            fontsize=6.5,
+        )
+        pdf.savefig(figure)
+        plt.close(figure)
+
+
+def _technical_reconciliation_lines(
+    state: ReviewState, active: ReviewManifest
+) -> tuple[str, ...]:
+    """Return one path-free, note-free technical row per active case revision."""
+    lines: list[str] = []
+    for case_token, history in sorted(state.case_histories.items()):
+        revision = history.revisions[-1]
+        presentations = tuple(
+            item
+            for item in active.visual_presentations
+            if item.case_token == case_token
+            and item.revision_id == revision.revision_id
+        )
+        assessment_event_ids = tuple(
+            assessment.event_id
+            for presentation in presentations
+            if (assessment := _latest_assessment(state, presentation.opaque_id))
+            is not None
+        )
+        adjudication = next(
+            (
+                item
+                for item in reversed(history.adjudications)
+                if item.revision_id == revision.revision_id
+            ),
+            None,
+        )
+        if adjudication is None:
+            adjudication_state = "not-adjudicated"
+            adjudicated_decision = "none"
+            adjudicated_reasons = "none"
+        else:
+            adjudication_state = (
+                "current"
+                if adjudication.assessment_event_ids == assessment_event_ids
+                else "stale"
+            )
+            adjudicated_decision = adjudication.status
+            adjudicated_reasons = ";".join(adjudication.reasons)
+        flags = dict(revision.deformation_flags)
+        lines.append(
+            " | ".join(
+                (
+                    f"case_token={case_token}",
+                    "presentations="
+                    + (",".join(item.opaque_id for item in presentations) or "none"),
+                    f"revision={revision.revision_id}",
+                    f"automated_valid={revision.automated_valid}",
+                    f"automated_reason={revision.automated_reason or 'none'}",
+                    f"whole={flags.get('whole', 'not-available')}",
+                    f"seam={flags.get('seam', 'not-available')}",
+                    f"interior={flags.get('interior', 'not-available')}",
+                    f"adjudication={adjudication_state}",
+                    f"adjudicated_decision={adjudicated_decision}",
+                    f"adjudicated_reasons={adjudicated_reasons}",
+                )
+            )
+        )
+    return tuple(lines)
 
 
 def _unblinded_provenance_lines(
@@ -213,6 +308,29 @@ def _unblinded_provenance_lines(
                 )
             )
         )
+    lines.extend(
+        (
+            "",
+            "Adjudication notes",
+            "cohort | cell | round | revision | decision | notes",
+        )
+    )
+    for history in sorted(
+        state.case_histories.values(), key=lambda item: item.case_key
+    ):
+        for adjudication in history.adjudications:
+            lines.append(
+                " | ".join(
+                    (
+                        history.case_key.cohort,
+                        history.case_key.cell_id,
+                        str(history.case_key.acquisition_round),
+                        adjudication.revision_id,
+                        adjudication.status,
+                        adjudication.notes,
+                    )
+                )
+            )
     return tuple(lines)
 
 
@@ -220,18 +338,27 @@ def _render_unblinded_provenance(
     pdf: PdfPages, state: ReviewState, active: ReviewManifest
 ) -> None:
     """Render the sole biological mapping, after every blinded PDF page."""
-    figure, axis = plt.subplots(figsize=(11, 8.5))
-    axis.set_axis_off()
-    axis.text(
-        0.03,
-        0.97,
-        "\n".join(_unblinded_provenance_lines(state, active)),
-        va="top",
-        family="monospace",
-        fontsize=8,
-    )
-    pdf.savefig(figure)
-    plt.close(figure)
+    lines = _unblinded_provenance_lines(state, active)
+    for page_number, start in enumerate(range(0, len(lines), 42), start=1):
+        figure, axis = plt.subplots(figsize=(11, 8.5))
+        axis.set_axis_off()
+        page = list(lines[start : start + 42])
+        if start:
+            page = [
+                f"UNBLINDED PROVENANCE APPENDIX — page {page_number}",
+                "",
+                *page,
+            ]
+        axis.text(
+            0.03,
+            0.97,
+            "\n".join(page),
+            va="top",
+            family="monospace",
+            fontsize=8,
+        )
+        pdf.savefig(figure)
+        plt.close(figure)
 
 
 def _render_pdf(
@@ -300,6 +427,8 @@ def _summary_text(
         )
         for row in consistency
     )
+    lines.extend(("", "## Target-blind technical reconciliation", ""))
+    lines.extend(f"- {line}" for line in _technical_reconciliation_lines(state, active))
     lines.extend(("", "## Unblinded provenance appendix", ""))
     lines.extend(("### Presentation provenance", ""))
     lines.extend(f"- {line}" for line in _unblinded_provenance_lines(state, active)[2:])
@@ -401,7 +530,6 @@ def write_review_report(
     )
     validated = ReviewState.from_dict(state.to_dict(), manifest)
     active = validated.active_manifest(manifest)
-    _validate_current_evidence(active)
     final_rows = _final_rows(validated, active)
     consistency = _consistency_rows(validated, active)
 
