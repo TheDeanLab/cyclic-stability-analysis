@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from cyclic_stability.review_models import (
     Adjudication,
@@ -24,11 +24,19 @@ from cyclic_stability.review_models import (
     RepositoryIdentity,
     ReviewManifest,
     ReviewState,
+    ReviewStateBindingError,
 )
 
 _CURRENT_NAME = "review-state.json"
 _PREVIOUS_NAME = "review-state.previous.json"
 _MANIFEST_NAME = "randomization-manifest.json"
+
+
+class _Digest(Protocol):
+    """Minimal hash interface used to construct repository identity bytes."""
+
+    def update(self, data: bytes, /) -> None:
+        """Append bytes to the digest input."""
 
 
 def _pretty_json_bytes(payload: Mapping[str, object]) -> bytes:
@@ -58,7 +66,7 @@ def _atomic_pretty_json(path: Path, payload: Mapping[str, object]) -> None:
 
 
 def _repository_identity() -> RepositoryIdentity:
-    """Return the current commit plus the exact binary diff from that commit."""
+    """Return commit plus tracked-diff and untracked-content dirty evidence."""
     repository = Path(__file__).resolve().parents[2]
     try:
         commit = (
@@ -77,13 +85,43 @@ def _repository_identity() -> RepositoryIdentity:
             check=True,
             capture_output=True,
         ).stdout
+        untracked_paths = tuple(
+            sorted(
+                path
+                for path in subprocess.run(
+                    ("git", "ls-files", "--others", "--exclude-standard", "-z"),
+                    cwd=repository,
+                    check=True,
+                    capture_output=True,
+                ).stdout.split(b"\0")
+                if path
+            )
+        )
     except (OSError, subprocess.CalledProcessError, UnicodeDecodeError) as error:
         raise ValueError("could not determine repository identity") from error
+    digest = hashlib.sha256()
+    _digest_component(digest, b"tracked-diff", diff)
+    for relative_path in untracked_paths:
+        try:
+            content = (repository / os.fsdecode(relative_path)).read_bytes()
+        except OSError as error:
+            raise ValueError("could not read untracked repository content") from error
+        _digest_component(digest, b"untracked-path", relative_path)
+        _digest_component(digest, b"untracked-content", content)
+    dirty = bool(diff or untracked_paths)
     return RepositoryIdentity(
         commit,
-        bool(diff),
-        hashlib.sha256(diff).hexdigest() if diff else None,
+        dirty,
+        digest.hexdigest() if dirty else None,
     )
+
+
+def _digest_component(digest: _Digest, label: bytes, value: bytes) -> None:
+    """Append one length-delimited dirty-tree identity component."""
+    digest.update(label)
+    digest.update(b"\0")
+    digest.update(len(value).to_bytes(8, byteorder="big"))
+    digest.update(value)
 
 
 def _read_payload(path: Path) -> Mapping[str, object]:
@@ -177,6 +215,10 @@ class ReviewStore:
         current_state, current_error = _load_state(current_path, manifest)
         previous_state, previous_error = _load_state(previous_path, manifest)
         recovered = False
+        if isinstance(current_error, ReviewStateBindingError):
+            raise current_error
+        if isinstance(previous_error, ReviewStateBindingError):
+            raise previous_error
         if current_state is not None:
             state = current_state
         elif previous_state is not None:
@@ -184,14 +226,6 @@ class ReviewStore:
             recovered = True
         elif current_error is None and previous_error is None:
             raise ValueError("review state is missing")
-        elif current_error is not None and str(current_error) == (
-            "reviewed evidence identity changed"
-        ):
-            raise current_error
-        elif previous_error is not None and str(previous_error) == (
-            "reviewed evidence identity changed"
-        ):
-            raise previous_error
         else:
             raise ValueError("review state is malformed")
         if state.reviewer != reviewer:
@@ -320,11 +354,11 @@ def _load_state(
         return None, None
     try:
         return ReviewState.from_dict(_read_payload(path), manifest), None
+    except ReviewStateBindingError as error:
+        return None, error
     except TypeError:
         return None, ValueError("review state is malformed")
-    except ValueError as error:
-        if str(error) == "reviewed evidence identity changed":
-            return None, error
+    except ValueError:
         return None, ValueError("review state is malformed")
 
 

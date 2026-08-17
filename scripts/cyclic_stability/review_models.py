@@ -54,6 +54,10 @@ REASON_TOKENS = frozenset(
 )
 
 
+class ReviewStateBindingError(ValueError):
+    """A structurally valid state conflicts with immutable review bindings."""
+
+
 def _mapping(payload: object, keys: frozenset[str], name: str) -> Mapping[str, object]:
     if not isinstance(payload, Mapping) or set(payload) != keys:
         raise ValueError(f"{name} has an invalid schema")
@@ -878,31 +882,47 @@ class ReviewState:
 
     def _validate_manifest(self, manifest: ReviewManifest) -> None:
         if self.manifest_identity != manifest.manifest_identity:
-            raise ValueError("reviewed evidence identity changed")
+            raise ReviewStateBindingError("reviewed evidence identity changed")
         presentations = {
             presentation.opaque_id: presentation
             for presentation in manifest.visual_presentations
         }
         if not set(self.assessment_history) <= set(presentations):
-            raise ValueError("assessment history contains unknown opaque IDs")
+            raise ReviewStateBindingError(
+                "assessment history contains unknown opaque IDs"
+            )
         for opaque_id, history in self.assessment_history.items():
             presentation = presentations[opaque_id]
             if any(
                 assessment.revision_id != presentation.revision_id
                 for assessment in history
             ):
-                raise ValueError(
+                raise ReviewStateBindingError(
                     "assessment revision is absent from immutable manifest"
+                )
+            if any(assessment.reviewer != self.reviewer for assessment in history):
+                raise ReviewStateBindingError(
+                    "assessment reviewer does not match persisted review state"
                 )
         revisions = {item.case_token: item for item in manifest.case_revisions}
         if set(self.case_histories) != set(revisions):
-            raise ValueError(
+            raise ReviewStateBindingError(
                 "case histories contain biological keys absent from immutable manifest"
             )
         for token, history in self.case_histories.items():
             revision = revisions[token]
-            if (
-                history.case_key != revision.case_key
-                or history.revisions[0] != revision
+            if history.case_key != revision.case_key:
+                raise ReviewStateBindingError(
+                    "case history does not match immutable manifest"
+                )
+            if history.revisions != (revision,):
+                raise ReviewStateBindingError(
+                    "case history initial revisions do not match immutable manifest"
+                )
+            if any(
+                adjudication.reviewer != self.reviewer
+                for adjudication in history.adjudications
             ):
-                raise ValueError("case history does not match immutable manifest")
+                raise ReviewStateBindingError(
+                    "adjudication reviewer does not match persisted review state"
+                )

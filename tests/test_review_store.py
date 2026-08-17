@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -159,6 +160,88 @@ def test_open_rejects_changed_dirty_repository_identity(
     monkeypatch.setattr(review_store, "_repository_identity", lambda: second)
 
     with pytest.raises(ValueError, match="repository identity changed"):
+        ReviewStore.open(tmp_path / "review", manifest, "Reviewer", now=fixed_clock)
+
+
+def test_repository_identity_tracks_untracked_nonignored_file_content() -> None:
+    """Changing an untracked review-relevant file changes the dirty-tree digest."""
+    repository = Path(review_store.__file__).resolve().parents[2]
+    untracked = repository / f"review-store-untracked-{uuid.uuid4().hex}.txt"
+    before = review_store._repository_identity()
+    try:
+        untracked.write_bytes(b"first untracked content")
+        first = review_store._repository_identity()
+        untracked.write_bytes(b"second untracked content")
+        second = review_store._repository_identity()
+    finally:
+        untracked.unlink(missing_ok=True)
+
+    assert first.dirty
+    assert first.diff_sha256
+    assert first != before
+    assert second != first
+
+
+def test_state_model_rejects_extra_unmanifested_case_revision(tmp_path: Path) -> None:
+    """Task 2 state permits exactly the immutable manifest's initial revisions."""
+    manifest = build_review_manifest(write_review_qc_fixture(tmp_path / "qc"), seed=7)
+    store = ReviewStore.create(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
+    payload = store.state.to_dict()
+    history = next(iter(payload["case_histories"].values()))
+    forged = dict(history["revisions"][0])
+    forged["revision_id"] = "REV-forged"
+    history["revisions"].append(forged)
+
+    with pytest.raises(ValueError, match="initial revisions"):
+        ReviewState.from_dict(payload, manifest)
+
+
+def test_state_model_rejects_events_from_another_reviewer(tmp_path: Path) -> None:
+    """Every persisted assessment and adjudication belongs to the state reviewer."""
+    manifest = build_review_manifest(write_review_qc_fixture(tmp_path / "qc"), seed=7)
+    store = ReviewStore.create(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
+    presentation = manifest.visual_presentations[0]
+    case_key = manifest.presentation_cases[presentation.opaque_id]
+    store.assess(presentation.opaque_id, "accept", ("dapi-aligned",), "clear")
+    assessment_payload = store.state.to_dict()
+    assessment_payload["assessment_history"][presentation.opaque_id][0]["reviewer"] = (
+        "Other Reviewer"
+    )
+
+    with pytest.raises(ValueError, match="assessment reviewer"):
+        ReviewState.from_dict(assessment_payload, manifest)
+
+    store.adjudicate(case_key, "accept", ("dapi-aligned",), "confirmed")
+    adjudication_payload = store.state.to_dict()
+    adjudication_payload["case_histories"][presentation.case_token]["adjudications"][0][
+        "reviewer"
+    ] = "Other Reviewer"
+    with pytest.raises(ValueError, match="adjudication reviewer"):
+        ReviewState.from_dict(adjudication_payload, manifest)
+
+
+def test_open_does_not_recover_from_manifest_binding_mismatch(tmp_path: Path) -> None:
+    """A semantic current-state evidence mismatch fails closed despite a backup."""
+    manifest = build_review_manifest(write_review_qc_fixture(tmp_path / "qc"), seed=7)
+    store = ReviewStore.create(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
+    store.assess(
+        manifest.visual_presentations[0].opaque_id,
+        "accept",
+        ("dapi-aligned",),
+        "clear",
+    )
+    current = tmp_path / "review/review-state.json"
+    payload = json.loads(current.read_text(encoding="utf-8"))
+    payload["manifest_identity"] = "a" * 64
+    current.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="reviewed evidence identity changed"):
         ReviewStore.open(tmp_path / "review", manifest, "Reviewer", now=fixed_clock)
 
 
