@@ -17,6 +17,7 @@ from scipy.ndimage import (
     binary_closing,
     binary_fill_holes,
     distance_transform_edt,
+    find_objects,
     gaussian_filter,
     label,
     map_coordinates,
@@ -89,10 +90,16 @@ class NuclearConsensus:
 
 
 @dataclass(frozen=True, slots=True)
-class _NuclearCandidate:
+class _AcceptedCandidateGeometry:
+    region_zyx: tuple[slice, slice, slice]
     mask_zyx: NDArray[np.bool_]
     vertices_xyz_um: NDArray[np.float64]
     faces: NDArray[np.int_]
+
+
+@dataclass(frozen=True, slots=True)
+class _NuclearCandidate:
+    accepted_geometry: _AcceptedCandidateGeometry | None
     accepted: bool
     rejection_reasons: tuple[str, ...]
     expanded_volume_um3: float
@@ -184,15 +191,38 @@ def _physical_ball(
 
 def _face_contact_fractions(
     mask: NDArray[np.bool_],
+    region_zyx: tuple[slice, slice, slice],
+    full_shape_zyx: tuple[int, int, int],
 ) -> tuple[float, float, float, float, float, float]:
+    z_region, y_region, x_region = region_zyx
+    full_z, full_y, full_x = full_shape_zyx
     return (
-        float(mask[0].mean()),
-        float(mask[-1].mean()),
-        float(mask[:, 0, :].mean()),
-        float(mask[:, -1, :].mean()),
-        float(mask[:, :, 0].mean()),
-        float(mask[:, :, -1].mean()),
+        float(mask[0].sum() / (full_y * full_x)) if z_region.start == 0 else 0.0,
+        (float(mask[-1].sum() / (full_y * full_x)) if z_region.stop == full_z else 0.0),
+        float(mask[:, 0, :].sum() / (full_z * full_x)) if y_region.start == 0 else 0.0,
+        (
+            float(mask[:, -1, :].sum() / (full_z * full_x))
+            if y_region.stop == full_y
+            else 0.0
+        ),
+        float(mask[:, :, 0].sum() / (full_z * full_y)) if x_region.start == 0 else 0.0,
+        (
+            float(mask[:, :, -1].sum() / (full_z * full_y))
+            if x_region.stop == full_x
+            else 0.0
+        ),
     )
+
+
+def _expanded_component_slice(
+    region_zyx: tuple[slice, slice, slice],
+    full_shape_zyx: tuple[int, int, int],
+) -> tuple[slice, slice, slice]:
+    """Include one real background voxel around a component where available."""
+    return tuple(
+        slice(max(int(region.start) - 1, 0), min(int(region.stop) + 1, extent))
+        for region, extent in zip(region_zyx, full_shape_zyx, strict=True)
+    )  # type: ignore[return-value]
 
 
 def _surface_from_mask(
@@ -322,12 +352,19 @@ def consensus_nuclear_surface(
     candidate_labels, candidate_count = label(
         mask, structure=np.ones((3, 3, 3), dtype=bool)
     )
+    full_shape_zyx = mask.shape
+    component_regions = find_objects(candidate_labels, max_label=candidate_count)
+    del filled, mask, median, smoothed, threshold_mask, volumes
     sx, sy, sz = spacing
     voxel_volume_um3 = sx * sy * sz
     minimum_volume, maximum_volume = config.nominal_volume_um3
     candidates: list[_NuclearCandidate] = []
     for component_index in range(1, candidate_count + 1):
-        component_mask = candidate_labels == component_index
+        raw_region = component_regions[component_index - 1]
+        if raw_region is None:
+            raise RuntimeError("labeled DAPI component has no bounding slice")
+        region_zyx = _expanded_component_slice(raw_region, full_shape_zyx)
+        component_mask = candidate_labels[region_zyx] == component_index
         expanded_volume_um3 = float(component_mask.sum()) * voxel_volume_um3
         nominal_volume_um3 = expanded_volume_um3 / expansion**3
         vertices, faces = _surface_from_mask(component_mask, spacing)
@@ -338,12 +375,15 @@ def consensus_nuclear_surface(
             / surface_area_um2
         )
         centroid_zyx = np.argwhere(component_mask).mean(axis=0)
+        z_region, y_region, x_region = region_zyx
         centroid_xyz_um = (
-            float(centroid_zyx[2] * sx),
-            float(centroid_zyx[1] * sy),
-            float(centroid_zyx[0] * sz),
+            float((centroid_zyx[2] + int(x_region.start)) * sx),
+            float((centroid_zyx[1] + int(y_region.start)) * sy),
+            float((centroid_zyx[0] + int(z_region.start)) * sz),
         )
-        face_contact_fractions = _face_contact_fractions(component_mask)
+        face_contact_fractions = _face_contact_fractions(
+            component_mask, region_zyx, full_shape_zyx
+        )
         rejection_reasons: list[str] = []
         if nominal_volume_um3 < minimum_volume:
             rejection_reasons.append("volume-below-minimum")
@@ -356,11 +396,14 @@ def consensus_nuclear_surface(
             for fraction in face_contact_fractions
         ):
             rejection_reasons.append("face-contact-above-maximum")
+        accepted_geometry = (
+            None
+            if rejection_reasons
+            else _AcceptedCandidateGeometry(region_zyx, component_mask, vertices, faces)
+        )
         candidates.append(
             _NuclearCandidate(
-                component_mask,
-                vertices,
-                faces,
+                accepted_geometry,
                 not rejection_reasons,
                 tuple(rejection_reasons),
                 expanded_volume_um3,
@@ -370,6 +413,7 @@ def consensus_nuclear_surface(
                 face_contact_fractions,
             )
         )
+        del component_mask, faces, vertices
 
     candidates.sort(key=lambda item: item.centroid_xyz_um)
     accepted_count = sum(item.accepted for item in candidates)
@@ -393,7 +437,8 @@ def consensus_nuclear_surface(
             f"[{minimum_count}, {maximum_count}]{reason_suffix}"
         )
 
-    accepted_labels = np.zeros(mask.shape, dtype=np.uint16)
+    del candidate_labels, component_regions
+    accepted_labels = np.zeros(full_shape_zyx, dtype=np.uint16)
     nuclei: list[NuclearSurface] = []
     component_qc: list[NuclearComponentQc] = []
     accepted_index = 0
@@ -401,25 +446,40 @@ def consensus_nuclear_surface(
         if candidate.accepted:
             accepted_index += 1
             nucleus_id = f"N{accepted_index:03d}"
-            normals, centroid, curvature = _surface_normals_and_curvature(
-                candidate.mask_zyx, candidate.vertices_xyz_um, spacing
+            geometry = candidate.accepted_geometry
+            if geometry is None:
+                raise RuntimeError("accepted DAPI component has no bounded geometry")
+            normals, local_centroid, curvature = _surface_normals_and_curvature(
+                geometry.mask_zyx, geometry.vertices_xyz_um, spacing
             )
+            z_region, y_region, x_region = geometry.region_zyx
+            origin_xyz_um = np.array(
+                (
+                    int(x_region.start) * sx,
+                    int(y_region.start) * sy,
+                    int(z_region.start) * sz,
+                )
+            )
+            vertices = geometry.vertices_xyz_um + origin_xyz_um
+            centroid = local_centroid + origin_xyz_um
+            component_mask = np.zeros(full_shape_zyx, dtype=bool)
+            component_mask[geometry.region_zyx] = geometry.mask_zyx
             for array in (
-                candidate.mask_zyx,
-                candidate.vertices_xyz_um,
-                candidate.faces,
+                component_mask,
+                vertices,
+                geometry.faces,
                 normals,
                 centroid,
                 curvature,
             ):
                 array.setflags(write=False)
-            accepted_labels[candidate.mask_zyx] = accepted_index
+            accepted_labels[component_mask] = accepted_index
             nuclei.append(
                 NuclearSurface(
                     nucleus_id,
-                    candidate.mask_zyx,
-                    candidate.vertices_xyz_um,
-                    candidate.faces,
+                    component_mask,
+                    vertices,
+                    geometry.faces,
                     normals,
                     centroid,
                     curvature,

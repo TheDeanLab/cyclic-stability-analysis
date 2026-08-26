@@ -138,6 +138,34 @@ def test_component_qc_records_exact_rejection_reason(
     assert rejected[0].rejection_reasons == (reason,)
 
 
+def test_component_qc_collects_every_applicable_rejection_reason() -> None:
+    """Stopping after one failed bound would hide additional DAPI QC evidence."""
+    spacing = (0.5, 0.5, 0.5)
+    dapi = ellipsoid_dapi(
+        ((0.5, 5.0, 10.0), (20.0, 15.0, 10.0)),
+        ((1.0, 1.0, 8.0), (4.0, 4.0, 4.0)),
+        spacing,
+        (50, 80, 80),
+    )
+    config = replace(
+        NUCLEAR_CONFIG,
+        nominal_volume_um3=(100.0, 1000.0),
+        minimum_sphericity=0.75,
+        maximum_face_contact_fraction=0.01,
+    )
+    result = consensus_nuclear_surface(
+        {2: dapi}, spacing, config, nominal_expansion_factor=1.0
+    )
+    rejected = [item for item in result.component_qc if not item.accepted]
+    assert len(result.nuclei) == 1
+    assert len(rejected) == 1
+    assert rejected[0].rejection_reasons == (
+        "volume-below-minimum",
+        "sphericity-below-minimum",
+        "face-contact-above-maximum",
+    )
+
+
 def test_component_qc_uses_exact_expansion_volume_conversion() -> None:
     """Using a linear or area expansion correction misclassifies nuclear volume."""
     spacing = (0.5, 0.5, 0.5)
