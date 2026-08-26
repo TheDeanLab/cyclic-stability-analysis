@@ -8,8 +8,10 @@ import os
 import shutil
 import tempfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import TypedDict
 
 import numpy as np
 from numpy.typing import NDArray
@@ -124,6 +126,20 @@ class LaminProfileRow:
     surface_coverage: float
     continuity: float
     continuity_change_from_reference: float
+    nucleus_id: str = "aggregate"
+
+
+class _GeometryResult(TypedDict):
+    """Exact-mask geometry and tolerant curvature completeness."""
+
+    volume_um3: float
+    area_to_volume_um_inverse: float
+    sphericity: float
+    mean_curvature_p25_um_inverse: float
+    mean_curvature_p50_um_inverse: float
+    mean_curvature_p75_um_inverse: float
+    valid_curvature_vertex_fraction: float
+    geometry_status: str
 
 
 def _spacing(
@@ -691,6 +707,7 @@ def lamin_normal_profiles(
                     coverage,
                     continuity,
                     continuity - reference_continuity,
+                    surface.nucleus_id,
                 )
             )
     return tuple(rows)
@@ -723,89 +740,104 @@ def _metric_rows(
     config: AnalysisConfig,
 ) -> tuple[MetricRow, ...]:
     rows: list[MetricRow] = []
-    for round_number in sorted({row.acquisition_round for row in profiles}):
-        subset = [row for row in profiles if row.acquisition_round == round_number]
-        current_supported = [row for row in subset if row.supported]
-        paired_supported = [
-            row
-            for row in subset
-            if row.supported and math.isfinite(row.displacement_um)
-        ]
-        values = {
-            "lamin_surface_coverage": (subset[0].surface_coverage, "fraction"),
-            "lamin_continuity": (subset[0].continuity, "fraction"),
-            "lamin_continuity_change_from_round_2": (
-                subset[0].continuity_change_from_reference,
-                "fraction",
-            ),
-        }
-        if paired_supported:
-            values.update(
-                {
-                    "lamin_signed_displacement_median": (
-                        float(
-                            np.median([row.displacement_um for row in paired_supported])
+    for nucleus_id in sorted({row.nucleus_id for row in profiles}):
+        nucleus_profiles = [row for row in profiles if row.nucleus_id == nucleus_id]
+        for round_number in sorted({row.acquisition_round for row in nucleus_profiles}):
+            subset = [
+                row for row in nucleus_profiles if row.acquisition_round == round_number
+            ]
+            current_supported = [row for row in subset if row.supported]
+            paired_supported = [
+                row
+                for row in subset
+                if row.supported and math.isfinite(row.displacement_um)
+            ]
+            values = {
+                "lamin_surface_coverage": (subset[0].surface_coverage, "fraction"),
+                "lamin_continuity": (subset[0].continuity, "fraction"),
+                "lamin_continuity_change_from_round_2": (
+                    subset[0].continuity_change_from_reference,
+                    "fraction",
+                ),
+            }
+            if paired_supported:
+                values.update(
+                    {
+                        "lamin_signed_displacement_median": (
+                            float(
+                                np.median(
+                                    [row.displacement_um for row in paired_supported]
+                                )
+                            ),
+                            "um",
                         ),
-                        "um",
-                    ),
-                    "lamin_absolute_displacement_median": (
-                        float(
-                            np.median(
-                                [
-                                    row.absolute_displacement_um
-                                    for row in paired_supported
-                                ]
-                            )
+                        "lamin_absolute_displacement_median": (
+                            float(
+                                np.median(
+                                    [
+                                        row.absolute_displacement_um
+                                        for row in paired_supported
+                                    ]
+                                )
+                            ),
+                            "um",
                         ),
-                        "um",
-                    ),
-                }
-            )
-        if current_supported:
-            values.update(
-                {
-                    "lamin_fwhm_median": (
-                        float(np.median([row.fwhm_um for row in current_supported])),
-                        "um",
-                    ),
-                    "lamin_integrated_ridge_intensity_median": (
-                        float(
-                            np.median(
-                                [
-                                    row.integrated_ridge_intensity
-                                    for row in current_supported
-                                ]
-                            )
-                        ),
-                        "a.u. um",
-                    ),
-                }
-            )
-        for endpoint, (value, units) in values.items():
-            rows.append(
-                MetricRow(
-                    cell.cohort,
-                    cell.cell_id,
-                    round_number,
-                    endpoint,
-                    value,
-                    units,
-                    "round-1-exposure-sensitivity"
-                    if round_number == 1
-                    else "matched-settings",
-                    True,
-                    config.config_digest,
+                    }
                 )
-            )
+            if current_supported:
+                values.update(
+                    {
+                        "lamin_fwhm_median": (
+                            float(
+                                np.median([row.fwhm_um for row in current_supported])
+                            ),
+                            "um",
+                        ),
+                        "lamin_integrated_ridge_intensity_median": (
+                            float(
+                                np.median(
+                                    [
+                                        row.integrated_ridge_intensity
+                                        for row in current_supported
+                                    ]
+                                )
+                            ),
+                            "a.u. um",
+                        ),
+                    }
+                )
+            for endpoint, (value, units) in values.items():
+                rows.append(
+                    MetricRow(
+                        cell.cohort,
+                        cell.cell_id,
+                        round_number,
+                        endpoint,
+                        value,
+                        units,
+                        "round-1-exposure-sensitivity"
+                        if round_number == 1
+                        else "matched-settings",
+                        True,
+                        config.config_digest,
+                        nucleus_id,
+                    )
+                )
     return tuple(rows)
 
 
 def _write_profile_diagnostics(
-    output_dir: Path, surface: NuclearSurface, profiles: tuple[LaminProfileRow, ...]
+    output_dir: Path,
+    cell_id: str,
+    surface: NuclearSurface,
+    profiles: tuple[LaminProfileRow, ...],
 ) -> tuple[Path, ...]:
     """Write portable surface coordinates plus XY/XZ/YZ profile projections."""
+    import matplotlib
     import matplotlib.pyplot as plt
 
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    matplotlib.rcParams["ps.fonttype"] = 42
     output_dir.mkdir(parents=True, exist_ok=True)
     surface_path = output_dir / "consensus-nuclear-surface.npz"
     np.savez_compressed(
@@ -851,12 +883,144 @@ def _write_profile_diagnostics(
             xlabel=f"{plane[0].upper()} (um)",
             ylabel=f"{plane[1].upper()} (um)",
             aspect="equal",
+            title=f"{cell_id} / {surface.nucleus_id} / round {latest_round}",
         )
         path = output_dir / f"lamin-surface-profile-{plane}.png"
         figure.savefig(path, dpi=200)
         plt.close(figure)
         projection_paths.append(path)
     return (surface_path, profile_path, *projection_paths)
+
+
+def _write_component_inventory(
+    output_dir: Path,
+    cell_id: str,
+    dapi_rounds: Mapping[int, NDArray[np.generic]],
+    consensus: NuclearConsensus,
+) -> Path:
+    """Write one DAPI-only component inventory with the exact QC evidence table."""
+    import matplotlib
+    import matplotlib.pyplot as plt
+
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    matplotlib.rcParams["ps.fonttype"] = 42
+    median_dapi = np.median(
+        np.stack(
+            [_normalized_dapi(_volume(image, "DAPI")) for image in dapi_rounds.values()]
+        ),
+        axis=0,
+    )
+    sx, sy, sz = consensus.spacing_xyz_um
+    colors = (
+        "#0072B2",
+        "#E69F00",
+        "#009E73",
+        "#CC79A7",
+        "#56B4E9",
+        "#D55E00",
+    )
+    color_by_id = {
+        surface.nucleus_id: colors[index]
+        for index, surface in enumerate(consensus.nuclei)
+    }
+    projections = (
+        ("XY", 0, (0, 1), (sx, sy)),
+        ("XZ", 1, (0, 2), (sx, sz)),
+        ("YZ", 2, (1, 2), (sy, sz)),
+    )
+    figure = plt.figure(figsize=(12, 8), layout="constrained")
+    grid = figure.add_gridspec(2, 3, height_ratios=(2.2, 1.0))
+    for column, (plane, projection_axis, centroid_axes, plot_spacing) in enumerate(
+        projections
+    ):
+        axis = figure.add_subplot(grid[0, column])
+        projection = median_dapi.max(axis=projection_axis)
+        horizontal_extent = (projection.shape[1] - 1) * plot_spacing[0]
+        vertical_extent = (projection.shape[0] - 1) * plot_spacing[1]
+        extent = (0.0, horizontal_extent, 0.0, vertical_extent)
+        axis.imshow(projection, cmap="gray", origin="lower", extent=extent)
+        for surface in consensus.nuclei:
+            projected_mask = surface.mask_zyx.max(axis=projection_axis)
+            axis.contour(
+                projected_mask.astype(float),
+                levels=(0.5,),
+                colors=(color_by_id[surface.nucleus_id],),
+                linewidths=(1.2,),
+                origin="lower",
+                extent=extent,
+            )
+        for component in consensus.component_qc:
+            point = (
+                component.centroid_xyz_um[centroid_axes[0]],
+                component.centroid_xyz_um[centroid_axes[1]],
+            )
+            color = color_by_id.get(component.nucleus_id, "#7F7F7F")
+            touches_boundary = max(component.face_contact_fractions) > 0.0
+            axis.scatter(
+                *point,
+                color=color,
+                edgecolor="#D62728" if touches_boundary else "white",
+                linewidth=1.2,
+                marker="o" if component.accepted else "X",
+                s=28,
+                zorder=3,
+            )
+            rejection = (
+                ""
+                if component.accepted
+                else f" ({','.join(component.rejection_reasons)})"
+            )
+            axis.annotate(
+                f"{component.nucleus_id}{rejection}",
+                point,
+                xytext=(3, 3),
+                textcoords="offset points",
+                color=color,
+                fontsize=7,
+            )
+        axis.set(
+            title=f"DAPI {plane} maximum projection",
+            xlabel=f"{plane[0]} (um)",
+            ylabel=f"{plane[1]} (um)",
+            aspect="equal",
+        )
+    table_axis = figure.add_subplot(grid[1, :])
+    table_axis.axis("off")
+    column_labels = (
+        "ID",
+        "accepted",
+        "expanded volume (um3)",
+        "nominal volume (um3)",
+        "sphericity",
+        "centroid XYZ (um)",
+        "max face contact",
+    )
+    table_values = [
+        (
+            component.nucleus_id,
+            str(component.accepted),
+            f"{component.expanded_volume_um3:.3f}",
+            f"{component.nominal_volume_um3:.3f}",
+            f"{component.sphericity:.4f}",
+            ", ".join(f"{value:.3f}" for value in component.centroid_xyz_um),
+            f"{max(component.face_contact_fractions):.5f}",
+        )
+        for component in consensus.component_qc
+    ]
+    table = table_axis.table(
+        cellText=table_values,
+        colLabels=column_labels,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7)
+    table.scale(1.0, 1.25)
+    figure.suptitle(f"{cell_id}: target-blind DAPI component inventory")
+    path = output_dir / "nuclear-component-inventory.pdf"
+    figure.savefig(path)
+    plt.close(figure)
+    return path
 
 
 def _atomic_publish_directory(
@@ -887,8 +1051,14 @@ def _atomic_publish_directory(
 def _geometry(
     mask: NDArray[np.bool_],
     spacing_xyz_um: tuple[float, float, float],
-) -> dict[str, float]:
-    """Return physical mask geometry without treating an empty mask as zero shape."""
+) -> _GeometryResult:
+    """Return exact-mask geometry with tolerant ensemble-only curvature.
+
+    Volume, surface area, and shape use the complete input mask. Curvature alone
+    filters vertices whose signed-distance normal or sampled curvature is not
+    finite and nondegenerate. The input mask is never relabeled, component-filtered,
+    or otherwise changed.
+    """
     volume = float(mask.sum() * np.prod(spacing_xyz_um))
     if volume == 0.0:
         return {
@@ -898,10 +1068,100 @@ def _geometry(
             "mean_curvature_p25_um_inverse": math.nan,
             "mean_curvature_p50_um_inverse": math.nan,
             "mean_curvature_p75_um_inverse": math.nan,
+            "valid_curvature_vertex_fraction": math.nan,
+            "geometry_status": "empty",
         }
     vertices, faces = _surface_from_mask(mask, spacing_xyz_um)
-    _, _, curvature = _surface_normals_and_curvature(mask, vertices, spacing_xyz_um)
     area = float(mesh_surface_area(vertices, faces))
+    curvature, valid_fraction = _tolerant_ensemble_curvature(
+        mask, vertices, spacing_xyz_um
+    )
+    report_curvature = valid_fraction >= 0.99 and curvature.size > 0
+    if valid_fraction == 1.0:
+        status = "valid"
+    elif report_curvature:
+        status = "partial-curvature"
+    else:
+        status = "invalid-curvature"
+    curvature_percentiles = (
+        tuple(float(value) for value in np.percentile(curvature, (25.0, 50.0, 75.0)))
+        if report_curvature
+        else (math.nan, math.nan, math.nan)
+    )
+    return {
+        "volume_um3": volume,
+        "area_to_volume_um_inverse": area / volume,
+        "sphericity": float(
+            np.pi ** (1.0 / 3.0) * (6.0 * volume) ** (2.0 / 3.0) / area
+        ),
+        "mean_curvature_p25_um_inverse": curvature_percentiles[0],
+        "mean_curvature_p50_um_inverse": curvature_percentiles[1],
+        "mean_curvature_p75_um_inverse": curvature_percentiles[2],
+        "valid_curvature_vertex_fraction": valid_fraction,
+        "geometry_status": status,
+    }
+
+
+def _tolerant_ensemble_curvature(
+    mask: NDArray[np.bool_],
+    vertices_xyz_um: NDArray[np.float64],
+    spacing_xyz_um: tuple[float, float, float],
+) -> tuple[NDArray[np.float64], float]:
+    """Sample curvature only at finite, nondegenerate ensemble-mask vertices.
+
+    This intentionally does not replace the strict normal path used to accept a
+    DAPI consensus surface. It exists only so one fragmented Lamin threshold
+    member cannot abort the remaining ensemble or field.
+    """
+    sx, sy, sz = spacing_xyz_um
+    padded = np.pad(mask, 1)
+    signed = np.asarray(
+        distance_transform_edt(~padded, sampling=(sz, sy, sx)), dtype=np.float64
+    ) - np.asarray(
+        distance_transform_edt(padded, sampling=(sz, sy, sx)), dtype=np.float64
+    )
+    gradients_zyx = np.gradient(signed, sz, sy, sx)
+    gradient_xyz = np.stack(
+        (gradients_zyx[2], gradients_zyx[1], gradients_zyx[0]), axis=-1
+    )
+    grid_lengths = np.linalg.norm(gradient_xyz, axis=-1, keepdims=True)
+    outward = np.divide(
+        gradient_xyz,
+        grid_lengths,
+        out=np.zeros_like(gradient_xyz),
+        where=np.isfinite(grid_lengths) & (grid_lengths > 0.0),
+    )
+    divergence = (
+        np.gradient(outward[..., 0], sx, axis=2)
+        + np.gradient(outward[..., 1], sy, axis=1)
+        + np.gradient(outward[..., 2], sz, axis=0)
+    )
+    sample_zyx = np.vstack(
+        (
+            vertices_xyz_um[:, 2] / sz + 1.0,
+            vertices_xyz_um[:, 1] / sy + 1.0,
+            vertices_xyz_um[:, 0] / sx + 1.0,
+        )
+    )
+    sampled_outward = np.vstack(
+        [map_coordinates(outward[..., axis], sample_zyx, order=1) for axis in range(3)]
+    ).T
+    sampled_lengths = np.linalg.norm(sampled_outward, axis=1)
+    sampled_curvature = map_coordinates(divergence, sample_zyx, order=1)
+    valid = (
+        np.all(np.isfinite(sampled_outward), axis=1)
+        & np.isfinite(sampled_lengths)
+        & (sampled_lengths > 0.0)
+        & np.isfinite(sampled_curvature)
+    )
+    return sampled_curvature[valid], float(np.count_nonzero(valid) / valid.size)
+
+
+def _nuclear_surface_geometry(surface: NuclearSurface) -> dict[str, float]:
+    """Summarize one already-strict, accepted DAPI surface without resampling it."""
+    volume = float(surface.mask_zyx.sum() * np.prod(surface.spacing_xyz_um))
+    area = float(mesh_surface_area(surface.vertices_xyz_um, surface.faces))
+    curvature = surface.mean_curvature_um_inverse
     return {
         "volume_um3": volume,
         "area_to_volume_um_inverse": area / volume,
@@ -920,9 +1180,10 @@ def _ensemble_row(
     endpoint: str,
     name: str,
     ensemble_value: float,
-    value: float | None,
+    value: float | str | None,
     units: str,
     config: AnalysisConfig,
+    nucleus_id: str,
 ) -> EnsembleRow:
     """Keep one declared ensemble coordinate beside every derived endpoint."""
     return EnsembleRow(
@@ -935,7 +1196,102 @@ def _ensemble_row(
         math.nan if value is None else value,
         units,
         config.config_digest,
+        nucleus_id,
     )
+
+
+def _aggregate_metric_rows(rows: tuple[MetricRow, ...]) -> tuple[MetricRow, ...]:
+    """Take field medians over nucleus-level metrics without pooling vertices."""
+    grouped: dict[tuple[object, ...], list[MetricRow]] = {}
+    for row in rows:
+        if row.nucleus_id == "aggregate":
+            continue
+        key = (
+            row.cohort,
+            row.cell_id,
+            row.acquisition_round,
+            row.endpoint,
+            row.units,
+            row.comparison_set,
+            row.qc_included,
+            row.source_task_identity,
+        )
+        grouped.setdefault(key, []).append(row)
+    aggregated: list[MetricRow] = []
+    for members in grouped.values():
+        first = members[0]
+        finite_values = [row.value for row in members if math.isfinite(row.value)]
+        aggregated.append(
+            MetricRow(
+                first.cohort,
+                first.cell_id,
+                first.acquisition_round,
+                first.endpoint,
+                float(np.median(finite_values)) if finite_values else math.nan,
+                first.units,
+                first.comparison_set,
+                first.qc_included,
+                first.source_task_identity,
+                "aggregate",
+            )
+        )
+    return tuple(aggregated)
+
+
+def _aggregate_ensemble_rows(
+    rows: tuple[EnsembleRow, ...],
+) -> tuple[EnsembleRow, ...]:
+    """Take field medians over matching nucleus-level ensemble coordinates."""
+    grouped: dict[tuple[object, ...], list[EnsembleRow]] = {}
+    for row in rows:
+        if row.nucleus_id == "aggregate":
+            continue
+        key = (
+            row.cohort,
+            row.cell_id,
+            row.acquisition_round,
+            row.endpoint,
+            row.ensemble_name,
+            row.ensemble_value,
+            row.units,
+            row.source_task_identity,
+        )
+        grouped.setdefault(key, []).append(row)
+    aggregated: list[EnsembleRow] = []
+    for members in grouped.values():
+        first = members[0]
+        values = [row.value for row in members]
+        if all(isinstance(value, str) for value in values):
+            statuses = {str(value) for value in values}
+            aggregate_value: float | str = (
+                str(values[0]) if len(statuses) == 1 else "mixed"
+            )
+        elif all(not isinstance(value, str) for value in values):
+            finite_values = [
+                float(value) for value in values if math.isfinite(float(value))
+            ]
+            aggregate_value = (
+                float(np.median(finite_values)) if finite_values else math.nan
+            )
+        else:
+            raise ValueError(
+                "one ensemble endpoint cannot mix numeric and status values"
+            )
+        aggregated.append(
+            EnsembleRow(
+                first.cohort,
+                first.cell_id,
+                first.acquisition_round,
+                first.endpoint,
+                first.ensemble_name,
+                first.ensemble_value,
+                aggregate_value,
+                first.units,
+                first.source_task_identity,
+                "aggregate",
+            )
+        )
+    return tuple(aggregated)
 
 
 def analyze_lamin_cell(
@@ -961,149 +1317,150 @@ def analyze_lamin_cell(
         round_number: load_volume(by_round[round_number].registered_target)
         for round_number in accepted
     }
-    surface = consensus_nuclear_surface(
-        dapi, config.voxel_spacing_xyz_um, config.nuclear
+    consensus = consensus_nuclear_surface(
+        dapi,
+        config.voxel_spacing_xyz_um,
+        config.nuclear,
+        config.nominal_expansion_factor,
     )
     backgrounds = {
         round_number: robust_background(image) for round_number, image in lamin.items()
     }
-    profiles = lamin_normal_profiles(surface, lamin, config.nuclear, backgrounds)
     resolution = theoretical_resolution(
         config.optics.target_wavelength_um,
         config.optics.numerical_aperture,
         config.optics.immersion_refractive_index,
         config.nominal_expansion_factor,
     )
-    reference_members = threshold_ensemble(
-        lamin[REFERENCE_ROUND],
-        surface.mask_zyx,
-        config.ensembles.gaussian_sigma_um,
-        config.ensembles.threshold_sbr,
-        config.voxel_spacing_xyz_um,
-    )
+    profiles_by_nucleus: dict[str, tuple[LaminProfileRow, ...]] = {}
+    profile_rows: list[LaminProfileRow] = []
+    summary_rows: list[MetricRow] = []
     ensemble_rows: list[EnsembleRow] = []
-    for round_number in accepted:
-        members = threshold_ensemble(
-            lamin[round_number],
-            surface.mask_zyx,
-            config.ensembles.gaussian_sigma_um,
-            config.ensembles.threshold_sbr,
-            config.voxel_spacing_xyz_um,
-        )
-        for reference_member, member in zip(reference_members, members, strict=True):
-            geometry = _geometry(member.mask_zyx, config.voxel_spacing_xyz_um)
-            surface_metrics = resolution_surface_metrics(
-                reference_member.mask_zyx,
-                member.mask_zyx,
+    for surface in consensus.nuclei:
+        profiles = lamin_normal_profiles(surface, lamin, config.nuclear, backgrounds)
+        profiles_by_nucleus[surface.nucleus_id] = profiles
+        profile_rows.extend(profiles)
+        members_by_round = {
+            round_number: threshold_ensemble(
+                lamin[round_number],
+                surface.mask_zyx,
+                config.ensembles.gaussian_sigma_um,
+                config.ensembles.threshold_sbr,
                 config.voxel_spacing_xyz_um,
-                resolution,
-                config.ensembles.surface_tolerance_resolution_units,
             )
-            name = f"sigma={member.sigma_um:g};sbr={member.threshold_sbr:g}"
-            ensemble_value = member.threshold_sbr
-            ensemble_rows.extend(
-                _ensemble_row(
-                    cell,
-                    round_number,
-                    f"lamin_mask_{endpoint}",
-                    name,
-                    ensemble_value,
-                    value,
-                    units,
-                    config,
+            for round_number in accepted
+        }
+        reference_members = members_by_round[REFERENCE_ROUND]
+        for round_number in accepted:
+            for reference_member, member in zip(
+                reference_members, members_by_round[round_number], strict=True
+            ):
+                geometry = _geometry(member.mask_zyx, config.voxel_spacing_xyz_um)
+                surface_metrics = resolution_surface_metrics(
+                    reference_member.mask_zyx,
+                    member.mask_zyx,
+                    config.voxel_spacing_xyz_um,
+                    resolution,
+                    config.ensembles.surface_tolerance_resolution_units,
                 )
-                for endpoint, value, units in (
-                    ("volume", geometry["volume_um3"], "um3"),
-                    ("area_to_volume", geometry["area_to_volume_um_inverse"], "1/um"),
-                    ("sphericity", geometry["sphericity"], "fraction"),
-                    (
-                        "mean_curvature_p25",
-                        geometry["mean_curvature_p25_um_inverse"],
-                        "1/um",
-                    ),
-                    (
-                        "mean_curvature_p50",
-                        geometry["mean_curvature_p50_um_inverse"],
-                        "1/um",
-                    ),
-                    (
-                        "mean_curvature_p75",
-                        geometry["mean_curvature_p75_um_inverse"],
-                        "1/um",
-                    ),
-                )
-            )
-            ensemble_rows.extend(
-                (
+                name = f"sigma={member.sigma_um:g};sbr={member.threshold_sbr:g}"
+                ensemble_value = member.threshold_sbr
+                ensemble_rows.extend(
                     _ensemble_row(
                         cell,
                         round_number,
-                        "lamin_jaccard",
+                        f"lamin_mask_{endpoint}",
                         name,
                         ensemble_value,
-                        surface_metrics.jaccard,
-                        "fraction",
+                        value,
+                        units,
                         config,
-                    ),
-                    _ensemble_row(
-                        cell,
-                        round_number,
-                        "lamin_fixed_to_moving_boundary_distance_p95",
-                        name,
-                        ensemble_value,
-                        surface_metrics.fixed_to_moving_normalized_distance_p95,
-                        "resolution-units",
-                        config,
-                    ),
-                    _ensemble_row(
-                        cell,
-                        round_number,
-                        "lamin_moving_to_fixed_boundary_distance_p95",
-                        name,
-                        ensemble_value,
-                        surface_metrics.moving_to_fixed_normalized_distance_p95,
-                        "resolution-units",
-                        config,
-                    ),
-                )
-            )
-            for tolerance, dice in surface_metrics.surface_dice.items():
-                ensemble_rows.append(
-                    _ensemble_row(
-                        cell,
-                        round_number,
-                        "lamin_surface_dice",
-                        name,
-                        tolerance,
-                        dice,
-                        "fraction",
-                        config,
+                        surface.nucleus_id,
+                    )
+                    for endpoint, value, units in (
+                        ("volume", geometry["volume_um3"], "um3"),
+                        (
+                            "area_to_volume",
+                            geometry["area_to_volume_um_inverse"],
+                            "1/um",
+                        ),
+                        ("sphericity", geometry["sphericity"], "fraction"),
+                        (
+                            "mean_curvature_p25",
+                            geometry["mean_curvature_p25_um_inverse"],
+                            "1/um",
+                        ),
+                        (
+                            "mean_curvature_p50",
+                            geometry["mean_curvature_p50_um_inverse"],
+                            "1/um",
+                        ),
+                        (
+                            "mean_curvature_p75",
+                            geometry["mean_curvature_p75_um_inverse"],
+                            "1/um",
+                        ),
+                        (
+                            "valid_curvature_vertex_fraction",
+                            geometry["valid_curvature_vertex_fraction"],
+                            "fraction",
+                        ),
+                        ("geometry_status", geometry["geometry_status"], "status"),
                     )
                 )
-    staged_diagnostics: tuple[Path, ...] = ()
-    staging_root: Path | None = None
-
-    def populate_diagnostics(staged: Path) -> None:
-        nonlocal staged_diagnostics, staging_root
-        staging_root = staged
-        staged_diagnostics = _write_profile_diagnostics(staged, surface, profiles)
-
-    _atomic_publish_directory(output_dir, populate_diagnostics)
-    assert staging_root is not None
-    diagnostics = tuple(
-        output_dir / path.relative_to(staging_root) for path in staged_diagnostics
-    )
-    identities = tuple(
-        str(path)
-        for artifact in artifacts
-        for path in (artifact.registered_dapi, artifact.registered_target)
-    )
-    nuclear_geometry = _geometry(surface.mask_zyx, config.voxel_spacing_xyz_um)
-    return MarkerResult(
-        cell.cohort,
-        cell.cell_id,
-        _metric_rows(cell, profiles, config)
-        + tuple(
+                ensemble_rows.extend(
+                    (
+                        _ensemble_row(
+                            cell,
+                            round_number,
+                            "lamin_jaccard",
+                            name,
+                            ensemble_value,
+                            surface_metrics.jaccard,
+                            "fraction",
+                            config,
+                            surface.nucleus_id,
+                        ),
+                        _ensemble_row(
+                            cell,
+                            round_number,
+                            "lamin_fixed_to_moving_boundary_distance_p95",
+                            name,
+                            ensemble_value,
+                            surface_metrics.fixed_to_moving_normalized_distance_p95,
+                            "resolution-units",
+                            config,
+                            surface.nucleus_id,
+                        ),
+                        _ensemble_row(
+                            cell,
+                            round_number,
+                            "lamin_moving_to_fixed_boundary_distance_p95",
+                            name,
+                            ensemble_value,
+                            surface_metrics.moving_to_fixed_normalized_distance_p95,
+                            "resolution-units",
+                            config,
+                            surface.nucleus_id,
+                        ),
+                    )
+                )
+                for tolerance, dice in surface_metrics.surface_dice.items():
+                    ensemble_rows.append(
+                        _ensemble_row(
+                            cell,
+                            round_number,
+                            "lamin_surface_dice",
+                            name,
+                            tolerance,
+                            dice,
+                            "fraction",
+                            config,
+                            surface.nucleus_id,
+                        )
+                    )
+        nuclear_geometry = _nuclear_surface_geometry(surface)
+        summary_rows.extend(
             MetricRow(
                 cell.cohort,
                 cell.cell_id,
@@ -1114,6 +1471,7 @@ def analyze_lamin_cell(
                 "QC-accepted-DAPI-rounds",
                 True,
                 config.config_digest,
+                surface.nucleus_id,
             )
             for endpoint, value, units in (
                 ("volume", nuclear_geometry["volume_um3"], "um3"),
@@ -1139,10 +1497,56 @@ def analyze_lamin_cell(
                     "1/um",
                 ),
             )
-        ),
-        tuple(ensemble_rows),
+        )
+    summary_rows[:0] = _metric_rows(cell, tuple(profile_rows), config)
+    per_nucleus_summary = tuple(summary_rows)
+    per_nucleus_ensemble = tuple(ensemble_rows)
+    all_summary_rows = (
+        *per_nucleus_summary,
+        *_aggregate_metric_rows(per_nucleus_summary),
+    )
+    all_ensemble_rows = (
+        *per_nucleus_ensemble,
+        *_aggregate_ensemble_rows(per_nucleus_ensemble),
+    )
+    staged_diagnostics: tuple[Path, ...] = ()
+    staging_root: Path | None = None
+
+    def populate_diagnostics(staged: Path) -> None:
+        nonlocal staged_diagnostics, staging_root
+        staging_root = staged
+        paths: list[Path] = [
+            _write_component_inventory(staged, cell.cell_id, dapi, consensus)
+        ]
+        for surface in consensus.nuclei:
+            paths.extend(
+                _write_profile_diagnostics(
+                    staged / surface.nucleus_id,
+                    cell.cell_id,
+                    surface,
+                    profiles_by_nucleus[surface.nucleus_id],
+                )
+            )
+        staged_diagnostics = tuple(paths)
+
+    _atomic_publish_directory(output_dir, populate_diagnostics)
+    assert staging_root is not None
+    diagnostics = tuple(
+        output_dir / path.relative_to(staging_root) for path in staged_diagnostics
+    )
+    identities = tuple(
+        str(path)
+        for artifact in artifacts
+        for path in (artifact.registered_dapi, artifact.registered_target)
+    )
+    return MarkerResult(
+        cell.cohort,
+        cell.cell_id,
+        all_summary_rows,
+        all_ensemble_rows,
         diagnostics,
         identities,
+        tuple(MappingProxyType(asdict(row)) for row in consensus.component_qc),
     )
 
 

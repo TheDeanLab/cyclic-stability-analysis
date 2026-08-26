@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from skimage.measure import mesh_surface_area
 from cyclic_stability import nuclear
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.models import (
@@ -19,6 +21,7 @@ from cyclic_stability.models import (
 )
 from cyclic_stability.nuclear import (
     LaminProfileRow,
+    _geometry,
     _metric_rows,
     _ridge,
     _surface_from_mask,
@@ -418,6 +421,181 @@ def test_metric_rows_mark_round_one_as_exposure_sensitivity(
     }
 
 
+def test_per_nucleus_lamin_profiles_and_metrics_isolate_local_ridges(
+    analysis_config: AnalysisConfig, tmp_path: Path
+) -> None:
+    """Pooling vertices or threshold masks would mix two known local offsets."""
+    spacing = (0.3, 0.3, 0.3)
+    shape = (56, 72, 128)
+    centers = ((11.0, 10.5, 8.1), (27.0, 10.5, 8.1))
+    z, y, x = np.indices(shape, dtype=np.float64)
+    physical_x = x * spacing[0]
+    physical_y = y * spacing[1]
+    physical_z = z * spacing[2]
+    background = 1.0 + 0.05 * np.sin(physical_x) * np.cos(physical_y)
+    dapi = background.copy()
+    reference_lamin = background.copy()
+    moved_lamin = background.copy()
+    for center, moved_radius in zip(centers, (5.3, 5.8), strict=True):
+        radius = np.sqrt(
+            (physical_x - center[0]) ** 2
+            + (physical_y - center[1]) ** 2
+            + (physical_z - center[2]) ** 2
+        )
+        dapi += 40.0 * (radius <= 5.0)
+        reference_lamin += 20.0 * np.exp(-0.5 * ((radius - 5.0) / (0.4 / 2.355)) ** 2)
+        moved_lamin += 20.0 * np.exp(
+            -0.5 * ((radius - moved_radius) / (0.4 / 2.355)) ** 2
+        )
+
+    source_rounds = analysis_config.cells[0].rounds
+    cell = CellSpec(
+        cohort="lamin",
+        cell_id="TwoNucleusField",
+        rounds=tuple(
+            replace(source_rounds[index], cohort="lamin", cell_id="TwoNucleusField")
+            for index in (1, 2)
+        ),
+    )
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=spacing,
+        nominal_expansion_factor=1.0,
+        cells=(cell,),
+        qc_decisions=(
+            QcDecision(
+                cohort="lamin",
+                cell_id=cell.cell_id,
+                acquisition_round=3,
+                decision="accept",
+                reasons=("synthetic-target-blind-acceptance",),
+                reviewer="Synthetic reviewer",
+                reviewed_at="2026-08-26T00:00:00Z",
+            ),
+        ),
+    )
+    artifacts = (
+        _write_round_artifacts(tmp_path, 2, dapi, reference_lamin),
+        _write_round_artifacts(tmp_path, 3, dapi, moved_lamin),
+    )
+
+    result = analyze_lamin_cell(cell, artifacts, config, tmp_path / "out")
+
+    expected_displacements = {"N001": 0.3, "N002": 0.8}
+    for nucleus_id, expected in expected_displacements.items():
+        profile_path = tmp_path / "out" / nucleus_id / "lamin-normal-profiles.csv"
+        with profile_path.open(newline="", encoding="utf-8") as handle:
+            profiles = tuple(csv.DictReader(handle))
+        assert profiles
+        assert {row["nucleus_id"] for row in profiles} == {nucleus_id}
+        measured = [
+            float(row["displacement_um"])
+            for row in profiles
+            if row["acquisition_round"] == "3" and row["supported"] == "True"
+        ]
+        assert np.median(measured) == pytest.approx(expected, abs=0.12)
+
+    displacement_rows = {
+        row.nucleus_id: row.value
+        for row in result.summary_rows
+        if row.acquisition_round == 3
+        and row.endpoint == "lamin_signed_displacement_median"
+    }
+    assert displacement_rows == {
+        "N001": pytest.approx(0.3, abs=0.12),
+        "N002": pytest.approx(0.8, abs=0.12),
+        "aggregate": pytest.approx(0.55, abs=0.12),
+    }
+    assert {row.nucleus_id for row in result.summary_rows} == {
+        "N001",
+        "N002",
+        "aggregate",
+    }
+    assert {row.nucleus_id for row in result.ensemble_rows} == {
+        "N001",
+        "N002",
+        "aggregate",
+    }
+    volume_rows = {
+        row.nucleus_id: row.value
+        for row in result.ensemble_rows
+        if row.acquisition_round == 3
+        and row.endpoint == "lamin_mask_volume"
+        and row.ensemble_name == "sigma=0.279;sbr=3"
+    }
+    assert float(volume_rows["N002"]) != pytest.approx(float(volume_rows["N001"]))
+    assert volume_rows["aggregate"] == pytest.approx(
+        np.median((float(volume_rows["N001"]), float(volume_rows["N002"])))
+    )
+
+
+def _fragmented_envelope(isolated_count: int) -> np.ndarray:
+    """Return one valid envelope plus separated single-voxel components."""
+    z, y, x = np.indices((32, 32, 32))
+    mask = (z - 16) ** 2 + (y - 16) ** 2 + (x - 16) ** 2 <= 6**2
+    isolated = (
+        (1, 1, 1),
+        (1, 1, 3),
+        (1, 1, 5),
+        (1, 1, 7),
+        (1, 3, 1),
+        (1, 3, 3),
+        (1, 3, 5),
+        (1, 3, 7),
+    )
+    for index in isolated[:isolated_count]:
+        mask[index] = True
+    return mask
+
+
+def test_fragmented_lamin_mask_preserves_geometry_without_curvature_abort() -> None:
+    """Degenerate curvature vertices must not alter the measured threshold mask."""
+    spacing = (1.0, 1.0, 1.0)
+    mask = _fragmented_envelope(8)
+    original = mask.copy()
+    vertices, faces = _surface_from_mask(mask, spacing)
+    expected_volume = float(mask.sum())
+    expected_area = float(mesh_surface_area(vertices, faces))
+
+    geometry = _geometry(mask, spacing)
+
+    assert np.array_equal(mask, original)
+    assert geometry["volume_um3"] == expected_volume
+    assert geometry["area_to_volume_um_inverse"] == pytest.approx(
+        expected_area / expected_volume
+    )
+    assert geometry["geometry_status"] in {
+        "partial-curvature",
+        "invalid-curvature",
+    }
+    assert 0.0 < geometry["valid_curvature_vertex_fraction"] < 1.0
+
+
+def test_curvature_coverage_uses_exact_ninety_nine_percent_rule() -> None:
+    """Curvature is reportable at 99% valid vertices and missing below it."""
+    at_least_ninety_nine = _geometry(_fragmented_envelope(4), (1.0, 1.0, 1.0))
+    below_ninety_nine = _geometry(_fragmented_envelope(8), (1.0, 1.0, 1.0))
+
+    assert at_least_ninety_nine["valid_curvature_vertex_fraction"] >= 0.99
+    assert all(
+        math.isfinite(at_least_ninety_nine[name])
+        for name in (
+            "mean_curvature_p25_um_inverse",
+            "mean_curvature_p50_um_inverse",
+            "mean_curvature_p75_um_inverse",
+        )
+    )
+    assert below_ninety_nine["valid_curvature_vertex_fraction"] < 0.99
+    assert all(
+        math.isnan(below_ninety_nine[name])
+        for name in (
+            "mean_curvature_p25_um_inverse",
+            "mean_curvature_p50_um_inverse",
+            "mean_curvature_p75_um_inverse",
+        )
+    )
+
+
 def test_ridge_requires_strict_sbr_and_rejects_search_endpoints() -> None:
     """An equality threshold or endpoint peak is not a localized supported ridge."""
     offsets = np.array((-0.1, 0.0, 0.1))
@@ -474,6 +652,7 @@ def test_cell_analysis_retains_every_frozen_ensemble_member(
     )
     revised_config = replace(
         analysis_config,
+        nominal_expansion_factor=1.0,
         cells=(cell,),
         qc_decisions=(
             QcDecision(
@@ -522,12 +701,18 @@ def test_cell_analysis_retains_every_frozen_ensemble_member(
             if row.acquisition_round == acquisition_round
             and row.endpoint == "lamin_jaccard"
         ]
-        assert len(round_rows) == 9
+        assert len(round_rows) == 18
         assert {row.ensemble_name for row in round_rows} == combinations
+        assert {
+            nucleus_id: sum(row.nucleus_id == nucleus_id for row in round_rows)
+            for nucleus_id in ("N001", "aggregate")
+        } == {"N001": 9, "aggregate": 9}
     assert {
         "lamin_mask_volume",
         "lamin_mask_area_to_volume",
         "lamin_mask_sphericity",
+        "lamin_mask_geometry_status",
+        "lamin_mask_valid_curvature_vertex_fraction",
         "lamin_fixed_to_moving_boundary_distance_p95",
         "lamin_moving_to_fixed_boundary_distance_p95",
         "lamin_surface_dice",

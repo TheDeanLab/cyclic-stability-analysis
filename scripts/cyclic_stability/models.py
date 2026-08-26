@@ -142,7 +142,7 @@ class EnsembleRow:
     endpoint: str
     ensemble_name: str
     ensemble_value: float
-    value: float
+    value: float | str
     units: str
     source_task_identity: str
     nucleus_id: str = "aggregate"
