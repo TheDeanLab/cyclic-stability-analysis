@@ -7,8 +7,9 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 from cyexm.registration._request_policy import channel_transform_parameters
@@ -37,6 +38,7 @@ from cyclic_stability.morphology import (
 )
 from cyclic_stability.nuclear import (
     REFERENCE_ROUND,
+    NuclearConsensus,
     NuclearSurface,
     _accepted_rounds,
     _atomic_publish_directory,
@@ -233,26 +235,38 @@ def multiscale_gradient_similarity(
 
 def golgi_nucleus_distances(
     mask: NDArray[np.bool_],
-    nuclear_surface: NuclearSurface,
+    nuclear_surfaces: NuclearSurface | tuple[NuclearSurface, ...],
     spacing_xyz_um: tuple[float, float, float],
 ) -> NDArray[np.float64]:
-    """Return physical XYZ distances to the nearest sampled nuclear mesh vertex.
+    """Return physical XYZ distances to the nearest accepted surface vertex.
 
     Target voxels are represented by their voxel centers.  This is a reproducible
     nearest-vertex approximation to a triangulated surface distance, not an exact
     point-to-triangle distance; spacing anisotropy is nevertheless preserved.
     """
     positive = validated_binary_mask(mask, "Golgi mask")
-    if positive.ndim != 3 or positive.shape != nuclear_surface.mask_zyx.shape:
-        raise ValueError("Golgi mask and nuclear surface must share 3D ZYX geometry")
-    if tuple(spacing_xyz_um) != tuple(nuclear_surface.spacing_xyz_um):
+    surfaces = (
+        (nuclear_surfaces,)
+        if isinstance(nuclear_surfaces, NuclearSurface)
+        else nuclear_surfaces
+    )
+    if positive.ndim != 3 or not surfaces:
+        raise ValueError("Golgi distance requires a 3D mask and accepted nuclei")
+    if any(positive.shape != surface.mask_zyx.shape for surface in surfaces):
+        raise ValueError("Golgi mask and nuclear surfaces must share 3D ZYX geometry")
+    if any(
+        tuple(spacing_xyz_um) != tuple(surface.spacing_xyz_um) for surface in surfaces
+    ):
         raise ValueError("Golgi and nuclear-surface spacing must match")
     indices_zyx = np.argwhere(positive)
     if indices_zyx.size == 0:
         return np.empty(0, dtype=np.float64)
     sx, sy, sz = spacing_xyz_um
     points_xyz = indices_zyx[:, ::-1] * np.array((sx, sy, sz))
-    return cKDTree(nuclear_surface.vertices_xyz_um).query(points_xyz, k=1)[0]
+    vertices_xyz_um = np.concatenate(
+        tuple(surface.vertices_xyz_um for surface in surfaces), axis=0
+    )
+    return cKDTree(vertices_xyz_um).query(points_xyz, k=1)[0]
 
 
 def _component_volume_gini(volumes_um3: NDArray[np.float64]) -> float:
@@ -665,10 +679,13 @@ def analyze_golgi_arrays(
         raise ValueError("registered Golgi rounds must share fixed-grid geometry")
     common_validity = _common_validity_masks(rounds, validity_masks)
     common_support = np.logical_and.reduce(tuple(common_validity.values()))
-    surface = consensus_nuclear_surface(
-        dapi_rounds, config.voxel_spacing_xyz_um, config.nuclear
+    consensus = consensus_nuclear_surface(
+        dapi_rounds,
+        config.voxel_spacing_xyz_um,
+        config.nuclear,
+        config.nominal_expansion_factor,
     )
-    roi = _perinuclear_roi(surface.mask_zyx, common_validity, config)
+    roi = _perinuclear_roi(consensus.mask_zyx, common_validity, config)
     reference = rounds[REFERENCE_ROUND]
     ensemble_by_round = {
         round_number: _support_threshold_ensemble(
@@ -735,7 +752,7 @@ def analyze_golgi_arrays(
         ):
             geometry = _mask_geometry(member.mask_zyx, config.voxel_spacing_xyz_um)
             distances = golgi_nucleus_distances(
-                member.mask_zyx, surface, config.voxel_spacing_xyz_um
+                member.mask_zyx, consensus.nuclei, config.voxel_spacing_xyz_um
             )
             background = member.background
             corrected_signal = float(
@@ -789,7 +806,13 @@ def analyze_golgi_arrays(
                 )
             )
     return MarkerResult(
-        "golgi", "array", tuple(summary_rows), tuple(ensemble_rows), (), ()
+        "golgi",
+        "array",
+        tuple(summary_rows),
+        tuple(ensemble_rows),
+        (),
+        (),
+        tuple(MappingProxyType(asdict(row)) for row in consensus.component_qc),
     )
 
 
@@ -808,6 +831,7 @@ def _rebind_cell(result: MarkerResult, cell: CellSpec) -> MarkerResult:
         ),
         result.diagnostics,
         result.input_identities,
+        result.component_qc_rows,
     )
 
 
@@ -815,7 +839,7 @@ def _write_diagnostics(
     output_dir: Path,
     rounds: Mapping[int, NDArray[np.float64]],
     result: MarkerResult,
-    surface: NuclearSurface,
+    consensus: NuclearConsensus,
     roi: NDArray[np.bool_],
     threshold_masks: Mapping[int, tuple[MaskMember, ...]],
 ) -> tuple[Path, ...]:
@@ -831,7 +855,7 @@ def _write_diagnostics(
         overlay = staged / "golgi-registered-overlays.npz"
         np.savez_compressed(
             overlay,
-            consensus_nuclear_mask_zyx=surface.mask_zyx,
+            consensus_nuclear_mask_zyx=consensus.mask_zyx,
             fixed_perinuclear_roi_zyx=roi,
             **{f"round_{number}_target_zyx": image for number, image in rounds.items()},
             **{
@@ -853,7 +877,7 @@ def _write_diagnostics(
         )
         reference = rounds[REFERENCE_ROUND].max(axis=0)
         roi_mip = roi.max(axis=0)
-        nucleus_mip = surface.mask_zyx.max(axis=0)
+        nucleus_mip = consensus.mask_zyx.max(axis=0)
         figure_paths: list[Path] = []
         union_masks = {
             number: np.logical_or.reduce([member.mask_zyx for member in members])
@@ -928,10 +952,13 @@ def analyze_golgi_cell(
     result = _rebind_cell(
         analyze_golgi_arrays(golgi, dapi, config, validity_masks=common_validity), cell
     )
-    surface = consensus_nuclear_surface(
-        dapi, config.voxel_spacing_xyz_um, config.nuclear
+    consensus = consensus_nuclear_surface(
+        dapi,
+        config.voxel_spacing_xyz_um,
+        config.nuclear,
+        config.nominal_expansion_factor,
     )
-    roi = _perinuclear_roi(surface.mask_zyx, common_validity, config)
+    roi = _perinuclear_roi(consensus.mask_zyx, common_validity, config)
     threshold_masks = {
         round_number: _support_threshold_ensemble(
             image,
@@ -942,7 +969,7 @@ def analyze_golgi_cell(
         for round_number, image in golgi.items()
     }
     diagnostics = _write_diagnostics(
-        output_dir, golgi, result, surface, roi, threshold_masks
+        output_dir, golgi, result, consensus, roi, threshold_masks
     )
     return replace(
         result,

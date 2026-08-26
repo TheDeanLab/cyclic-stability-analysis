@@ -8,9 +8,9 @@ import numpy as np
 import pytest
 from cyclic_stability.models import AnalysisConfig
 from cyclic_stability.morphology import threshold_ensemble
-from cyclic_stability.signal import measure_signal
+from cyclic_stability.signal import measure_signal, raw_structure_roi
 from scipy.ndimage import gaussian_filter
-from synthetic import synthetic_roi, synthetic_target
+from synthetic import ellipsoid_dapi, synthetic_roi, synthetic_target
 
 
 def _ensemble(config: AnalysisConfig):
@@ -35,6 +35,49 @@ def test_round_one_signal_is_kept_out_of_matched_setting_rows(
     )
     assert all(row.comparison_set == "round-1-exposure-sensitivity" for row in rows)
     assert all(row.exposure_normalized for row in rows)
+
+
+def test_raw_signal_roi_uses_the_union_of_every_accepted_nucleus(
+    analysis_config: AnalysisConfig,
+) -> None:
+    """Raw target ROIs must not select one favorable nucleus from the DAPI field."""
+    spacing = (0.5, 0.5, 0.5)
+    dapi = ellipsoid_dapi(
+        ((6.0, 6.0, 6.0), (20.0, 6.0, 6.0)),
+        ((4.0, 4.0, 4.0), (4.0, 4.0, 4.0)),
+        spacing,
+        (28, 28, 56),
+    )
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=spacing,
+        nominal_expansion_factor=1.0,
+    )
+    lamin_roi = raw_structure_roi("lamin", dapi, config)
+    golgi_roi = raw_structure_roi("golgi", dapi, config)
+    lamp_roi = raw_structure_roi("lamp1", dapi, config)
+    assert np.any(lamin_roi[:, :, :28])
+    assert np.any(lamin_roi[:, :, 28:])
+    assert np.array_equal(golgi_roi, ~lamin_roi)
+    assert np.array_equal(lamp_roi, ~lamin_roi)
+
+
+def test_raw_signal_rows_serialize_explicit_aggregate_nucleus_id(
+    analysis_config: AnalysisConfig,
+) -> None:
+    """Field-level raw-signal rows must state their aggregate analysis unit."""
+    rows = measure_signal(
+        analysis_config.cell("golgi", "Cell1").rounds[1],
+        synthetic_target(),
+        synthetic_roi(),
+        _ensemble(analysis_config),
+    )
+    assert rows
+    dictionaries = [
+        {field: getattr(row, field) for field in row.__dataclass_fields__}
+        for row in rows
+    ]
+    assert all(row["nucleus_id"] == "aggregate" for row in dictionaries)
 
 
 @pytest.mark.parametrize("round_index", (1, 2, 3, 4))

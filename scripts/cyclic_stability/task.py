@@ -499,7 +499,12 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
             task.config.voxel_spacing_xyz_um,
         )
         signal_rows.extend(
-            asdict(row) for row in measure_signal(round_spec, raw_target, roi, members)
+            {
+                field: dict(value) if isinstance(value, Mapping) else value
+                for field in row.__dataclass_fields__
+                for value in (getattr(row, field),)
+            }
+            for row in measure_signal(round_spec, raw_target, roi, members)
         )
     return TaskOutput(
         tables={
@@ -508,6 +513,9 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
             "summary": tuple(asdict(item) for item in result.summary_rows),
             "ensemble": tuple(asdict(item) for item in result.ensemble_rows),
             "raw-signal": tuple(signal_rows),
+            "nuclear-component-qc": tuple(
+                dict(row) for row in result.component_qc_rows
+            ),
         },
         diagnostics=(*qc.overlay_paths, *result.diagnostics),
     )

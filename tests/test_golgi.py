@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -38,11 +38,45 @@ from cyexm.registration.artifacts import (
 from cyexm.spatial import ImageGeometry
 from scipy.ndimage import distance_transform_edt
 from synthetic import (
-    NUCLEAR_CONFIG,
+    ellipsoid_dapi,
     synthetic_dapi_rounds,
     synthetic_golgi,
     synthetic_perinuclear_roi,
 )
+
+
+def _two_nucleus_consensus(analysis_config):
+    """Return a compact accepted two-nucleus field for consumer tests."""
+    spacing = (0.5, 0.5, 0.5)
+    dapi = ellipsoid_dapi(
+        ((6.0, 6.0, 6.0), (20.0, 6.0, 6.0)),
+        ((4.0, 4.0, 4.0), (4.0, 4.0, 4.0)),
+        spacing,
+        (28, 28, 56),
+    )
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=spacing,
+        nominal_expansion_factor=1.0,
+    )
+    return (
+        consensus_nuclear_surface(
+            {2: dapi},
+            spacing,
+            config.nuclear,
+            nominal_expansion_factor=config.nominal_expansion_factor,
+        ),
+        config,
+    )
+
+
+def _small_nucleus_config(analysis_config):
+    """Admit the compact single-nucleus fixture in expanded synthetic units."""
+    return replace(
+        analysis_config,
+        nominal_expansion_factor=1.0,
+        nuclear=replace(analysis_config.nuclear, nominal_volume_um3=(1.0, 5000.0)),
+    )
 
 
 def _full_support(rounds: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
@@ -370,17 +404,18 @@ def test_support_aware_preprocessing_ignores_invalid_region_values(
     assert changed == baseline
     rounds = {2: reference, 3: reference.copy()}
     validity_by_round = {2: valid, 3: valid}
+    config = _small_nucleus_config(analysis_config)
     baseline_result = analyze_golgi_arrays(
         rounds,
         synthetic_dapi_rounds(),
-        analysis_config,
+        config,
         validity_masks=validity_by_round,
     )
     rounds[3][:, :, :24] = 1e12
     changed_result = analyze_golgi_arrays(
         rounds,
         synthetic_dapi_rounds(),
-        analysis_config,
+        config,
         validity_masks=validity_by_round,
     )
     assert [row.endpoint for row in changed_result.ensemble_rows] == [
@@ -412,7 +447,7 @@ def test_fragmentation_change_is_reported_for_every_frozen_member(
     result = analyze_golgi_arrays(
         {2: synthetic_golgi(components=1), 3: synthetic_golgi(components=4)},
         synthetic_dapi_rounds(),
-        analysis_config,
+        _small_nucleus_config(analysis_config),
         validity_masks=_full_support({2: synthetic_golgi(), 3: synthetic_golgi()}),
     )
     counts = [
@@ -431,23 +466,25 @@ def test_perinuclear_roi_is_fixed_outside_consensus_and_limited_to_18_um(
 ) -> None:
     """A target-derived or round-specific ROI would make morphology non-comparable."""
     dapi = synthetic_dapi_rounds()
+    config = _small_nucleus_config(analysis_config)
     surface = consensus_nuclear_surface(
-        dapi, analysis_config.voxel_spacing_xyz_um, NUCLEAR_CONFIG
+        dapi,
+        config.voxel_spacing_xyz_um,
+        config.nuclear,
+        nominal_expansion_factor=config.nominal_expansion_factor,
     )
     validity = {
         round_number: np.ones(surface.mask_zyx.shape, dtype=bool)
         for round_number in dapi
     }
-    roi = _perinuclear_roi(surface.mask_zyx, validity, analysis_config)
+    roi = _perinuclear_roi(surface.mask_zyx, validity, config)
     distances = distance_transform_edt(
         ~surface.mask_zyx,
-        sampling=analysis_config.voxel_spacing_xyz_um[::-1],
+        sampling=config.voxel_spacing_xyz_um[::-1],
     )
     assert not np.any(roi & surface.mask_zyx)
     assert float(distances[roi].max()) <= 18.0
-    assert np.array_equal(
-        roi, _perinuclear_roi(surface.mask_zyx, validity, analysis_config)
-    )
+    assert np.array_equal(roi, _perinuclear_roi(surface.mask_zyx, validity, config))
 
 
 def test_perinuclear_roi_intersects_explicit_transform_validity_not_target_values(
@@ -455,15 +492,19 @@ def test_perinuclear_roi_intersects_explicit_transform_validity_not_target_value
 ) -> None:
     """Target finiteness is not evidence that a moving transform sampled valid data."""
     dapi = synthetic_dapi_rounds()
+    config = _small_nucleus_config(analysis_config)
     surface = consensus_nuclear_surface(
-        dapi, analysis_config.voxel_spacing_xyz_um, NUCLEAR_CONFIG
+        dapi,
+        config.voxel_spacing_xyz_um,
+        config.nuclear,
+        nominal_expansion_factor=config.nominal_expansion_factor,
     )
     validity = {
         round_number: np.ones(surface.mask_zyx.shape, dtype=bool)
         for round_number in dapi
     }
     validity[3][:, :, :20] = False
-    roi = _perinuclear_roi(surface.mask_zyx, validity, analysis_config)
+    roi = _perinuclear_roi(surface.mask_zyx, validity, config)
     assert not np.any(roi[:, :, :20])
 
 
@@ -474,7 +515,7 @@ def test_round_two_is_reference_regardless_of_mapping_order(analysis_config) -> 
     result = analyze_golgi_arrays(
         {3: moving, 2: reference},
         {3: synthetic_dapi_rounds()[3], 2: synthetic_dapi_rounds()[2]},
-        analysis_config,
+        _small_nucleus_config(analysis_config),
         validity_masks=_full_support({2: reference, 3: moving}),
     )
     round_two = [
@@ -514,7 +555,7 @@ def test_all_empty_members_keep_every_predeclared_summary_endpoint(
 ) -> None:
     """Dropping all-NaN endpoints creates a data-dependent outcome schema."""
     empty_config = replace(
-        analysis_config,
+        _small_nucleus_config(analysis_config),
         ensembles=replace(analysis_config.ensembles, threshold_sbr=(1e9,)),
     )
     result = analyze_golgi_arrays(
@@ -557,7 +598,7 @@ def test_ensemble_rows_preserve_all_coordinates_and_endpoints(analysis_config) -
     result = analyze_golgi_arrays(
         {2: synthetic_golgi(), 3: synthetic_golgi()},
         synthetic_dapi_rounds(),
-        analysis_config,
+        _small_nucleus_config(analysis_config),
         validity_masks=_full_support({2: synthetic_golgi(), 3: synthetic_golgi()}),
     )
     members = len(analysis_config.ensembles.gaussian_sigma_um) * len(
@@ -671,12 +712,15 @@ def test_atomic_golgi_diagnostic_publisher_restores_previous_tree_on_failure(
 def test_target_distances_use_full_physical_xyz_coordinates(analysis_config) -> None:
     """Index-space or XY-only distances mis-measure anisotropic Z displacement."""
     surface = consensus_nuclear_surface(
-        synthetic_dapi_rounds(), analysis_config.voxel_spacing_xyz_um, NUCLEAR_CONFIG
+        synthetic_dapi_rounds(),
+        analysis_config.voxel_spacing_xyz_um,
+        _small_nucleus_config(analysis_config).nuclear,
+        nominal_expansion_factor=1.0,
     )
     mask = np.zeros(surface.mask_zyx.shape, dtype=bool)
     mask[40, 64, 64] = True
     distances = golgi_nucleus_distances(
-        mask, surface, analysis_config.voxel_spacing_xyz_um
+        mask, surface.nuclei, analysis_config.voxel_spacing_xyz_um
     )
     assert distances.shape == (1,)
     assert distances[0] > 3.0
@@ -685,6 +729,7 @@ def test_target_distances_use_full_physical_xyz_coordinates(analysis_config) -> 
 def test_target_distance_characterizes_anisotropic_voxel_center_coordinates() -> None:
     """Treating ZYX indices as equal XYZ units would turn a 0.3 um Z step into one."""
     surface = NuclearSurface(
+        "N001",
         np.zeros((3, 3, 3), dtype=bool),
         np.array(((0.0, 0.0, 0.0),)),
         np.empty((0, 3), dtype=int),
@@ -698,6 +743,53 @@ def test_target_distance_characterizes_anisotropic_voxel_center_coordinates() ->
     assert golgi_nucleus_distances(mask, surface, (0.1, 0.1, 0.3)) == pytest.approx(
         (0.3,)
     )
+
+
+def test_golgi_union_roi_and_distances_consume_every_accepted_nucleus(
+    analysis_config,
+) -> None:
+    """Using only the first nucleus would leak the second into the Golgi ROI."""
+    consensus, config = _two_nucleus_consensus(analysis_config)
+    validity = {2: np.ones(consensus.mask_zyx.shape, dtype=bool)}
+    roi = _perinuclear_roi(consensus.mask_zyx, validity, config)
+    assert not np.any(roi & consensus.nuclei[0].mask_zyx)
+    assert not np.any(roi & consensus.nuclei[1].mask_zyx)
+
+    target_mask = np.zeros(consensus.mask_zyx.shape, dtype=bool)
+    target_index_zyx = (12, 12, 49)
+    target_mask[target_index_zyx] = True
+    target_xyz_um = np.asarray(target_index_zyx[::-1]) * np.asarray(
+        config.voxel_spacing_xyz_um
+    )
+    expected = min(
+        float(np.linalg.norm(surface.vertices_xyz_um - target_xyz_um, axis=1).min())
+        for surface in consensus.nuclei
+    )
+    assert golgi_nucleus_distances(
+        target_mask, consensus.nuclei, config.voxel_spacing_xyz_um
+    ) == pytest.approx((expected,))
+    assert expected < float(
+        np.linalg.norm(
+            consensus.nuclei[0].vertices_xyz_um - target_xyz_um, axis=1
+        ).min()
+    )
+
+
+def test_golgi_rows_serialize_explicit_aggregate_nucleus_id(analysis_config) -> None:
+    """Field-level Golgi rows must not imply organelle ownership by one nucleus."""
+    rounds = {2: synthetic_golgi(), 3: synthetic_golgi()}
+    config = _small_nucleus_config(analysis_config)
+    result = analyze_golgi_arrays(
+        rounds,
+        synthetic_dapi_rounds(),
+        config,
+        validity_masks=_full_support(rounds),
+    )
+    dictionaries = [
+        asdict(row) for row in (*result.summary_rows, *result.ensemble_rows)
+    ]
+    assert dictionaries
+    assert all(row["nucleus_id"] == "aggregate" for row in dictionaries)
 
 
 @pytest.mark.parametrize("bad", (np.nan, np.inf, -1.0, 0.5, 2.0))

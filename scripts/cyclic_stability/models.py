@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -157,6 +158,7 @@ class MarkerResult:
     ensemble_rows: tuple[EnsembleRow, ...]
     diagnostics: tuple[Path, ...]
     input_identities: tuple[str, ...]
+    component_qc_rows: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

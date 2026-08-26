@@ -3,12 +3,132 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
+from types import MappingProxyType, SimpleNamespace
 
+import numpy as np
 import pytest
-from cyclic_stability.task import _record_from_payload, _record_payload, run_cell_task
+from cyclic_stability.models import MarkerResult, QcDecision
+from cyclic_stability.nuclear import NuclearComponentQc
+from cyclic_stability.signal import SignalRow
+from cyclic_stability.task import (
+    CellTask,
+    PreflightSnapshot,
+    _record_from_payload,
+    _record_payload,
+    default_marker_analyzer,
+    run_cell_task,
+)
 from synthetic import cell_task, different_identity
+
+
+def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accepted and rejected DAPI components must remain visible without target fields."""
+    from cyclic_stability import golgi, images, morphology, provenance, registration_qc
+    from cyclic_stability import signal as signal_module
+
+    cell = analysis_config.cell("golgi", "Cell1")
+    decisions = tuple(
+        QcDecision(
+            "golgi",
+            cell.cell_id,
+            number,
+            "accept",
+            ("target-blind",),
+            "reviewer",
+            "2026-08-26T00:00:00Z",
+        )
+        for number in (1, 3, 4, 5)
+    )
+    config = replace(analysis_config, qc_decisions=decisions)
+    component_qc_rows = (
+        NuclearComponentQc(
+            "N001",
+            True,
+            (),
+            800.0,
+            100.0,
+            0.9,
+            (1.0, 2.0, 3.0),
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        ),
+        NuclearComponentQc(
+            "C002",
+            False,
+            ("volume-below-minimum",),
+            8.0,
+            1.0,
+            0.8,
+            (4.0, 5.0, 6.0),
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        ),
+    )
+    component_qc = tuple(MappingProxyType(asdict(row)) for row in component_qc_rows)
+    marker_result = MarkerResult("golgi", cell.cell_id, (), (), (), (), component_qc)
+    monkeypatch.setattr(
+        registration_qc,
+        "analyze_registration_qc",
+        lambda *_args: SimpleNamespace(
+            registration_rows=(), deformation_rows=(), overlay_paths=()
+        ),
+    )
+    monkeypatch.setattr(golgi, "analyze_golgi_cell", lambda *_args: marker_result)
+    monkeypatch.setattr(
+        provenance,
+        "channel_tiff_paths",
+        lambda _round: (
+            ("dapi", tmp_path / "dapi.tif"),
+            ("target", tmp_path / "target.tif"),
+        ),
+    )
+    monkeypatch.setattr(images, "load_volume", lambda _path: np.ones((3, 3, 3)))
+    monkeypatch.setattr(
+        signal_module,
+        "raw_structure_roi",
+        lambda *_args: np.ones((3, 3, 3), dtype=bool),
+    )
+    monkeypatch.setattr(morphology, "threshold_ensemble", lambda *_args: ())
+    signal_row = SignalRow(
+        "golgi",
+        cell.cell_id,
+        2,
+        "matched-settings",
+        True,
+        0.5,
+        3.0,
+        "measured",
+        10.0,
+        4.0,
+        2.0,
+        MappingProxyType({50: 5.0}),
+        MappingProxyType({50: 4.0}),
+    )
+    monkeypatch.setattr(signal_module, "measure_signal", lambda *_args: (signal_row,))
+    task = CellTask(
+        cell,
+        config,
+        config.config_digest,
+        (),
+        default_marker_analyzer,
+        preflight=PreflightSnapshot((), ()),
+    )
+    output = default_marker_analyzer(task, tmp_path / "output")
+    rows = output.tables["nuclear-component-qc"]
+    assert [row["nucleus_id"] for row in rows] == ["N001", "C002"]
+    assert [row["accepted"] for row in rows] == [True, False]
+    expected_fields = set(NuclearComponentQc.__dataclass_fields__)
+    assert all(set(row) == expected_fields for row in rows)
+    assert all(
+        not any(
+            "target" in field or "intensity" in field or "mask" in field
+            for field in row
+        )
+        for row in rows
+    )
+    assert output.tables["raw-signal"][0]["nucleus_id"] == "aggregate"
 
 
 def test_completed_task_is_reused_only_for_matching_inputs(tmp_path: Path) -> None:
