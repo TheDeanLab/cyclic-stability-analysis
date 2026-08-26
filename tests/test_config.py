@@ -51,6 +51,7 @@ def test_analysis_config_parses_multinuclear_bounds(
     [
         ("accepted_component_count", [0, 6]),
         ("accepted_component_count", [6, 1]),
+        ("accepted_component_count", [1, 7]),
         ("nominal_volume_um3", [5000.0, 100.0]),
         ("minimum_sphericity", 1.1),
         ("maximum_face_contact_fraction", 1.1),

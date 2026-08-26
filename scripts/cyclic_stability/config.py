@@ -100,6 +100,13 @@ def _integer_pair(value: object, name: str) -> tuple[int, int]:
     return lower, upper
 
 
+def _accepted_component_count(value: object) -> tuple[int, int]:
+    result = _integer_pair(value, "nuclear.accepted_component_count")
+    if result[1] > 6:
+        raise ValueError("nuclear.accepted_component_count must not exceed 6")
+    return result
+
+
 def _ordered_positive_pair(value: object, name: str) -> tuple[float, float]:
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
         raise ValueError(f"{name} must be a pair of positive numbers")  # noqa: TRY004
@@ -293,9 +300,8 @@ def _parse_scientific_config(
             ridge_min_sbr=_number(
                 nuclear_data["ridge_min_sbr"], "nuclear.ridge_min_sbr"
             ),
-            accepted_component_count=_integer_pair(
-                nuclear_data["accepted_component_count"],
-                "nuclear.accepted_component_count",
+            accepted_component_count=_accepted_component_count(
+                nuclear_data["accepted_component_count"]
             ),
             nominal_volume_um3=_ordered_positive_pair(
                 nuclear_data["nominal_volume_um3"], "nuclear.nominal_volume_um3"
