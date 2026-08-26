@@ -431,6 +431,8 @@ def test_lamp_analysis_emits_round_two_and_adjacent_comparisons_for_every_ensemb
         "moving_object_index",
         "normalized_displacement",
     }
+    assert {row["nucleus_id"] for row in objects} == {"aggregate"}
+    assert {row["nucleus_id"] for row in matches} == {"aggregate"}
     stale = tmp_path / "output" / "stale.txt"
     stale.write_text("obsolete", encoding="utf-8")
     analyze_lamp1_cell(cell, artifacts, config, tmp_path / "output")

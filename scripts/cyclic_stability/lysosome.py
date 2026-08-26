@@ -756,6 +756,7 @@ def analyze_lamp1_cell(
                     "sphericity",
                     "nearest_neighbor_distance_um",
                     "nucleus_relative_distance_um",
+                    "nucleus_id",
                 )
             )
             for number, members in sorted(detections.items()):
@@ -773,6 +774,7 @@ def analyze_lamp1_cell(
                                 object_.sphericity,
                                 object_.nearest_neighbor_distance_um,
                                 object_.nucleus_relative_distance_um,
+                                "aggregate",
                             )
                         )
         matches_table = staged / "matches.csv"
@@ -796,6 +798,7 @@ def analyze_lamp1_cell(
                     "lateral_displacement_um",
                     "axial_displacement_um",
                     "normalized_displacement",
+                    "nucleus_id",
                 )
             )
             for (
@@ -828,6 +831,7 @@ def analyze_lamp1_cell(
                             match.lateral_displacements_um[pair_index],
                             match.axial_displacements_um[pair_index],
                             match.normalized_displacements[pair_index],
+                            "aggregate",
                         )
                     )
         staged_paths = (diagnostic, table, objects_table, matches_table)
