@@ -1240,10 +1240,15 @@ def _aggregate_metric_rows(rows: tuple[MetricRow, ...]) -> tuple[MetricRow, ...]
 
 def _aggregate_ensemble_rows(
     rows: tuple[EnsembleRow, ...],
+    exact_coordinates: tuple[tuple[float, float, float | None], ...],
 ) -> tuple[EnsembleRow, ...]:
     """Take field medians over matching nucleus-level ensemble coordinates."""
+    if len(rows) != len(exact_coordinates):
+        raise ValueError("every ensemble row requires one exact scientific coordinate")
     grouped: dict[tuple[object, ...], list[EnsembleRow]] = {}
-    for row in rows:
+    for row, (sigma_um, threshold_sbr, tolerance) in zip(
+        rows, exact_coordinates, strict=True
+    ):
         if row.nucleus_id == "aggregate":
             continue
         key = (
@@ -1251,8 +1256,9 @@ def _aggregate_ensemble_rows(
             row.cell_id,
             row.acquisition_round,
             row.endpoint,
-            row.ensemble_name,
-            row.ensemble_value,
+            sigma_um,
+            threshold_sbr,
+            tolerance,
             row.units,
             row.source_task_identity,
         )
@@ -1336,6 +1342,7 @@ def analyze_lamin_cell(
     profile_rows: list[LaminProfileRow] = []
     summary_rows: list[MetricRow] = []
     ensemble_rows: list[EnsembleRow] = []
+    ensemble_coordinates: list[tuple[float, float, float | None]] = []
     for surface in consensus.nuclei:
         profiles = lamin_normal_profiles(surface, lamin, config.nuclear, backgrounds)
         profiles_by_nucleus[surface.nucleus_id] = profiles
@@ -1365,7 +1372,8 @@ def analyze_lamin_cell(
                 )
                 name = f"sigma={member.sigma_um:g};sbr={member.threshold_sbr:g}"
                 ensemble_value = member.threshold_sbr
-                ensemble_rows.extend(
+                exact_coordinate = (member.sigma_um, member.threshold_sbr, None)
+                geometry_rows = tuple(
                     _ensemble_row(
                         cell,
                         round_number,
@@ -1408,42 +1416,48 @@ def analyze_lamin_cell(
                         ("geometry_status", geometry["geometry_status"], "status"),
                     )
                 )
-                ensemble_rows.extend(
-                    (
-                        _ensemble_row(
-                            cell,
-                            round_number,
-                            "lamin_jaccard",
-                            name,
-                            ensemble_value,
-                            surface_metrics.jaccard,
-                            "fraction",
-                            config,
-                            surface.nucleus_id,
-                        ),
-                        _ensemble_row(
-                            cell,
-                            round_number,
-                            "lamin_fixed_to_moving_boundary_distance_p95",
-                            name,
-                            ensemble_value,
-                            surface_metrics.fixed_to_moving_normalized_distance_p95,
-                            "resolution-units",
-                            config,
-                            surface.nucleus_id,
-                        ),
-                        _ensemble_row(
-                            cell,
-                            round_number,
-                            "lamin_moving_to_fixed_boundary_distance_p95",
-                            name,
-                            ensemble_value,
-                            surface_metrics.moving_to_fixed_normalized_distance_p95,
-                            "resolution-units",
-                            config,
-                            surface.nucleus_id,
-                        ),
-                    )
+                ensemble_rows.extend(geometry_rows)
+                ensemble_coordinates.extend(
+                    exact_coordinate for _ in range(len(geometry_rows))
+                )
+                surface_rows = (
+                    _ensemble_row(
+                        cell,
+                        round_number,
+                        "lamin_jaccard",
+                        name,
+                        ensemble_value,
+                        surface_metrics.jaccard,
+                        "fraction",
+                        config,
+                        surface.nucleus_id,
+                    ),
+                    _ensemble_row(
+                        cell,
+                        round_number,
+                        "lamin_fixed_to_moving_boundary_distance_p95",
+                        name,
+                        ensemble_value,
+                        surface_metrics.fixed_to_moving_normalized_distance_p95,
+                        "resolution-units",
+                        config,
+                        surface.nucleus_id,
+                    ),
+                    _ensemble_row(
+                        cell,
+                        round_number,
+                        "lamin_moving_to_fixed_boundary_distance_p95",
+                        name,
+                        ensemble_value,
+                        surface_metrics.moving_to_fixed_normalized_distance_p95,
+                        "resolution-units",
+                        config,
+                        surface.nucleus_id,
+                    ),
+                )
+                ensemble_rows.extend(surface_rows)
+                ensemble_coordinates.extend(
+                    exact_coordinate for _ in range(len(surface_rows))
                 )
                 for tolerance, dice in surface_metrics.surface_dice.items():
                     ensemble_rows.append(
@@ -1458,6 +1472,9 @@ def analyze_lamin_cell(
                             config,
                             surface.nucleus_id,
                         )
+                    )
+                    ensemble_coordinates.append(
+                        (member.sigma_um, member.threshold_sbr, tolerance)
                     )
         nuclear_geometry = _nuclear_surface_geometry(surface)
         summary_rows.extend(
@@ -1501,13 +1518,14 @@ def analyze_lamin_cell(
     summary_rows[:0] = _metric_rows(cell, tuple(profile_rows), config)
     per_nucleus_summary = tuple(summary_rows)
     per_nucleus_ensemble = tuple(ensemble_rows)
+    per_nucleus_coordinates = tuple(ensemble_coordinates)
     all_summary_rows = (
         *per_nucleus_summary,
         *_aggregate_metric_rows(per_nucleus_summary),
     )
     all_ensemble_rows = (
         *per_nucleus_ensemble,
-        *_aggregate_ensemble_rows(per_nucleus_ensemble),
+        *_aggregate_ensemble_rows(per_nucleus_ensemble, per_nucleus_coordinates),
     )
     staged_diagnostics: tuple[Path, ...] = ()
     staging_root: Path | None = None

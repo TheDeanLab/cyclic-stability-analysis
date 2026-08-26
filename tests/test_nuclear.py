@@ -16,11 +16,13 @@ from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.models import (
     AnalysisConfig,
     CellSpec,
+    EnsembleRow,
     NuclearConfig,
     QcDecision,
 )
 from cyclic_stability.nuclear import (
     LaminProfileRow,
+    _aggregate_ensemble_rows,
     _geometry,
     _metric_rows,
     _ridge,
@@ -527,6 +529,151 @@ def test_per_nucleus_lamin_profiles_and_metrics_isolate_local_ridges(
     assert volume_rows["aggregate"] == pytest.approx(
         np.median((float(volume_rows["N001"]), float(volume_rows["N002"])))
     )
+
+
+def test_aggregate_collision_uses_exact_sigma_not_display_name() -> None:
+    """Rounded display labels must not merge distinct Gaussian scales."""
+    sigma_a = 0.12345671
+    sigma_b = 0.12345672
+    sbr = 3.0
+    name_a = f"sigma={sigma_a:g};sbr={sbr:g}"
+    name_b = f"sigma={sigma_b:g};sbr={sbr:g}"
+    assert name_a == name_b
+    rows = (
+        EnsembleRow(
+            "lamin",
+            "Collision",
+            3,
+            "lamin_mask_volume",
+            name_a,
+            sbr,
+            1.0,
+            "um3",
+            "digest",
+            "N001",
+        ),
+        EnsembleRow(
+            "lamin",
+            "Collision",
+            3,
+            "lamin_mask_volume",
+            name_a,
+            sbr,
+            3.0,
+            "um3",
+            "digest",
+            "N002",
+        ),
+        EnsembleRow(
+            "lamin",
+            "Collision",
+            3,
+            "lamin_mask_volume",
+            name_b,
+            sbr,
+            10.0,
+            "um3",
+            "digest",
+            "N001",
+        ),
+        EnsembleRow(
+            "lamin",
+            "Collision",
+            3,
+            "lamin_mask_volume",
+            name_b,
+            sbr,
+            14.0,
+            "um3",
+            "digest",
+            "N002",
+        ),
+    )
+    coordinates = (
+        (sigma_a, sbr, None),
+        (sigma_a, sbr, None),
+        (sigma_b, sbr, None),
+        (sigma_b, sbr, None),
+    )
+
+    aggregated = _aggregate_ensemble_rows(rows, coordinates)
+
+    assert [row.value for row in aggregated] == [2.0, 12.0]
+    assert [row.ensemble_name for row in aggregated] == [name_a, name_b]
+    assert [row.ensemble_value for row in aggregated] == [sbr, sbr]
+
+
+def test_surface_dice_aggregate_collision_uses_exact_sbr_and_tolerance() -> None:
+    """Surface Dice retains tolerance publicly but groups on its exact SBR too."""
+    sigma = 0.25
+    sbr_a = 3.1234561
+    sbr_b = 3.1234562
+    tolerance = 0.5
+    name_a = f"sigma={sigma:g};sbr={sbr_a:g}"
+    name_b = f"sigma={sigma:g};sbr={sbr_b:g}"
+    assert name_a == name_b
+    rows = (
+        EnsembleRow(
+            "lamin",
+            "Collision",
+            3,
+            "lamin_surface_dice",
+            name_a,
+            tolerance,
+            0.1,
+            "fraction",
+            "digest",
+            "N001",
+        ),
+        EnsembleRow(
+            "lamin",
+            "Collision",
+            3,
+            "lamin_surface_dice",
+            name_a,
+            tolerance,
+            0.3,
+            "fraction",
+            "digest",
+            "N002",
+        ),
+        EnsembleRow(
+            "lamin",
+            "Collision",
+            3,
+            "lamin_surface_dice",
+            name_b,
+            tolerance,
+            0.6,
+            "fraction",
+            "digest",
+            "N001",
+        ),
+        EnsembleRow(
+            "lamin",
+            "Collision",
+            3,
+            "lamin_surface_dice",
+            name_b,
+            tolerance,
+            1.0,
+            "fraction",
+            "digest",
+            "N002",
+        ),
+    )
+    coordinates = (
+        (sigma, sbr_a, tolerance),
+        (sigma, sbr_a, tolerance),
+        (sigma, sbr_b, tolerance),
+        (sigma, sbr_b, tolerance),
+    )
+
+    aggregated = _aggregate_ensemble_rows(rows, coordinates)
+
+    assert [row.value for row in aggregated] == [0.2, 0.8]
+    assert [row.ensemble_name for row in aggregated] == [name_a, name_b]
+    assert [row.ensemble_value for row in aggregated] == [tolerance, tolerance]
 
 
 def _fragmented_envelope(isolated_count: int) -> np.ndarray:
