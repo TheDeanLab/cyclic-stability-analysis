@@ -306,6 +306,10 @@ nuclear:
   normal_half_window_um: 1.5
   normal_step_um: 0.05
   ridge_min_sbr: 3.0
+  accepted_component_count: [1, 6]
+  nominal_volume_um3: [100.0, 5000.0]
+  minimum_sphericity: 0.15
+  maximum_face_contact_fraction: 0.10
 golgi:
   perinuclear_outer_distance_um: 18.0
 lysosome:
@@ -565,4 +569,8 @@ NUCLEAR_CONFIG = NuclearConfig(
     normal_half_window_um=1.5,
     normal_step_um=0.05,
     ridge_min_sbr=3.0,
+    accepted_component_count=(1, 6),
+    nominal_volume_um3=(100.0, 5000.0),
+    minimum_sphericity=0.15,
+    maximum_face_contact_fraction=0.10,
 )

@@ -88,6 +88,41 @@ def _positive_int(value: object, name: str) -> int:
     return value
 
 
+def _integer_pair(value: object, name: str) -> tuple[int, int]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"{name} must be a pair of positive integers")  # noqa: TRY004
+    if len(value) != 2:
+        raise ValueError(f"{name} must have length 2")
+    lower = _positive_int(value[0], f"{name}[0]")
+    upper = _positive_int(value[1], f"{name}[1]")
+    if lower > upper:
+        raise ValueError(f"{name} must be ordered")
+    return lower, upper
+
+
+def _ordered_positive_pair(value: object, name: str) -> tuple[float, float]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"{name} must be a pair of positive numbers")  # noqa: TRY004
+    if len(value) != 2:
+        raise ValueError(f"{name} must have length 2")
+    lower = _number(value[0], f"{name}[0]")
+    upper = _number(value[1], f"{name}[1]")
+    if lower > upper:
+        raise ValueError(f"{name} must be ordered")
+    return lower, upper
+
+
+def _closed_fraction(value: object, name: str, *, lower_open: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a fraction")  # noqa: TRY004
+    result = float(value)
+    lower_invalid = result <= 0 if lower_open else result < 0
+    if not math.isfinite(result) or lower_invalid or result > 1:
+        lower = "(0, 1]" if lower_open else "[0, 1]"
+        raise ValueError(f"{name} must be finite and in {lower}")
+    return result
+
+
 def _nonnegative_int(value: str, name: str) -> int:
     try:
         result = int(value)
@@ -198,6 +233,10 @@ def _parse_scientific_config(
             "normal_half_window_um",
             "normal_step_um",
             "ridge_min_sbr",
+            "accepted_component_count",
+            "nominal_volume_um3",
+            "minimum_sphericity",
+            "maximum_face_contact_fraction",
         },
     )
     golgi_data = _mapping(data["golgi"], "golgi", {"perinuclear_outer_distance_um"})
@@ -240,15 +279,36 @@ def _parse_scientific_config(
             ),
         ),
         NuclearConfig(
-            *(
-                _number(nuclear_data[key], f"nuclear.{key}")
-                for key in (
-                    "consensus_smoothing_um",
-                    "normal_half_window_um",
-                    "normal_step_um",
-                    "ridge_min_sbr",
-                )
-            )
+            consensus_smoothing_um=_number(
+                nuclear_data["consensus_smoothing_um"],
+                "nuclear.consensus_smoothing_um",
+            ),
+            normal_half_window_um=_number(
+                nuclear_data["normal_half_window_um"],
+                "nuclear.normal_half_window_um",
+            ),
+            normal_step_um=_number(
+                nuclear_data["normal_step_um"], "nuclear.normal_step_um"
+            ),
+            ridge_min_sbr=_number(
+                nuclear_data["ridge_min_sbr"], "nuclear.ridge_min_sbr"
+            ),
+            accepted_component_count=_integer_pair(
+                nuclear_data["accepted_component_count"],
+                "nuclear.accepted_component_count",
+            ),
+            nominal_volume_um3=_ordered_positive_pair(
+                nuclear_data["nominal_volume_um3"], "nuclear.nominal_volume_um3"
+            ),
+            minimum_sphericity=_closed_fraction(
+                nuclear_data["minimum_sphericity"],
+                "nuclear.minimum_sphericity",
+                lower_open=True,
+            ),
+            maximum_face_contact_fraction=_closed_fraction(
+                nuclear_data["maximum_face_contact_fraction"],
+                "nuclear.maximum_face_contact_fraction",
+            ),
         ),
         GolgiConfig(
             _number(

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
+import yaml
 from cyclic_stability.config import load_analysis_config, load_execution_profile
+from cyclic_stability.models import EnsembleRow, MetricRow
 
 
 def _lamp_rows(cell_id: str) -> str:
@@ -30,6 +33,53 @@ def test_config_preserves_acquisition_and_workflow_rounds(
     assert [item.workflow_round for item in golgi.rounds] == [2, 1, 3, 4, 5]
     assert config.reference_acquisition_round == 2
     assert config.nominal_expansion_factor == 4.5
+
+
+def test_analysis_config_parses_multinuclear_bounds(
+    config_files: tuple[Path, ...],
+) -> None:
+    """The frozen analysis manifest declares the accepted nuclear population."""
+    config = load_analysis_config(*config_files)
+    assert config.nuclear.accepted_component_count == (1, 6)
+    assert config.nuclear.nominal_volume_um3 == (100.0, 5000.0)
+    assert config.nuclear.minimum_sphericity == 0.15
+    assert config.nuclear.maximum_face_contact_fraction == 0.10
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("accepted_component_count", [0, 6]),
+        ("accepted_component_count", [6, 1]),
+        ("nominal_volume_um3", [5000.0, 100.0]),
+        ("minimum_sphericity", 1.1),
+        ("maximum_face_contact_fraction", 1.1),
+    ],
+)
+def test_analysis_config_rejects_invalid_multinuclear_bounds(
+    tmp_path: Path,
+    config_files: tuple[Path, ...],
+    key: str,
+    value: object,
+) -> None:
+    """Population-selection bounds must remain physically meaningful."""
+    analysis, correspondence, decisions = config_files
+    data = yaml.safe_load(analysis.read_text(encoding="utf-8"))
+    data["nuclear"][key] = value
+    invalid = tmp_path / "invalid-analysis.yaml"
+    invalid.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_analysis_config(invalid, correspondence, decisions)
+
+
+def test_output_rows_default_to_an_explicit_aggregate_nucleus_id() -> None:
+    """Legacy row constructors serialize their unambiguous aggregate analysis unit."""
+    metric = MetricRow("golgi", "Cell1", 2, "volume", 1.0, "um3", "all", True, "id")
+    ensemble = EnsembleRow(
+        "golgi", "Cell1", 2, "volume", "sigma=1", 1.0, 1.0, "um3", "id"
+    )
+    assert asdict(metric)["nucleus_id"] == "aggregate"
+    assert asdict(ensemble)["nucleus_id"] == "aggregate"
 
 
 def test_config_rejects_numeric_lamp_identity(

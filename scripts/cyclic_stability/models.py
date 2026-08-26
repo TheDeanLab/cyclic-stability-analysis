@@ -35,6 +35,10 @@ class NuclearConfig:
     normal_half_window_um: float
     normal_step_um: float
     ridge_min_sbr: float
+    accepted_component_count: tuple[int, int]
+    nominal_volume_um3: tuple[float, float]
+    minimum_sphericity: float
+    maximum_face_contact_fraction: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +128,7 @@ class MetricRow:
     comparison_set: str
     qc_included: bool
     source_task_identity: str
+    nucleus_id: str = "aggregate"
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +144,7 @@ class EnsembleRow:
     value: float
     units: str
     source_task_identity: str
+    nucleus_id: str = "aggregate"
 
 
 @dataclass(frozen=True, slots=True)
