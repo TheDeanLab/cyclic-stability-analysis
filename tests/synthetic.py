@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -504,6 +505,76 @@ def synthetic_nucleus(
         -0.5 * ((radius - radius_um) / (shell_width_um / 2.355)) ** 2
     )
     return dapi, lamin
+
+
+def ellipsoid_dapi(
+    centers_xyz_um: Sequence[tuple[float, float, float]],
+    radii_xyz_um: Sequence[tuple[float, float, float]],
+    spacing_xyz_um: tuple[float, float, float],
+    shape_zyx: tuple[int, int, int],
+) -> NDArray[np.float32]:
+    """Place nonoverlapping bright ellipsoids in one physical ZYX volume."""
+    if len(centers_xyz_um) != len(radii_xyz_um):
+        raise ValueError("ellipsoid centers and radii must have matching lengths")
+    if any(value <= 0.0 for value in (*spacing_xyz_um, *shape_zyx)):
+        raise ValueError("ellipsoid spacing and shape must be positive")
+    sx, sy, sz = spacing_xyz_um
+    z, y, x = np.ogrid[: shape_zyx[0], : shape_zyx[1], : shape_zyx[2]]
+    foreground = np.zeros(shape_zyx, dtype=bool)
+    for center, radii in zip(centers_xyz_um, radii_xyz_um, strict=True):
+        if any(value <= 0.0 for value in radii):
+            raise ValueError("ellipsoid radii must be positive")
+        cx, cy, cz = center
+        rx, ry, rz = radii
+        component = ((x * sx - cx) / rx) ** 2 + ((y * sy - cy) / ry) ** 2 + (
+            (z * sz - cz) / rz
+        ) ** 2 <= 1.0
+        if np.any(foreground & component):
+            raise ValueError("synthetic ellipsoids must not overlap")
+        foreground |= component
+    background_x = np.sin(x * sx).astype(np.float32)
+    background_y = np.cos(y * sy).astype(np.float32)
+    image = np.empty(shape_zyx, dtype=np.float32)
+    image[...] = 1.0 + 0.05 * background_x * background_y
+    image[foreground] = 41.0
+    return image
+
+
+def separated_nuclei(
+    count: int, spacing_xyz_um: tuple[float, float, float]
+) -> NDArray[np.float32]:
+    """Return one through seven valid expanded-space nuclei on a compact grid."""
+    if count < 1 or count > 7:
+        raise ValueError("count must be between one and seven")
+    radius_um = 13.25
+    gap_um = 1.5
+    margin_um = 1.5
+    columns = min(count, 4 if count == 7 else 3)
+    rows = math.ceil(count / columns)
+    diameter_um = 2.0 * radius_um
+    centers = tuple(
+        (
+            margin_um + radius_um + (index % columns) * (diameter_um + gap_um),
+            margin_um + radius_um + (index // columns) * (diameter_um + gap_um),
+            margin_um + radius_um,
+        )
+        for index in range(count)
+    )
+    extent_xyz_um = (
+        2.0 * margin_um + columns * diameter_um + (columns - 1) * gap_um,
+        2.0 * margin_um + rows * diameter_um + (rows - 1) * gap_um,
+        2.0 * margin_um + diameter_um,
+    )
+    shape_zyx = tuple(
+        math.ceil(extent / step) + 1
+        for extent, step in zip(extent_xyz_um[::-1], spacing_xyz_um[::-1], strict=True)
+    )
+    return ellipsoid_dapi(
+        centers,
+        ((radius_um, radius_um, radius_um),) * count,
+        spacing_xyz_um,
+        shape_zyx,
+    )
 
 
 def synthetic_shell(radius_um: float, shell_width_um: float) -> NDArray[np.float64]:

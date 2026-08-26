@@ -46,9 +46,27 @@ _DAPI_LATERAL_RESOLUTION_UM = 0.61 * 0.405 / 1.4
 
 
 @dataclass(frozen=True, slots=True)
+class NuclearComponentQc:
+    """Target-blind physical adjudication of one consensus DAPI component.
+
+    Face fractions are ordered ``z-min, z-max, y-min, y-max, x-min, x-max``.
+    """
+
+    nucleus_id: str
+    accepted: bool
+    rejection_reasons: tuple[str, ...]
+    expanded_volume_um3: float
+    nominal_volume_um3: float
+    sphericity: float
+    centroid_xyz_um: tuple[float, float, float]
+    face_contact_fractions: tuple[float, float, float, float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
 class NuclearSurface:
     """A target-independent common nuclear surface in physical coordinates."""
 
+    nucleus_id: str
     mask_zyx: NDArray[np.bool_]
     vertices_xyz_um: NDArray[np.float64]
     faces: NDArray[np.int_]
@@ -56,6 +74,32 @@ class NuclearSurface:
     centroid_xyz_um: NDArray[np.float64]
     mean_curvature_um_inverse: NDArray[np.float64]
     spacing_xyz_um: tuple[float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class NuclearConsensus:
+    """Immutable accepted nuclei, their union, and all DAPI component QC."""
+
+    nuclei: tuple[NuclearSurface, ...]
+    mask_zyx: NDArray[np.bool_]
+    labels_zyx: NDArray[np.uint16]
+    component_qc: tuple[NuclearComponentQc, ...]
+    spacing_xyz_um: tuple[float, float, float]
+    nominal_expansion_factor: float
+
+
+@dataclass(frozen=True, slots=True)
+class _NuclearCandidate:
+    mask_zyx: NDArray[np.bool_]
+    vertices_xyz_um: NDArray[np.float64]
+    faces: NDArray[np.int_]
+    accepted: bool
+    rejection_reasons: tuple[str, ...]
+    expanded_volume_um3: float
+    nominal_volume_um3: float
+    sphericity: float
+    centroid_xyz_um: tuple[float, float, float]
+    face_contact_fractions: tuple[float, float, float, float, float, float]
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,28 +182,17 @@ def _physical_ball(
     return (z * sz) ** 2 + (y * sy) ** 2 + (x * sx) ** 2 <= radius_um**2
 
 
-def _largest_component(mask: NDArray[np.bool_]) -> NDArray[np.bool_]:
-    labels, count = label(mask, structure=np.ones((3, 3, 3), dtype=bool))
-    if count == 0:
-        raise ValueError("consensus DAPI threshold has no foreground component")
-    sizes = np.bincount(labels.ravel())
-    sizes[0] = 0
-    return labels == int(np.argmax(sizes))
-
-
-def _reject_face_touch(mask: NDArray[np.bool_]) -> None:
-    faces = (
-        mask[0],
-        mask[-1],
-        mask[:, 0, :],
-        mask[:, -1, :],
-        mask[:, :, 0],
-        mask[:, :, -1],
+def _face_contact_fractions(
+    mask: NDArray[np.bool_],
+) -> tuple[float, float, float, float, float, float]:
+    return (
+        float(mask[0].mean()),
+        float(mask[-1].mean()),
+        float(mask[:, 0, :].mean()),
+        float(mask[:, -1, :].mean()),
+        float(mask[:, :, 0].mean()),
+        float(mask[:, :, -1].mean()),
     )
-    if any(float(face.mean()) > 0.1 for face in faces):
-        raise ValueError(
-            "consensus nucleus touches more than 10 percent of a volume face"
-        )
 
 
 def _surface_from_mask(
@@ -243,8 +276,9 @@ def consensus_nuclear_surface(
     dapi_rounds: Mapping[int, NDArray[np.generic]],
     spacing_xyz_um: tuple[float, float, float],
     config: NuclearConfig,
-) -> NuclearSurface:
-    """Construct a QC-filtered, target-independent median DAPI nuclear surface.
+    nominal_expansion_factor: float,
+) -> NuclearConsensus:
+    """Construct a target-independent, component-aware median DAPI consensus.
 
     ``dapi_rounds`` must already contain only the acquisition rounds admitted by
     recorded target-blind QC.  Acquisition round 2 is required even when no
@@ -253,6 +287,9 @@ def consensus_nuclear_surface(
     """
     spacing = _spacing(spacing_xyz_um)
     _validate_config(config)
+    expansion = float(nominal_expansion_factor)
+    if not math.isfinite(expansion) or expansion <= 0.0:
+        raise ValueError("nominal_expansion_factor must be finite and positive")
     if REFERENCE_ROUND not in dapi_rounds:
         raise ValueError("consensus nuclear surface requires acquisition round 2")
     if not dapi_rounds:
@@ -274,24 +311,146 @@ def consensus_nuclear_surface(
         smoothed.min()
     ):
         raise ValueError("consensus DAPI intensity is degenerate")
-    mask = _largest_component(smoothed > threshold_otsu(smoothed))
-    mask = binary_fill_holes(mask)
-    _reject_face_touch(mask)
+    threshold_mask = smoothed > threshold_otsu(smoothed)
+    filled = binary_fill_holes(threshold_mask)
     mask = (
         binary_closing(
-            mask, structure=_physical_ball(_DAPI_LATERAL_RESOLUTION_UM, spacing)
+            filled, structure=_physical_ball(_DAPI_LATERAL_RESOLUTION_UM, spacing)
         )
-        | mask
+        | filled
     )
-    mask = _largest_component(mask)
-    _reject_face_touch(mask)
-    vertices, faces = _surface_from_mask(mask, spacing)
-    normals, centroid, curvature = _surface_normals_and_curvature(
-        mask, vertices, spacing
+    candidate_labels, candidate_count = label(
+        mask, structure=np.ones((3, 3, 3), dtype=bool)
     )
-    for array in (mask, vertices, faces, normals, centroid, curvature):
-        array.setflags(write=False)
-    return NuclearSurface(mask, vertices, faces, normals, centroid, curvature, spacing)
+    sx, sy, sz = spacing
+    voxel_volume_um3 = sx * sy * sz
+    minimum_volume, maximum_volume = config.nominal_volume_um3
+    candidates: list[_NuclearCandidate] = []
+    for component_index in range(1, candidate_count + 1):
+        component_mask = candidate_labels == component_index
+        expanded_volume_um3 = float(component_mask.sum()) * voxel_volume_um3
+        nominal_volume_um3 = expanded_volume_um3 / expansion**3
+        vertices, faces = _surface_from_mask(component_mask, spacing)
+        surface_area_um2 = float(mesh_surface_area(vertices, faces))
+        sphericity = float(
+            math.pi ** (1.0 / 3.0)
+            * (6.0 * expanded_volume_um3) ** (2.0 / 3.0)
+            / surface_area_um2
+        )
+        centroid_zyx = np.argwhere(component_mask).mean(axis=0)
+        centroid_xyz_um = (
+            float(centroid_zyx[2] * sx),
+            float(centroid_zyx[1] * sy),
+            float(centroid_zyx[0] * sz),
+        )
+        face_contact_fractions = _face_contact_fractions(component_mask)
+        rejection_reasons: list[str] = []
+        if nominal_volume_um3 < minimum_volume:
+            rejection_reasons.append("volume-below-minimum")
+        if nominal_volume_um3 > maximum_volume:
+            rejection_reasons.append("volume-above-maximum")
+        if sphericity < config.minimum_sphericity:
+            rejection_reasons.append("sphericity-below-minimum")
+        if any(
+            fraction > config.maximum_face_contact_fraction
+            for fraction in face_contact_fractions
+        ):
+            rejection_reasons.append("face-contact-above-maximum")
+        candidates.append(
+            _NuclearCandidate(
+                component_mask,
+                vertices,
+                faces,
+                not rejection_reasons,
+                tuple(rejection_reasons),
+                expanded_volume_um3,
+                nominal_volume_um3,
+                sphericity,
+                centroid_xyz_um,
+                face_contact_fractions,
+            )
+        )
+
+    candidates.sort(key=lambda item: item.centroid_xyz_um)
+    accepted_count = sum(item.accepted for item in candidates)
+    minimum_count, maximum_count = config.accepted_component_count
+    if not minimum_count <= accepted_count <= maximum_count:
+        rejected_reasons = sorted(
+            {
+                reason
+                for candidate in candidates
+                for reason in candidate.rejection_reasons
+            }
+        )
+        reason_suffix = (
+            f"; rejected component reasons: {', '.join(rejected_reasons)}"
+            if rejected_reasons
+            else ""
+        )
+        raise ValueError(
+            "accepted nuclear component count "
+            f"{accepted_count} is outside configured range "
+            f"[{minimum_count}, {maximum_count}]{reason_suffix}"
+        )
+
+    accepted_labels = np.zeros(mask.shape, dtype=np.uint16)
+    nuclei: list[NuclearSurface] = []
+    component_qc: list[NuclearComponentQc] = []
+    accepted_index = 0
+    for candidate_index, candidate in enumerate(candidates, start=1):
+        if candidate.accepted:
+            accepted_index += 1
+            nucleus_id = f"N{accepted_index:03d}"
+            normals, centroid, curvature = _surface_normals_and_curvature(
+                candidate.mask_zyx, candidate.vertices_xyz_um, spacing
+            )
+            for array in (
+                candidate.mask_zyx,
+                candidate.vertices_xyz_um,
+                candidate.faces,
+                normals,
+                centroid,
+                curvature,
+            ):
+                array.setflags(write=False)
+            accepted_labels[candidate.mask_zyx] = accepted_index
+            nuclei.append(
+                NuclearSurface(
+                    nucleus_id,
+                    candidate.mask_zyx,
+                    candidate.vertices_xyz_um,
+                    candidate.faces,
+                    normals,
+                    centroid,
+                    curvature,
+                    spacing,
+                )
+            )
+        else:
+            nucleus_id = f"C{candidate_index:03d}"
+        component_qc.append(
+            NuclearComponentQc(
+                nucleus_id,
+                candidate.accepted,
+                candidate.rejection_reasons,
+                candidate.expanded_volume_um3,
+                candidate.nominal_volume_um3,
+                candidate.sphericity,
+                candidate.centroid_xyz_um,
+                candidate.face_contact_fractions,
+            )
+        )
+    union_mask = accepted_labels > 0
+    union_mask.setflags(write=False)
+    accepted_labels.setflags(write=False)
+    return NuclearConsensus(
+        tuple(nuclei),
+        union_mask,
+        accepted_labels,
+        tuple(component_qc),
+        spacing,
+        expansion,
+    )
 
 
 def _profile_offsets(config: NuclearConfig) -> NDArray[np.float64]:
@@ -929,6 +1088,8 @@ def analyze_lamin_cell(
 
 __all__ = [
     "LaminProfileRow",
+    "NuclearComponentQc",
+    "NuclearConsensus",
     "NuclearSurface",
     "analyze_lamin_cell",
     "consensus_nuclear_surface",
