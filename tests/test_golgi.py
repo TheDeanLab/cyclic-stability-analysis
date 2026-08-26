@@ -114,7 +114,7 @@ def _producer_artifacts(tmp_path: Path, analysis_config):
         native_threads={"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1},
         upstream=FileIdentity.from_path(warp),
         parameters=channel_transform_parameters(
-            pixel_size_xyz=spacing, interpolation="nearestNeighbor"
+            pixel_size_xyz=spacing, interpolation="linear"
         ),
     )
     ArtifactStore().commit(
@@ -243,7 +243,7 @@ def test_gradient_similarity_rejects_thin_transform_support(analysis_config) -> 
 def test_artifact_support_replays_exact_producer_request_and_provenance(
     analysis_config, tmp_path
 ) -> None:
-    """Support is reconstructed with producer spacing and transform order, not analysis defaults."""
+    """A linearly transformed scalar target replays binary support with nearest-neighbor."""
     reference, moving, fixed, source, affine, warp, request = _producer_artifacts(
         tmp_path, analysis_config
     )

@@ -458,10 +458,10 @@ def _artifact_validity_masks(
             or request.method != "warp-affine"
             or request.accuracy != "not-applicable"
             or len(request.inputs) != 4
-            or request.parameters.get("interpolation") != "nearestNeighbor"
+            or request.parameters.get("interpolation") != "linear"
         ):
             raise ValueError(
-                "registered target is not an exact nearest-neighbor channel transform"
+                "registered target is not an exact linear scalar channel transform"
             )
         try:
             spacing = tuple(
@@ -478,7 +478,7 @@ def _artifact_validity_masks(
                 "registered target has invalid recorded producer pixel size"
             )
         if request.parameters != channel_transform_parameters(
-            pixel_size_xyz=spacing, interpolation="nearestNeighbor"
+            pixel_size_xyz=spacing, interpolation="linear"
         ):
             raise ValueError(
                 "registered target transform parameters do not match producer policy"
