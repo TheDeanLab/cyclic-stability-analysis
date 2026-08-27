@@ -27,7 +27,7 @@ import platform
 import subprocess
 import sys
 import uuid
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -50,6 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     selection.add_argument("--pilot-first-accepted", action="store_true")
     parser.add_argument("--task-index", type=int)
     parser.add_argument("--force-task", action="store_true")
+    parser.add_argument("--nuclear-inventory-only", action="store_true")
     return parser
 
 
@@ -90,6 +91,109 @@ def _write_selection(run_dir: Path, payload: dict[str, object]) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def _write_pretty_json(path: Path, payload: dict[str, object]) -> None:
+    """Durably publish human-readable inventory JSON without a partial target."""
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=4, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _validated_registered_dapi(round_spec) -> Path:
+    """Resolve one completed registered DAPI artifact without resolving targets."""
+    from cyexm.config.execution import load_execution_profile
+    from cyexm.workflow.layout import WorkflowLayout
+
+    from cyclic_stability.cyexm_artifacts import (
+        require_complete_workflow,
+        validate_completed_artifact,
+    )
+
+    require_complete_workflow(round_spec)
+    output_root = load_execution_profile(round_spec.execution_profile).paths.output_root
+    round_layout = WorkflowLayout.for_dataset(
+        output_root, round_spec.workflow_dataset_id
+    ).round(round_spec.workflow_round)
+    path = round_layout.channel(f"round_{round_spec.acquisition_round}_405_DAPI.tif")
+    validate_completed_artifact(path)
+    return path
+
+
+def _nuclear_inventory_payload(config, cells) -> dict[str, object]:
+    """Build complete DAPI component evidence without opening a target channel."""
+    from cyclic_stability.images import load_volume
+    from cyclic_stability.nuclear import consensus_nuclear_surface
+
+    decisions = {
+        (item.cohort, item.cell_id, item.acquisition_round): item.decision
+        for item in config.qc_decisions
+    }
+    minimum_count, maximum_count = config.nuclear.accepted_component_count
+    inventory_config = replace(config.nuclear, accepted_component_count=(0, 2**16 - 1))
+    rows: list[dict[str, object]] = []
+    for cell in sorted(cells, key=lambda value: (value.cohort, value.cell_id)):
+        missing = [
+            item.acquisition_round
+            for item in cell.rounds
+            if item.acquisition_round != config.reference_acquisition_round
+            and (item.cohort, item.cell_id, item.acquisition_round) not in decisions
+        ]
+        if missing:
+            raise ValueError(
+                f"target-blind QC decisions are missing for moving rounds: {missing}"
+            )
+        accepted_rounds = tuple(
+            item
+            for item in sorted(cell.rounds, key=lambda value: value.acquisition_round)
+            if item.acquisition_round == config.reference_acquisition_round
+            or decisions[(item.cohort, item.cell_id, item.acquisition_round)]
+            == "accept"
+        )
+        dapi = {
+            item.acquisition_round: load_volume(_validated_registered_dapi(item))
+            for item in accepted_rounds
+        }
+        consensus = consensus_nuclear_surface(
+            dapi,
+            config.voxel_spacing_xyz_um,
+            inventory_config,
+            config.nominal_expansion_factor,
+        )
+        components = tuple(asdict(item) for item in consensus.component_qc)
+        accepted_ids = [
+            str(item["nucleus_id"]) for item in components if item["accepted"] is True
+        ]
+        accepted_count = len(accepted_ids)
+        rows.append(
+            {
+                "accepted_count": accepted_count,
+                "accepted_ids": accepted_ids,
+                "candidate_count": len(components),
+                "cell_id": cell.cell_id,
+                "cohort": cell.cohort,
+                "components": list(components),
+                "field_id": f"{cell.cohort}/{cell.cell_id}",
+                "within_accepted_component_contract": (
+                    minimum_count <= accepted_count <= maximum_count
+                ),
+            }
+        )
+    return {
+        "accepted_component_count_range": [minimum_count, maximum_count],
+        "all_fields_within_contract": all(
+            bool(item["within_accepted_component_contract"]) for item in rows
+        ),
+        "cells": rows,
+    }
 
 
 def _software_identity() -> str:
@@ -157,7 +261,11 @@ def main(argv: list[str] | None = None) -> int:
     known_cohorts = {"golgi", "lamin", "lamp1"}
     if any(cohort not in known_cohorts for cohort in cohorts):
         raise ValueError("--cohort must name a configured cohort")
-    if profile.mode == "slurm" and args.task_index is None:
+    if (
+        profile.mode == "slurm"
+        and args.task_index is None
+        and not args.nuclear_inventory_only
+    ):
         raise ValueError("SLURM execution requires --task-index")
     selected = None
     if args.cell is not None:
@@ -175,6 +283,42 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.pilot_first_accepted:
         selected = _pilot_cell(config, cohorts)
+    if args.nuclear_inventory_only:
+        if args.pilot_first_accepted or args.task_index is not None or args.force_task:
+            raise ValueError(
+                "--nuclear-inventory-only cannot be combined with pilot, task-index, "
+                "or force selection"
+            )
+        if args.run_dir is not None:
+            run_dir = args.run_dir
+            results_root = None
+        else:
+            assert args.results_root is not None
+            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            run_dir = args.results_root / f"{timestamp}-{config.config_digest[:12]}"
+            results_root = args.results_root
+        initialize_run(
+            run_dir,
+            analysis_config=args.analysis_config,
+            correspondence=args.correspondence,
+            qc_decisions=args.qc_decisions,
+            execution_profile=args.execution_profile,
+            config_digest=config.config_digest,
+            results_root=results_root,
+        )
+        inventory_cells = tuple(
+            cell
+            for cell in config.cells
+            if (not cohorts or cell.cohort in cohorts)
+            and (selected is None or cell == selected)
+        )
+        payload = _nuclear_inventory_payload(config, inventory_cells)
+        path = run_dir / "nuclear-inventory.json"
+        _write_pretty_json(path, payload)
+        print(
+            f"wrote target-blind nuclear inventory for {len(inventory_cells)} cells: {path}"
+        )
+        return 0 if payload["all_fields_within_contract"] is True else 1
     tasks = build_tasks(
         config,
         cohorts,
