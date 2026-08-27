@@ -39,6 +39,7 @@ class RoundArtifacts:
     completion_records: tuple[CompletionRecord, ...]
     native_target: Path | None = None
     moving_crop: Path | None = None
+    completion_record_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +138,8 @@ def resolve_round_artifacts(
                 chunk_manifest,
             )
         )
+    store = ArtifactStore()
+    record_paths = tuple(store.record_path(path) for path in required)
     records = tuple(validate_completed_artifact(path) for path in required)
     target_record = records[2]
     if (
@@ -167,6 +170,7 @@ def resolve_round_artifacts(
         # Channel-transform-v1 records name the native source directly.  A stale
         # registration crop is not a transform input and must never be inferred.
         moving_crop=None,
+        completion_record_paths=record_paths,
     )
 
 

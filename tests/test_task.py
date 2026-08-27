@@ -23,6 +23,14 @@ from cyclic_stability.task import (
     default_marker_analyzer,
     run_cell_task,
 )
+from cyexm.registration._request_policy import channel_transform_parameters
+from cyexm.registration.artifacts import (
+    ArtifactStore,
+    CompletionRecord,
+    FileIdentity,
+    StageRequest,
+)
+from cyexm.spatial import ImageGeometry
 from synthetic import cell_task, different_identity
 
 
@@ -146,6 +154,69 @@ def test_completed_task_is_reused_only_for_matching_inputs(tmp_path: Path) -> No
     assert third.reused is False
 
 
+def test_production_preflight_failure_supersedes_prior_success_terminal(
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed production preflight must belong to a newly admitted attempt."""
+    decisions = tuple(
+        QcDecision(
+            "golgi",
+            "Cell1",
+            number,
+            "accept",
+            ("target-blind",),
+            "reviewer",
+            "2026-08-27T00:00:00Z",
+        )
+        for number in (1, 3, 4, 5)
+    )
+    task = replace(
+        cell_task(tmp_path),
+        config=replace(analysis_config, qc_decisions=decisions),
+    )
+    task_dir = tmp_path / "tasks" / task.key
+    preflight_calls = 0
+    observed_terminal_status: list[str] = []
+    observed_lock_held: list[bool] = []
+
+    def preflight(value: CellTask) -> CellTask:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        if preflight_calls == 1:
+            return value
+        terminal = json.loads((task_dir / "terminal.json").read_text())
+        observed_terminal_status.append(str(terminal["status"]))
+        with (task_dir / ".task.lock").open("a+b") as competing_lock:
+            try:
+                task_module.fcntl.flock(
+                    competing_lock,
+                    task_module.fcntl.LOCK_EX | task_module.fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                observed_lock_held.append(True)
+            else:
+                observed_lock_held.append(False)
+                task_module.fcntl.flock(competing_lock, task_module.fcntl.LOCK_UN)
+        raise ValueError("synthetic production preflight failure")
+
+    monkeypatch.setattr(task_module, "_preflight_task", preflight)
+    first = run_cell_task(task, tmp_path)
+    failed = run_cell_task(replace(task, config_digest="changed"), tmp_path)
+
+    assert first.status == "complete"
+    assert failed.status == "failed"
+    assert failed.attempt_id != first.attempt_id
+    assert observed_terminal_status == ["running"]
+    assert observed_lock_held == [True]
+    terminal = json.loads((task_dir / "terminal.json").read_text())
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_id"] == failed.attempt_id
+    failure = json.loads((failed.attempt_dir / "failure.json").read_text())
+    assert failure["error_type"] == "ValueError"
+    assert failure["message"] == "synthetic production preflight failure"
+    assert (first.attempt_dir / "record.json").is_file()
+
+
 def test_artifact_task_changed_input_or_repository_preserves_prior_evidence(
     tmp_path: Path,
 ) -> None:
@@ -239,6 +310,197 @@ def test_artifact_task_failure_has_failed_terminal_pointer(
     assert terminal["status"] == "failed"
     assert terminal["attempt_id"] == record.attempt_id
     assert not (tmp_path / "run" / "tasks" / task.key / "complete.json").exists()
+
+
+def test_producer_input_mutation_never_publishes_completion(tmp_path: Path) -> None:
+    """An input changed during analysis must fail before any success metadata exists."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"input-v1")
+    original_mtime = source.stat().st_mtime_ns
+
+    def mutate_input(output_dir: Path) -> tuple[Path, ...]:
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text('{"value":"complete"}\n', encoding="utf-8")
+        source.write_bytes(b"input-v2")
+        os.utime(source, ns=(source.stat().st_atime_ns, original_mtime))
+        return (output,)
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(task_module.ContentIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=mutate_input,
+    )
+
+    failed = task_module.run_artifact_task(task, tmp_path / "run")
+
+    assert failed.status == "failed"
+    terminal = json.loads(
+        (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_id"] == failed.attempt_id
+    failure = json.loads((failed.attempt_dir / "failure.json").read_text())
+    assert (
+        failure["message"]
+        == "one or more immutable task inputs changed during execution"
+    )
+    assert not (failed.attempt_dir / "record.json").exists()
+    assert not (failed.attempt_dir / "output-manifest.json").exists()
+    assert not (tmp_path / "run" / "tasks" / task.key / "complete.json").exists()
+
+
+def _production_provenance_task(
+    analysis_config,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[CellTask, Path, Path]:
+    """Create one production-preflight-shaped task with record-derived source input."""
+    from cyclic_stability import cyexm_artifacts, provenance
+
+    base = cell_task(tmp_path)
+    round_spec = base.cell.rounds[2]
+    root = tmp_path / "production-provenance"
+    nd2 = root / "source.nd2"
+    nd2.parent.mkdir(parents=True)
+    nd2.write_bytes(b"nd2")
+    raw_paths = tuple(
+        (name, root / "raw" / f"round-3-{name}.tif")
+        for name in ("dapi", "tubulin", "target")
+    )
+    for _name, path in raw_paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(path.name.encode())
+    fixed = root / "registered-dapi.tif"
+    native_source = root / "native-target.tif"
+    affine = root / "affine.mat"
+    warp = root / "warp.nii.gz"
+    registered_tubulin = root / "registered-tubulin.tif"
+    registered_target = root / "registered-target.tif"
+    for path, payload in (
+        (fixed, b"fixed"),
+        (native_source, b"source-v1"),
+        (affine, b"affine"),
+        (warp, b"warp"),
+        (registered_tubulin, b"tubulin"),
+    ):
+        path.write_bytes(payload)
+    spacing = (1.0, 1.0, 1.0)
+    request = StageRequest.for_files(
+        stage="channel-transform-v1",
+        inputs=(fixed, native_source, affine, warp),
+        geometry=ImageGeometry(
+            shape=(1, 1, 1),
+            origin=(0.0, 0.0, 0.0),
+            spacing=spacing,
+            direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        ),
+        method="warp-affine",
+        accuracy="not-applicable",
+        native_threads={"ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS": 1},
+        upstream=FileIdentity.from_path(warp),
+        parameters=channel_transform_parameters(
+            pixel_size_xyz=spacing, interpolation="linear"
+        ),
+    )
+    store = ArtifactStore()
+
+    def write_registered(path: Path) -> None:
+        path.write_bytes(b"registered")
+
+    store.commit(
+        registered_target,
+        request,
+        write_registered,
+        lambda path: path.read_bytes() == b"registered",
+    )
+    completion_record_path = store.record_path(registered_target)
+    completion_record = CompletionRecord.read(completion_record_path)
+    artifact = SimpleNamespace(
+        registered_dapi=fixed,
+        registered_tubulin=registered_tubulin,
+        registered_target=registered_target,
+        affine=affine,
+        warp=warp,
+        pre_metrics=None,
+        linear_metrics=None,
+        nonlinear_metrics=None,
+        chunk_manifest=None,
+        completion_records=(completion_record,),
+        completion_record_paths=(completion_record_path,),
+        native_target=Path(completion_record.request.inputs[1].path),
+        moving_crop=None,
+    )
+    cell = replace(
+        base.cell,
+        rounds=(replace(round_spec, nd2_path=nd2, tiff_directory=root / "raw"),),
+    )
+    config = replace(
+        analysis_config,
+        qc_decisions=(
+            QcDecision(
+                "golgi",
+                "Cell1",
+                3,
+                "accept",
+                ("target-blind",),
+                "reviewer",
+                "2026-08-27T00:00:00Z",
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        cyexm_artifacts,
+        "validate_cell_inputs",
+        lambda _cell: SimpleNamespace(rounds=(artifact,)),
+    )
+    monkeypatch.setattr(provenance, "channel_tiff_paths", lambda _round: raw_paths)
+    return (
+        replace(base, cell=cell, config=config),
+        completion_record_path,
+        native_source,
+    )
+
+
+@pytest.mark.parametrize("tampered_input", ("completion-record", "native-source"))
+def test_production_task_rejects_same_metadata_consumed_provenance_tampering(
+    analysis_config,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tampered_input: str,
+) -> None:
+    """Every parsed record and record-derived source must invalidate stale reuse."""
+    task, completion_record, native_source = _production_provenance_task(
+        analysis_config, tmp_path, monkeypatch
+    )
+    first = run_cell_task(task, tmp_path)
+    reopened = run_cell_task(task, tmp_path)
+    assert reopened.attempt_id == first.attempt_id
+    assert reopened.reused is True
+    path = {
+        "completion-record": completion_record,
+        "native-source": native_source,
+    }[tampered_input]
+    original_mtime = path.stat().st_mtime_ns
+    payload = path.read_bytes()
+    if tampered_input == "completion-record":
+        tampered = payload.replace(b'":', b'": ', 1)[:-1]
+        assert json.loads(tampered) == json.loads(payload)
+    else:
+        tampered = b"source-v2"
+    assert len(tampered) == len(payload)
+    path.write_bytes(tampered)
+    os.utime(path, ns=(path.stat().st_atime_ns, original_mtime))
+
+    after_tamper = run_cell_task(task, tmp_path)
+
+    assert after_tamper.status == "complete"
+    assert after_tamper.reused is False
+    assert after_tamper.attempt_id != first.attempt_id
+    bound_paths = {identity.path for identity in after_tamper.input_identities}
+    assert str(completion_record.resolve()) in bound_paths
+    assert str(native_source.resolve()) in bound_paths
 
 
 def test_artifact_task_rejects_same_metadata_dapi_tampering(tmp_path: Path) -> None:

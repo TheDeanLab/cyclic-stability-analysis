@@ -12,6 +12,7 @@ from cyclic_stability.cyexm_artifacts import (
 )
 from cyclic_stability.models import RoundSpec
 from cyexm.errors import InputValidationError
+from cyexm.registration.artifacts import ArtifactStore
 from cyexm.workflow.models import WorkflowStatus
 from synthetic import write_completion_fixture
 
@@ -93,6 +94,10 @@ def test_golgi_reference_resolves_acquisition_round_two_from_workflow_round_one(
     assert artifacts.affine is None
     assert artifacts.native_target is None
     assert artifacts.moving_crop is None
+    assert artifacts.completion_record_paths == tuple(
+        ArtifactStore().record_path(Path(record.artifact.path))
+        for record in artifacts.completion_records
+    )
     assert (
         artifacts.workflow_output_root
         == golgi_round_two.execution_profile.parent / "workflow-root"

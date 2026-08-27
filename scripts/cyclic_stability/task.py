@@ -366,6 +366,27 @@ def _current_identities_match(values: tuple[ContentIdentity, ...]) -> bool:
         return False
 
 
+def _reusable_input_identities(
+    task: CellTask | ArtifactTask, record: TaskRecord
+) -> tuple[ContentIdentity, ...] | None:
+    """Return the exact identities that authorize reuse for this task invocation."""
+    if (
+        isinstance(task, CellTask)
+        and task.config is not None
+        and task.preflight is None
+    ):
+        prefix_count = len(task.input_identities)
+        if (
+            len(record.input_identities) <= prefix_count
+            or record.input_identities[:prefix_count] != task.input_identities
+        ):
+            return None
+        return record.input_identities
+    if record.input_identities != task.input_identities:
+        return None
+    return task.input_identities
+
+
 def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord | None:
     try:
         if terminal.is_symlink() or not stat.S_ISREG(terminal.stat().st_mode):
@@ -453,13 +474,14 @@ def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord 
             return None
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
+    reusable_inputs = _reusable_input_identities(task, record)
     if (
         record.status != "complete"
         or record.key != task.key
         or record.attempt_id != attempt_id
         or record.config_digest != task.config_digest
         or record.software_identity != task.software_identity
-        or record.input_identities != task.input_identities
+        or reusable_inputs is None
         or record.attempt_dir.resolve(strict=True) != attempt_dir
         or not record.output_identities
         or any(
@@ -468,7 +490,7 @@ def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord 
             or attempt_dir not in path.resolve(strict=True).parents
             for path in (Path(identity.path) for identity in record.output_identities)
         )
-        or not _current_identities_match(task.input_identities)
+        or not _current_identities_match(reusable_inputs)
         or not _current_identities_match(record.output_identities)
     ):
         return None
@@ -563,15 +585,15 @@ def _preflight_task(task: CellTask) -> CellTask:
     from cyclic_stability.provenance import channel_tiff_paths
 
     report = validate_cell_inputs(task.cell)
+    paths: list[Path] = []
     identities: list[ContentIdentity] = []
     for round_spec, artifacts in zip(task.cell.rounds, report.rounds, strict=True):
-        identities.append(ContentIdentity.from_path(round_spec.nd2_path))
-        identities.extend(
-            ContentIdentity.from_path(path)
-            for _, path in channel_tiff_paths(round_spec)
-        )
-        identities.extend(
-            ContentIdentity.from_path(path)
+        if len(artifacts.completion_record_paths) != len(artifacts.completion_records):
+            raise ValueError("validated artifact record paths are incomplete")
+        paths.append(round_spec.nd2_path)
+        paths.extend(path for _, path in channel_tiff_paths(round_spec))
+        paths.extend(
+            path
             for path in (
                 artifacts.registered_dapi,
                 artifacts.registered_tubulin,
@@ -585,6 +607,16 @@ def _preflight_task(task: CellTask) -> CellTask:
             )
             if path is not None
         )
+        paths.extend(artifacts.completion_record_paths)
+        if artifacts.native_target is not None:
+            paths.append(artifacts.native_target)
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve(strict=True)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        identities.append(ContentIdentity.from_path(resolved))
     snapshot = PreflightSnapshot(report.rounds, tuple(identities))
     return replace(
         task,
@@ -705,17 +737,14 @@ def _produce_cell_outputs(task: CellTask, attempt_dir: Path) -> tuple[Path, ...]
 def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
     """Run one immutable cell attempt or reuse an exactly matching completion."""
     configure_native_threads(task.native_threads)
-    task = _preflight_task(task)
-    if not task.input_identities or not all(
-        isinstance(identity, ContentIdentity) for identity in task.input_identities
-    ):
+    if any(
+        not isinstance(identity, ContentIdentity) for identity in task.input_identities
+    ) or (task.config is None and not task.input_identities):
         raise TypeError("cell task inputs require content-bound identities")
     task_dir = _task_directory(task, run_dir)
     with (task_dir / ".task.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return _run_task_locked(
-            task, task_dir, lambda attempt: _produce_cell_outputs(task, attempt)
-        )
+        return _run_task_locked(task, task_dir)
 
 
 def run_artifact_task(task: ArtifactTask, run_dir: Path) -> TaskRecord:
@@ -728,13 +757,12 @@ def run_artifact_task(task: ArtifactTask, run_dir: Path) -> TaskRecord:
     task_dir = _task_directory(task, run_dir)
     with (task_dir / ".task.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return _run_task_locked(task, task_dir, task.producer)
+        return _run_task_locked(task, task_dir)
 
 
 def _run_task_locked(
     task: CellTask | ArtifactTask,
     task_dir: Path,
-    producer: ArtifactProducer,
 ) -> TaskRecord:
     """Execute under the kernel lock that serializes reuse and publication."""
     terminal_path = task_dir / "terminal.json"
@@ -775,12 +803,25 @@ def _run_task_locked(
     sampler.start()
     try:
         if isinstance(task, CellTask):
+            task = _preflight_task(task)
+            if not task.input_identities or not all(
+                isinstance(identity, ContentIdentity)
+                for identity in task.input_identities
+            ):
+                raise TypeError("cell task inputs require content-bound identities")
             _qc_gate(task)
         if not _current_identities_match(task.input_identities):
             raise ValueError(
                 "one or more immutable task inputs changed before execution"
             )
-        output_paths = producer(attempt_dir)
+        if isinstance(task, CellTask):
+            output_paths = _produce_cell_outputs(task, attempt_dir)
+        else:
+            output_paths = task.producer(attempt_dir)
+        if not _current_identities_match(task.input_identities):
+            raise ValueError(
+                "one or more immutable task inputs changed during execution"
+            )
         if not output_paths or not all(
             path.is_file()
             and not path.is_symlink()
