@@ -37,6 +37,7 @@ CORRESPONDENCE_COLUMNS = (
     "nd2_relative",
     "tiff_directory_relative",
     "z_start_offset",
+    "producer_source_z_start_offset",
     "target_channel",
     "target_exposure_ms",
     "target_laser_percent",
@@ -139,6 +140,18 @@ def _nonnegative_int(value: str, name: str) -> int:
     if result < 0:
         raise ValueError(f"{name} must be non-negative")
     return result
+
+
+def _producer_source_z_start_offset(value: str) -> int | None:
+    if value == "unresolved":
+        return None
+    try:
+        return _nonnegative_int(value, "producer_source_z_start_offset")
+    except ValueError as error:
+        raise ValueError(
+            "producer_source_z_start_offset must be a non-negative integer "
+            "or 'unresolved'"
+        ) from error
 
 
 def _csv_number(value: str, name: str) -> float:
@@ -435,6 +448,9 @@ def _parse_rounds(
                 nd2_root, row["tiff_directory_relative"], "tiff_directory_relative"
             ),
             z_start_offset=_nonnegative_int(row["z_start_offset"], "z_start_offset"),
+            producer_source_z_start_offset=_producer_source_z_start_offset(
+                row["producer_source_z_start_offset"]
+            ),
             target_exposure_ms=_csv_number(
                 row["target_exposure_ms"], "target_exposure_ms"
             ),

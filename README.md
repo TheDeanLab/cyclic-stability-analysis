@@ -13,6 +13,12 @@ read-only inputs. `RoundSpec.workflow_round` is explicitly recorded because Golg
 acquisition rounds 1 and 2 map to workflow rounds 2 and 1, respectively. No analysis
 code derives a workflow round from acquisition numbering.
 
+`producer_source_z_start_offset` in the correspondence CSV attests to the number
+of leading Z planes removed from the correspondence TIFF when the Cy-ExM producer
+source was created. It is a nonnegative integer; the exact `unresolved` sentinel
+keeps non-equivalent source copies fail-closed until an operator records the missing
+provenance.
+
 Registration review is target-blind: target-channel images must not be opened before
 the reviewer records accept/exclude decisions for the non-reference rounds in
 `config/qc-decisions.csv`. An empty decision file is the required initial state and

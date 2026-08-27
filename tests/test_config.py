@@ -20,7 +20,7 @@ def _lamp_rows(cell_id: str) -> str:
     return "".join(
         f"lamp1,{cell_id},{acquisition_round},{acquisition_round},"
         f"round{acquisition_round}/DAPI_tubulin_lamp1_001.nd2,"
-        f"Lysosomes/{cell_id},0,647_lamp1,"
+        f"Lysosomes/{cell_id},0,0,647_lamp1,"
         f"{150 if acquisition_round == 1 else 200},50,200,50,200,75,"
         f"lamp.yaml,exec.yaml,lamp-{cell_id},image-verified\n"
         for acquisition_round in range(1, 6)
@@ -38,6 +38,53 @@ def test_config_preserves_acquisition_and_workflow_rounds(
     assert [item.workflow_round for item in golgi.rounds] == [2, 1, 3, 4, 5]
     assert config.reference_acquisition_round == 2
     assert config.nominal_expansion_factor == 4.5
+
+
+def test_config_parses_producer_source_offset_and_hashes_it(
+    config_files: tuple[Path, ...],
+) -> None:
+    """Changing source-copy transform provenance must change task identity."""
+    analysis, correspondence, decisions = config_files
+    exact = load_analysis_config(analysis, correspondence, decisions)
+    assert exact.cell("golgi", "Cell1").rounds[0].producer_source_z_start_offset == 0
+
+    unresolved_path = correspondence.with_name("unresolved-source-copy.csv")
+    unresolved_path.write_text(
+        correspondence.read_text(encoding="utf-8").replace(
+            ",Golgi/Cell1,1,0,647_golgi,",
+            ",Golgi/Cell1,1,unresolved,647_golgi,",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    unresolved = load_analysis_config(analysis, unresolved_path, decisions)
+    assert (
+        unresolved.cell("golgi", "Cell1").rounds[0].producer_source_z_start_offset
+        is None
+    )
+    assert unresolved.config_digest != exact.config_digest
+
+
+def test_config_rejects_invalid_producer_source_offset(
+    config_files: tuple[Path, ...],
+) -> None:
+    """Only a nonnegative integer or the exact unresolved sentinel is admitted."""
+    analysis, correspondence, decisions = config_files
+    invalid = correspondence.with_name("invalid-source-copy-offset.csv")
+    invalid.write_text(
+        correspondence.read_text(encoding="utf-8").replace(
+            ",Golgi/Cell1,1,0,647_golgi,",
+            ",Golgi/Cell1,1,unknown,647_golgi,",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="producer_source_z_start_offset.*non-negative integer.*unresolved",
+    ):
+        load_analysis_config(analysis, invalid, decisions)
 
 
 def test_analysis_config_parses_multinuclear_bounds(
@@ -177,7 +224,7 @@ def test_config_rejects_numeric_lamp_identity(
     analysis, correspondence, decisions = config_files
     text = correspondence.read_text(encoding="utf-8")
     text += (
-        "lamp1,Cell1,1,1,DAPI_tubulin_lamp_003.nd2,LAMP1/Cell1,0,"
+        "lamp1,Cell1,1,1,DAPI_tubulin_lamp_003.nd2,LAMP1/Cell1,0,0,"
         "647_lamp1,150,50,200,50,200,75,lamp.yaml,exec.yaml,lamp-cell1,"
         "numeric-suffix\n"
     )

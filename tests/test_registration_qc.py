@@ -242,6 +242,7 @@ def _target_blind_inputs(tmp_path: Path) -> tuple[CellSpec, tuple[RoundArtifacts
             nd2_path=tmp_path / f"round-{acquisition}.nd2",
             tiff_directory=tmp_path / "raw",
             z_start_offset=0,
+            producer_source_z_start_offset=0,
             target_exposure_ms=1.0,
             target_laser_percent=1.0,
             tubulin_exposure_ms=1.0,

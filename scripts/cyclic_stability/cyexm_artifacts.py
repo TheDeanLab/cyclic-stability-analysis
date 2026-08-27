@@ -324,14 +324,63 @@ def _retained_tiff_geometry(content: RetainedContent) -> tuple[tuple[int, ...], 
         shape = tuple(int(value) for value in series.shape)
         if len(shape) != 3 or series.dtype.kind not in "uif":
             raise ValueError("DAPI source must be one scalar three-dimensional TIFF")
-        return shape, str(series.axes)
+        return shape, str(series.dtype)
+
+
+def _retained_tiff_planes_equal(
+    producer: RetainedContent,
+    correspondence: RetainedContent,
+    z_start_offset: int,
+) -> bool:
+    """Compare exact decoded pixels one independently stored Z plane at a time."""
+    import numpy as np
+    import tifffile
+
+    with (
+        producer.open_binary() as producer_source,
+        correspondence.open_binary() as correspondence_source,
+        tifffile.TiffFile(producer_source) as producer_handle,
+        tifffile.TiffFile(correspondence_source) as correspondence_handle,
+    ):
+        producer_series = producer_handle.series[0]
+        correspondence_series = correspondence_handle.series[0]
+        producer_shape = tuple(int(value) for value in producer_series.shape)
+        correspondence_shape = tuple(
+            int(value) for value in correspondence_series.shape
+        )
+        producer_pages = producer_series.pages
+        correspondence_pages = correspondence_series.pages
+        if (
+            len(producer_pages) != producer_shape[0]
+            or len(correspondence_pages) != correspondence_shape[0]
+            or any(
+                tuple(int(value) for value in page.shape) != producer_shape[1:]
+                for page in producer_pages
+            )
+            or any(
+                tuple(int(value) for value in page.shape) != correspondence_shape[1:]
+                for page in correspondence_pages
+            )
+        ):
+            raise ValueError(
+                "DAPI source TIFF must expose one independently decodable page "
+                "per Z plane"
+            )
+        for producer_index, producer_page in enumerate(producer_pages):
+            correspondence_page = correspondence_pages[producer_index + z_start_offset]
+            producer_pixels = producer_page.asarray()
+            correspondence_pixels = correspondence_page.asarray()
+            if not np.array_equal(producer_pixels, correspondence_pixels):
+                return False
+        return True
 
 
 def _validated_dapi_source_copies(
     producer_path: Path,
     correspondence_path: Path,
+    producer_source_z_start_offset: int | None,
 ) -> tuple[ContentIdentity, ContentIdentity]:
-    """Bind the producer source and its correspondence copy by bytes and geometry."""
+    """Bind producer pixels to the declared correspondence leading-Z transform."""
     producer: RetainedContent | None = None
     correspondence: RetainedContent | None = None
     try:
@@ -339,13 +388,51 @@ def _validated_dapi_source_copies(
         correspondence = RetainedContent.from_path(correspondence_path)
         producer_geometry = _retained_tiff_geometry(producer)
         correspondence_geometry = _retained_tiff_geometry(correspondence)
-        if producer_geometry != correspondence_geometry:
-            raise InputValidationError(
-                "DAPI source TIFF geometries differ; explicit source-copy "
-                "provenance is required"
+        correspondence_shape, correspondence_dtype = correspondence_geometry
+        if producer_source_z_start_offset is None:
+            if producer_geometry != correspondence_geometry:
+                raise InputValidationError(
+                    "producer_source_z_start_offset is unresolved for "
+                    "non-equivalent DAPI source copies; attest this field "
+                    "before analysis"
+                )
+            effective_offset = 0
+        else:
+            effective_offset = producer_source_z_start_offset
+            if effective_offset < 0 or effective_offset >= correspondence_shape[0]:
+                raise InputValidationError(
+                    "producer_source_z_start_offset is outside correspondence TIFF Z"
+                )
+            expected_producer_geometry = (
+                (
+                    correspondence_shape[0] - effective_offset,
+                    *correspondence_shape[1:],
+                ),
+                correspondence_dtype,
             )
-        if producer.identity.sha256 != correspondence.identity.sha256:
-            raise InputValidationError("DAPI source copies differ in content")
+            if producer_geometry != expected_producer_geometry:
+                raise InputValidationError(
+                    "DAPI source-copy geometry does not match declared "
+                    "producer_source_z_start_offset"
+                )
+        pixels_equal = (
+            effective_offset == 0
+            and producer.identity.sha256 == correspondence.identity.sha256
+        ) or _retained_tiff_planes_equal(
+            producer,
+            correspondence,
+            effective_offset,
+        )
+        if not pixels_equal and producer_source_z_start_offset is None:
+            raise InputValidationError(
+                "producer_source_z_start_offset is unresolved for non-equivalent "
+                "DAPI source copies; attest this field before analysis"
+            )
+        if not pixels_equal:
+            raise InputValidationError(
+                "DAPI source-copy pixels do not match declared "
+                "producer_source_z_start_offset"
+            )
         producer.validate()
         correspondence.validate()
         return producer.identity, correspondence.identity
@@ -507,6 +594,7 @@ def snapshot_registered_dapi(
             _validated_dapi_source_copies(
                 Path(request.inputs[source_index].path),
                 correspondence_source,
+                round_spec.producer_source_z_start_offset,
             )
         )
         try:

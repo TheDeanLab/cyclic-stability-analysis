@@ -69,6 +69,7 @@ class RoundSpec:
     nd2_path: Path
     tiff_directory: Path
     z_start_offset: int
+    producer_source_z_start_offset: int | None
     target_exposure_ms: float
     target_laser_percent: float
     tubulin_exposure_ms: float

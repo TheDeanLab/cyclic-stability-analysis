@@ -83,6 +83,7 @@ paths:
         nd2_path=tmp_path / "round2.nd2",
         tiff_directory=tmp_path / "raw",
         z_start_offset=1,
+        producer_source_z_start_offset=0,
         target_exposure_ms=200.0,
         target_laser_percent=50.0,
         tubulin_exposure_ms=200.0,
@@ -111,6 +112,7 @@ def _write_registered_dapi(
     shape: tuple[int, int, int] = (5, 7, 9),
     dataset_root: Path | None = None,
     producer_z_start: int = 0,
+    producer_description: str | None = None,
     record_source: Path | None = None,
     reference_channel_index: int = 1,
     stage: str | None = None,
@@ -129,10 +131,11 @@ def _write_registered_dapi(
     manifest_native = authoritative_root / expected_native.name
     manifest_native.parent.mkdir(parents=True, exist_ok=True)
     if manifest_native != expected_native:
-        if producer_z_start:
+        if producer_z_start or producer_description is not None:
             tifffile.imwrite(
                 manifest_native,
                 source_image[producer_z_start:],
+                description=producer_description,
                 photometric="minisblack",
             )
         else:
@@ -321,6 +324,7 @@ paths:
         nd2_path=tmp_path / "source.nd2",
         tiff_directory=tmp_path / "raw",
         z_start_offset=1,
+        producer_source_z_start_offset=0,
         target_exposure_ms=200.0,
         target_laser_percent=40.0,
         tubulin_exposure_ms=200.0,
@@ -432,11 +436,47 @@ def test_dapi_snapshot_accepts_byte_identical_manifest_source_copy(
         snapshot.close()
 
 
+def test_dapi_snapshot_accepts_exact_decoded_offset_zero(
+    tmp_path: Path,
+    analysis_config,
+) -> None:
+    """Offset zero binds exact pixels even when TIFF container bytes differ."""
+    round_spec = _lamin_round(
+        tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+    )
+    output = (
+        tmp_path
+        / "workflow-root/synthetic/rounds/round-003/channels/round_3_405_DAPI.tif"
+    )
+    producer_root = tmp_path / "registration-copy"
+    _write_registered_dapi(
+        output,
+        round_spec=round_spec,
+        spacing=analysis_config.voxel_spacing_xyz_um,
+        moving=True,
+        dataset_root=producer_root,
+        producer_description="scientifically equivalent alternate TIFF container",
+    )
+    correspondence = dict(channel_tiff_paths(round_spec))["dapi"]
+    producer = producer_root / correspondence.name
+    assert correspondence.read_bytes() != producer.read_bytes()
+
+    snapshot = snapshot_registered_dapi(round_spec, analysis_config)
+    try:
+        by_path = {Path(item.path): item for item in snapshot.identities}
+        assert (
+            by_path[correspondence.resolve()].sha256
+            != by_path[producer.resolve()].sha256
+        )
+    finally:
+        snapshot.close()
+
+
 def test_dapi_snapshot_rejects_same_metadata_source_copy_content_mismatch(
     tmp_path: Path,
     analysis_config,
 ) -> None:
-    """Equal size and restored mtime cannot substitute for exact source bytes."""
+    """Equal size and restored mtime cannot substitute for exact source pixels."""
     round_spec = _lamin_round(
         tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
     )
@@ -453,11 +493,11 @@ def test_dapi_snapshot_rejects_same_metadata_source_copy_content_mismatch(
         dataset_root=producer_root,
     )
     correspondence = dict(channel_tiff_paths(round_spec))["dapi"]
-    original = correspondence.read_bytes()
     original_stat = correspondence.stat()
-    changed = bytearray(original)
-    changed[-1] ^= 1
-    correspondence.write_bytes(changed)
+    changed = tifffile.memmap(correspondence)
+    changed[0, 0, 0] ^= 1
+    changed.flush()
+    del changed
     os.utime(
         correspondence,
         ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
@@ -465,7 +505,7 @@ def test_dapi_snapshot_rejects_same_metadata_source_copy_content_mismatch(
     assert correspondence.stat().st_size == original_stat.st_size
     assert correspondence.stat().st_mtime_ns == original_stat.st_mtime_ns
 
-    with pytest.raises(InputValidationError, match="source copies differ in content"):
+    with pytest.raises(InputValidationError, match="source-copy pixels do not match"):
         snapshot_registered_dapi(round_spec, analysis_config)
 
 
@@ -496,7 +536,7 @@ def test_dapi_snapshot_rejects_source_copy_tiff_geometry_mismatch(
         photometric="minisblack",
     )
 
-    with pytest.raises(InputValidationError, match="source TIFF geometries differ"):
+    with pytest.raises(InputValidationError, match="source-copy geometry"):
         snapshot_registered_dapi(round_spec, analysis_config)
 
 
@@ -505,8 +545,11 @@ def test_dapi_snapshot_rejects_undeclared_leading_plane_source_crop(
     analysis_config,
 ) -> None:
     """Empirical correspondence[1:] equality cannot replace declared provenance."""
-    round_spec = _lamin_round(
-        tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+    round_spec = replace(
+        _lamin_round(
+            tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+        ),
+        producer_source_z_start_offset=None,
     )
     output = (
         tmp_path
@@ -521,7 +564,80 @@ def test_dapi_snapshot_rejects_undeclared_leading_plane_source_crop(
         producer_z_start=1,
     )
 
-    with pytest.raises(InputValidationError, match="explicit source-copy provenance"):
+    with pytest.raises(
+        InputValidationError,
+        match="producer_source_z_start_offset.*unresolved",
+    ):
+        snapshot_registered_dapi(round_spec, analysis_config)
+
+
+def test_dapi_snapshot_accepts_declared_leading_plane_source_crop(
+    tmp_path: Path,
+    analysis_config,
+) -> None:
+    """A declared offset binds producer pixels to correspondence[offset:]."""
+    round_spec = replace(
+        _lamin_round(
+            tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+        ),
+        producer_source_z_start_offset=1,
+    )
+    output = (
+        tmp_path
+        / "workflow-root/synthetic/rounds/round-003/channels/round_3_405_DAPI.tif"
+    )
+    producer_root = tmp_path / "registration-copy"
+    _write_registered_dapi(
+        output,
+        round_spec=round_spec,
+        spacing=analysis_config.voxel_spacing_xyz_um,
+        moving=True,
+        dataset_root=producer_root,
+        producer_z_start=1,
+    )
+
+    snapshot = snapshot_registered_dapi(round_spec, analysis_config)
+    try:
+        correspondence = dict(channel_tiff_paths(round_spec))["dapi"].resolve()
+        producer = (producer_root / correspondence.name).resolve()
+        assert {correspondence, producer} <= {
+            Path(item.path) for item in snapshot.identities
+        }
+    finally:
+        snapshot.close()
+
+
+@pytest.mark.parametrize(
+    ("declared_offset", "message"),
+    ((2, "does not match declared"), (4, "outside correspondence TIFF Z")),
+)
+def test_dapi_snapshot_rejects_wrong_declared_source_crop_offset(
+    tmp_path: Path,
+    analysis_config,
+    declared_offset: int,
+    message: str,
+) -> None:
+    """Declared offsets must exactly explain the producer source volume."""
+    round_spec = replace(
+        _lamin_round(
+            tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+        ),
+        producer_source_z_start_offset=declared_offset,
+    )
+    output = (
+        tmp_path
+        / "workflow-root/synthetic/rounds/round-003/channels/round_3_405_DAPI.tif"
+    )
+    _write_registered_dapi(
+        output,
+        round_spec=round_spec,
+        spacing=analysis_config.voxel_spacing_xyz_um,
+        moving=True,
+        dataset_root=tmp_path / "registration-copy",
+        producer_z_start=1,
+    )
+
+    with pytest.raises(InputValidationError, match=message):
         snapshot_registered_dapi(round_spec, analysis_config)
 
 
@@ -813,6 +929,7 @@ paths:
         nd2_path=tmp_path / "round3.nd2",
         tiff_directory=tmp_path / "raw",
         z_start_offset=1,
+        producer_source_z_start_offset=0,
         target_exposure_ms=200.0,
         target_laser_percent=50.0,
         tubulin_exposure_ms=200.0,
@@ -931,6 +1048,7 @@ paths:
         nd2_path=tmp_path / "source.nd2",
         tiff_directory=tmp_path / "raw",
         z_start_offset=1,
+        producer_source_z_start_offset=0,
         target_exposure_ms=200.0,
         target_laser_percent=40.0,
         tubulin_exposure_ms=200.0,

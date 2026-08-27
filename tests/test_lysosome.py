@@ -331,6 +331,7 @@ def _lamp_cell_and_artifacts(
                 tmp_path / f"round-{number}.nd2",
                 tmp_path,
                 0,
+                0,
                 200.0,
                 50.0,
                 200.0,
