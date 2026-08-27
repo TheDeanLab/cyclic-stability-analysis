@@ -110,22 +110,23 @@ def _write_pretty_json(path: Path, payload: dict[str, object]) -> None:
 
 def _validated_registered_dapi(round_spec) -> Path:
     """Resolve one completed registered DAPI artifact without resolving targets."""
-    from cyexm.config.execution import load_execution_profile
     from cyexm.workflow.layout import WorkflowLayout
 
     from cyclic_stability.cyexm_artifacts import (
+        _execution_profile_snapshot,
         require_complete_workflow,
         validate_completed_artifact,
     )
 
-    require_complete_workflow(round_spec)
-    output_root = load_execution_profile(round_spec.execution_profile).paths.output_root
+    profile, _ = _execution_profile_snapshot(round_spec.execution_profile)
+    require_complete_workflow(round_spec, profile=profile)
+    output_root = profile.paths.output_root
     round_layout = WorkflowLayout.for_dataset(
         output_root, round_spec.workflow_dataset_id
     ).round(round_spec.workflow_round)
     path = round_layout.channel(f"round_{round_spec.acquisition_round}_405_DAPI.tif")
-    validate_completed_artifact(path)
-    return path
+    record = validate_completed_artifact(path)
+    return Path(record.artifact.path)
 
 
 def _inventory_rounds(config, cell) -> tuple[object, ...]:

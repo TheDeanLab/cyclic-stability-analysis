@@ -1022,6 +1022,7 @@ def _run_task_locked(
         terminal_path,
         _json_bytes({"status": "running", "attempt_id": attempt_id}),
     )
+    running_terminal_identity = ContentIdentity.from_path(terminal_path)
     scratch_dir = (
         (task.scratch_root / task.key / attempt_id)
         if task.scratch_root is not None
@@ -1067,6 +1068,10 @@ def _run_task_locked(
                     if not _current_identities_match(task.input_identities):
                         raise ValueError(
                             "one or more immutable task inputs changed before reuse"
+                        )
+                    if not running_terminal_identity.matches_path():
+                        raise ValueError(
+                            "authoritative running terminal changed before reuse"
                         )
                     _atomic_bytes(terminal_path, prior_terminal_snapshot.payload)
                     return reusable

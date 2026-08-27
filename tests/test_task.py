@@ -1225,6 +1225,64 @@ def test_terminal_replacement_during_decode_invalidates_production_reuse(
     assert reopened.attempt_id != first.attempt_id
 
 
+def test_production_reuse_rechecks_running_terminal_before_restoring_complete(
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replacement during preflight must prevent restoration of old success."""
+    decisions = tuple(
+        QcDecision(
+            "golgi",
+            "Cell1",
+            number,
+            "accept",
+            ("target-blind",),
+            "reviewer",
+            "2026-08-27T00:00:00Z",
+        )
+        for number in (1, 3, 4, 5)
+    )
+    task = replace(
+        cell_task(tmp_path),
+        config=replace(analysis_config, qc_decisions=decisions),
+    )
+
+    def preflight(value):
+        return replace(value, preflight=PreflightSnapshot((), ()))
+
+    monkeypatch.setattr(task_module, "_preflight_task", preflight)
+    first = run_cell_task(task, tmp_path / "run")
+    terminal = tmp_path / "run" / "tasks" / task.key / "terminal.json"
+    replacement = tmp_path / "replacement-failed-terminal.json"
+    replacement.write_text(
+        json.dumps({"status": "failed", "attempt_id": "0" * 32}) + "\n",
+        encoding="utf-8",
+    )
+    replaced = False
+
+    def replace_running_during_preflight(value):
+        nonlocal replaced
+        pointer = json.loads(terminal.read_text(encoding="utf-8"))
+        if pointer["status"] == "running":
+            os.replace(replacement, terminal)
+            replaced = True
+        return preflight(value)
+
+    monkeypatch.setattr(
+        task_module, "_preflight_task", replace_running_during_preflight
+    )
+
+    reopened = run_cell_task(task, tmp_path / "run")
+
+    assert replaced is True
+    assert reopened.status == "failed"
+    assert reopened.reused is False
+    assert reopened.attempt_id != first.attempt_id
+    pointer = json.loads(terminal.read_text(encoding="utf-8"))
+    assert pointer["status"] == "failed"
+    assert pointer["attempt_id"] == reopened.attempt_id
+    assert (first.attempt_dir / "record.json").is_file()
+
+
 def test_changed_input_failure_supersedes_prior_success_terminal(
     tmp_path: Path,
 ) -> None:

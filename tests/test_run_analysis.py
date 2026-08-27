@@ -7,9 +7,87 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+from cyclic_stability import cyexm_artifacts
 from cyclic_stability.models import NuclearConfig
 from cyclic_stability.nuclear import NuclearComponentQc
+from cyexm.workflow.models import WorkflowStatus
 from scripts import run_analysis
+from synthetic import write_completion_fixture
+
+
+def test_dapi_inventory_profile_rewrite_cannot_select_unvalidated_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """DAPI status and layout must consume one exact execution-profile snapshot."""
+    profile_path = tmp_path / "execution.yaml"
+    root_a = tmp_path / "workflow-root-a"
+    root_b = tmp_path / "workflow-root-b"
+
+    def profile_bytes(output_root: Path) -> bytes:
+        return f"""schema_version: 1
+executor: sequential
+paths:
+  dataset_root: /synthetic/raw
+  output_root: {output_root}
+  worker_local_directory: null
+""".encode()
+
+    profile_path.write_bytes(profile_bytes(root_a))
+    dapi_a = write_completion_fixture(
+        root_a
+        / "synthetic"
+        / "rounds"
+        / "round-001"
+        / "channels"
+        / "round_2_405_DAPI.tif",
+        b"root-a-dapi",
+    )
+    write_completion_fixture(
+        root_b
+        / "synthetic"
+        / "rounds"
+        / "round-001"
+        / "channels"
+        / "round_2_405_DAPI.tif",
+        b"root-b-dapi",
+    )
+    round_spec = SimpleNamespace(
+        acquisition_round=2,
+        execution_profile=profile_path,
+        workflow_dataset_id="synthetic",
+        workflow_round=1,
+    )
+    original_require = cyexm_artifacts.require_complete_workflow
+    inspected_roots: list[Path] = []
+
+    def complete_status(output_root: str | Path, dataset_id: str) -> WorkflowStatus:
+        inspected_roots.append(Path(output_root))
+        return WorkflowStatus(
+            dataset_id=dataset_id,
+            scientific_fingerprint="synthetic",
+            rounds=(),
+            complete=True,
+        )
+
+    def rewrite_after_status(round_value, *args, **kwargs):
+        assert not args
+        result = original_require(
+            round_value,
+            complete_status,
+            profile=kwargs.get("profile"),
+        )
+        profile_path.write_bytes(profile_bytes(root_b))
+        return result
+
+    monkeypatch.setattr(
+        cyexm_artifacts, "require_complete_workflow", rewrite_after_status
+    )
+
+    resolved = run_analysis._validated_registered_dapi(round_spec)
+
+    assert inspected_roots == [root_a.resolve()]
+    assert resolved == dapi_a.resolve()
+    assert resolved.read_bytes() == b"root-a-dapi"
 
 
 def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
