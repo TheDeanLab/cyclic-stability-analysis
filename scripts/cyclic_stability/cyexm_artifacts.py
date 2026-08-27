@@ -3,12 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
-from cyexm.config.execution import load_execution_profile
-from cyexm.errors import InputValidationError
+import yaml
+from cyexm.config import execution as cyexm_execution
+from cyexm.config._validation import require_exact_keys
+from cyexm.config._yaml import _StrictSafeLoader, _yaml_error_detail
+from cyexm.config.models import ExecutionProfile, ExecutorName, ParallelismSpec
+from cyexm.errors import (
+    ConfigurationValidationError,
+    InputValidationError,
+    ManifestDecodeError,
+)
 from cyexm.registration.artifacts import (
     ArtifactStore,
     CompletionRecord,
@@ -49,6 +59,8 @@ class RoundArtifacts:
     completion_record_paths: tuple[Path, ...] = ()
     completion_record_identities: tuple[ContentIdentity, ...] = ()
     native_target_identity: ContentIdentity | None = None
+    execution_profile_identity: ContentIdentity | None = None
+    artifact_identities: tuple[ContentIdentity, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,9 +96,101 @@ def _completion_record_from_bytes(payload: bytes) -> CompletionRecord:
     )
 
 
+def _execution_profile_from_bytes(
+    payload: bytes, source_path: Path
+) -> ExecutionProfile:
+    """Parse one Cy-ExM profile from the exact bytes already hashed by the caller."""
+    loader: _StrictSafeLoader | None = None
+    try:
+        loader = _StrictSafeLoader(payload.decode("utf-8"))
+        value = loader.get_single_data()
+        if not isinstance(value, Mapping):
+            raise yaml.YAMLError("YAML document must contain a top-level mapping")
+        raw_mapping = cast(Mapping[str, object], value)
+    except UnicodeDecodeError as error:
+        raise ManifestDecodeError(
+            f"Could not decode YAML from {source_path}: {error}"
+        ) from error
+    except yaml.YAMLError as error:
+        raise ManifestDecodeError(
+            f"Could not decode YAML from {source_path}: {_yaml_error_detail(error)}"
+        ) from error
+    finally:
+        if loader is not None:
+            loader.dispose()
+
+    raw_executor = raw_mapping.get("executor")
+    executor = cast(
+        ExecutorName,
+        cyexm_execution._choice(  # noqa: SLF001 - pinned Cy-ExM parser adapter
+            raw_executor,
+            cyexm_execution._EXECUTORS,
+            "executor",  # noqa: SLF001
+        ),
+    )
+    expected_keys = cyexm_execution._BASE_EXECUTION_KEYS  # noqa: SLF001
+    if "native_threads" in raw_mapping:
+        expected_keys |= frozenset({"native_threads"})
+    if "parallelism" in raw_mapping:
+        expected_keys |= frozenset({"parallelism"})
+    if executor != "sequential":
+        expected_keys |= frozenset({executor})
+    mapping = require_exact_keys(raw_mapping, expected_keys, "execution")
+
+    schema_version = mapping["schema_version"]
+    if type(schema_version) is not int or schema_version != 1:
+        raise ConfigurationValidationError(
+            f"schema_version must be the built-in integer 1; got {schema_version!r}"
+        )
+    native_threads = (
+        cyexm_execution._native_threads(mapping["native_threads"])  # noqa: SLF001
+        if "native_threads" in mapping
+        else cyexm_execution._resolve_inherited_native_threads(  # noqa: SLF001
+            os.environ
+        )
+    )
+    profile = ExecutionProfile(
+        schema_version=schema_version,
+        executor=executor,
+        paths=cyexm_execution._paths(  # noqa: SLF001
+            mapping["paths"],
+            source_path.parent,
+            require_worker_scratch=executor != "sequential",
+        ),
+        native_threads=native_threads,
+        local_dask=(
+            cyexm_execution._local_dask(mapping["local_dask"])  # noqa: SLF001
+            if executor == "local_dask"
+            else None
+        ),
+        slurm=(
+            cyexm_execution._slurm(mapping["slurm"])  # noqa: SLF001
+            if executor == "slurm"
+            else None
+        ),
+        source_path=source_path,
+        parallelism=(
+            cyexm_execution._parallelism(mapping["parallelism"])  # noqa: SLF001
+            if "parallelism" in mapping
+            else ParallelismSpec()
+        ),
+    )
+    cyexm_execution._validate_execution_profile(profile)  # noqa: SLF001
+    return profile
+
+
+def _execution_profile_snapshot(
+    path: Path,
+) -> tuple[ExecutionProfile, ContentIdentity]:
+    """Hash and parse one canonical execution-profile snapshot without reloading it."""
+    identity, payload = ContentIdentity.read_bytes(path)
+    profile = _execution_profile_from_bytes(payload, Path(identity.path))
+    return profile, identity
+
+
 def _validated_completion_snapshot(
     path: Path,
-) -> tuple[CompletionRecord, Path, ContentIdentity]:
+) -> tuple[CompletionRecord, Path, ContentIdentity, ContentIdentity]:
     """Return one parsed record and identity from the same no-follow snapshot."""
     store = ArtifactStore()
     record_path = store.record_path(path)
@@ -97,28 +201,36 @@ def _validated_completion_snapshot(
         record = _completion_record_from_bytes(record_bytes)
         if not record_identity.matches_path():
             raise ValueError("completion record changed during parsing")
-        identity = FileIdentity.from_path(path)
+        artifact_identity = ContentIdentity.from_path(path)
+        identity = FileIdentity(
+            artifact_identity.path,
+            artifact_identity.st_size,
+            artifact_identity.st_mtime_ns,
+        )
     except (OSError, RuntimeError, TypeError, UnicodeError, ValueError) as error:
         raise InputValidationError(
             f"completion record is unreadable: {path}"
         ) from error
     if identity != record.artifact:
         raise InputValidationError(f"completion identity mismatch: {path}")
-    return record, Path(record_identity.path), record_identity
+    return record, Path(record_identity.path), record_identity, artifact_identity
 
 
 def validate_completed_artifact(path: Path) -> CompletionRecord:
     """Validate an artifact against the immutable identity in its completion record."""
-    record, _, _ = _validated_completion_snapshot(path)
+    record, _, _, _ = _validated_completion_snapshot(path)
     return record
 
 
 def require_complete_workflow(
     round_spec: RoundSpec,
     status_inspector: StatusInspector = inspect_workflow_status,
+    *,
+    profile: ExecutionProfile | None = None,
 ) -> WorkflowStatus:
     """Require the declared Cy-ExM workflow to be authoritatively complete."""
-    profile = load_execution_profile(round_spec.execution_profile)
+    if profile is None:
+        profile, _ = _execution_profile_snapshot(round_spec.execution_profile)
     status = status_inspector(profile.paths.output_root, round_spec.workflow_dataset_id)
     if not status.complete:
         raise InputValidationError(
@@ -138,8 +250,11 @@ def resolve_round_artifacts(
     status_inspector: StatusInspector = inspect_workflow_status,
 ) -> RoundArtifacts:
     """Resolve and validate every Cy-ExM artifact consumed for a round."""
-    require_complete_workflow(round_spec, status_inspector)
-    output_root = load_execution_profile(round_spec.execution_profile).paths.output_root
+    profile, profile_identity = _execution_profile_snapshot(
+        round_spec.execution_profile
+    )
+    require_complete_workflow(round_spec, status_inspector, profile=profile)
+    output_root = profile.paths.output_root
     round_layout = WorkflowLayout.for_dataset(
         output_root, round_spec.workflow_dataset_id
     ).round(round_spec.workflow_round)
@@ -185,6 +300,18 @@ def resolve_round_artifacts(
     records = tuple(item[0] for item in validated)
     record_paths = tuple(item[1] for item in validated)
     record_identities = tuple(item[2] for item in validated)
+    artifact_identities = tuple(item[3] for item in validated)
+    canonical_required = tuple(Path(identity.path) for identity in artifact_identities)
+    channels = cast(tuple[Path, Path, Path], canonical_required[:3])
+    if acquisition != 2:
+        (
+            affine,
+            warp,
+            pre_metrics,
+            linear_metrics,
+            nonlinear_metrics,
+            chunk_manifest,
+        ) = canonical_required[3:]
     target_record = records[2]
     native_target_identity: ContentIdentity | None = None
     if (
@@ -228,6 +355,8 @@ def resolve_round_artifacts(
         completion_record_paths=record_paths,
         completion_record_identities=record_identities,
         native_target_identity=native_target_identity,
+        execution_profile_identity=profile_identity,
+        artifact_identities=artifact_identities,
     )
 
 

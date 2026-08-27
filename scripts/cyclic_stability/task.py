@@ -290,6 +290,15 @@ class TaskRecord:
         return (self.software_identity,)
 
 
+@dataclass(frozen=True, slots=True)
+class _TerminalSnapshot:
+    """One parsed terminal pointer bound to the exact bytes read from disk."""
+
+    identity: ContentIdentity
+    payload: bytes
+    pointer: Mapping[str, object]
+
+
 def configure_native_threads(native_threads: int) -> None:
     """Set every supported native runtime thread variable before scientific imports."""
     if isinstance(native_threads, bool) or native_threads < 1:
@@ -443,16 +452,31 @@ def _reusable_input_identities(
     return task.input_identities
 
 
+def _terminal_snapshot(terminal: Path) -> _TerminalSnapshot | None:
+    """Read, parse, and recheck a terminal while its path remains authoritative."""
+    try:
+        identity, payload = ContentIdentity.read_bytes(terminal)
+        pointer = json.loads(payload.decode("utf-8"))
+        if not isinstance(pointer, Mapping) or not identity.matches_path():
+            return None
+    except (OSError, ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+        return None
+    return _TerminalSnapshot(identity, payload, pointer)
+
+
 def _read_reusable(
     task: CellTask | ArtifactTask,
     terminal: Path,
     *,
-    terminal_payload: bytes | None = None,
+    terminal_snapshot: _TerminalSnapshot | None = None,
+    recheck_terminal: bool = True,
 ) -> TaskRecord | None:
+    if terminal_snapshot is None:
+        terminal_snapshot = _terminal_snapshot(terminal)
+        if terminal_snapshot is None:
+            return None
     try:
-        if terminal_payload is None:
-            _, terminal_payload = ContentIdentity.read_bytes(terminal)
-        pointer = json.loads(terminal_payload.decode("utf-8"))
+        pointer = terminal_snapshot.pointer
         if (
             set(pointer)
             != {
@@ -548,6 +572,7 @@ def _read_reusable(
         or record.software_identity != task.software_identity
         or reusable_inputs is None
         or record.attempt_dir.resolve(strict=True) != attempt_dir
+        or (recheck_terminal and not terminal_snapshot.identity.matches_path())
         or not actual_record_identity.matches_path()
         or not actual_manifest_identity.matches_path()
         or not record.output_identities
@@ -652,8 +677,24 @@ def _preflight_task(task: CellTask) -> CellTask:
     from cyclic_stability.provenance import channel_tiff_paths
 
     report = validate_cell_inputs(task.cell)
-    paths: list[Path] = []
     identities: list[ContentIdentity] = []
+    identities_by_path: dict[Path, ContentIdentity] = {}
+    canonical_rounds: list[object] = []
+    canonical_artifacts: list[object] = []
+
+    def retain_identity(identity: ContentIdentity) -> Path:
+        path = Path(identity.path)
+        prior = identities_by_path.get(path)
+        if prior is not None and prior != identity:
+            raise ValueError(f"conflicting source snapshots for canonical path: {path}")
+        if prior is None:
+            identities_by_path[path] = identity
+            identities.append(identity)
+        return path
+
+    def snapshot_path(path: Path) -> Path:
+        return retain_identity(ContentIdentity.from_path(path))
+
     decisions = {
         (item.cohort, item.cell_id, item.acquisition_round): item.decision
         for item in task.config.qc_decisions
@@ -682,24 +723,72 @@ def _preflight_task(task: CellTask) -> CellTask:
             artifacts.completion_records
         ):
             raise ValueError("validated artifact record paths are incomplete")
-        paths.append(round_spec.nd2_path)
-        paths.append(round_spec.execution_profile)
-        paths.extend(path for _, path in channel_tiff_paths(round_spec))
-        paths.extend(
-            path
-            for path in (
-                artifacts.registered_dapi,
-                artifacts.registered_tubulin,
-                artifacts.registered_target,
-                artifacts.affine,
-                artifacts.warp,
-                artifacts.pre_metrics,
-                artifacts.linear_metrics,
-                artifacts.nonlinear_metrics,
-                artifacts.chunk_manifest,
+        canonical_nd2 = snapshot_path(round_spec.nd2_path)
+        canonical_manifest = snapshot_path(round_spec.dataset_manifest)
+        profile_identity = getattr(artifacts, "execution_profile_identity", None)
+        if profile_identity is None:
+            canonical_profile = snapshot_path(round_spec.execution_profile)
+        elif not isinstance(profile_identity, ContentIdentity):
+            raise ValueError("validated execution-profile identity is inconsistent")
+        else:
+            canonical_profile = retain_identity(profile_identity)
+            if round_spec.execution_profile.resolve(strict=True) != canonical_profile:
+                raise ValueError("validated execution-profile identity is inconsistent")
+        canonical_tiffs = tuple(
+            snapshot_path(path) for _, path in channel_tiff_paths(round_spec)
+        )
+        tiff_parents = {path.parent for path in canonical_tiffs}
+        if len(tiff_parents) != 1:
+            raise ValueError(
+                "source TIFF channels do not share one canonical directory"
+            )
+        canonical_tiff_directory = next(iter(tiff_parents))
+
+        artifact_sources = tuple(
+            (name, path)
+            for name, path in (
+                ("registered_dapi", artifacts.registered_dapi),
+                ("registered_tubulin", artifacts.registered_tubulin),
+                ("registered_target", artifacts.registered_target),
+                ("affine", artifacts.affine),
+                ("warp", artifacts.warp),
+                ("pre_metrics", artifacts.pre_metrics),
+                ("linear_metrics", artifacts.linear_metrics),
+                ("nonlinear_metrics", artifacts.nonlinear_metrics),
+                ("chunk_manifest", artifacts.chunk_manifest),
             )
             if path is not None
         )
+        artifact_identities = getattr(artifacts, "artifact_identities", ())
+        if artifact_identities and len(artifact_identities) != len(artifact_sources):
+            raise ValueError("validated artifact identities are incomplete")
+        artifact_paths: dict[str, Path | None] = {
+            name: None
+            for name in (
+                "affine",
+                "warp",
+                "pre_metrics",
+                "linear_metrics",
+                "nonlinear_metrics",
+                "chunk_manifest",
+            )
+        }
+        for index, (name, path) in enumerate(artifact_sources):
+            if artifact_identities:
+                identity = artifact_identities[index]
+                if not isinstance(identity, ContentIdentity) or path.resolve(
+                    strict=True
+                ) != Path(identity.path):
+                    raise ValueError("validated artifact identity is inconsistent")
+                artifact_paths[name] = retain_identity(identity)
+            else:
+                artifact_paths[name] = snapshot_path(path)
+        artifact_paths["moving_crop"] = (
+            None
+            if artifacts.moving_crop is None
+            else snapshot_path(artifacts.moving_crop)
+        )
+        canonical_record_paths: list[Path] = []
         for record_path, identity in zip(
             artifacts.completion_record_paths,
             artifacts.completion_record_identities,
@@ -709,34 +798,66 @@ def _preflight_task(task: CellTask) -> CellTask:
                 strict=True
             ) != Path(identity.path):
                 raise ValueError("validated artifact record identity is inconsistent")
-            identities.append(identity)
+            canonical_record_paths.append(retain_identity(identity))
+        canonical_native_target = artifacts.native_target
+        native_identity = artifacts.native_target_identity
+        if canonical_native_target is not None and isinstance(
+            native_identity, ContentIdentity
+        ):
+            if canonical_native_target.resolve(strict=True) != Path(
+                native_identity.path
+            ):
+                raise ValueError("validated native target identity is inconsistent")
+            canonical_native_target = Path(native_identity.path)
         if (
             round_spec.acquisition_round in native_rounds
-            and artifacts.native_target is not None
+            and canonical_native_target is not None
         ):
-            identity = artifacts.native_target_identity
-            if not isinstance(
-                identity, ContentIdentity
-            ) or artifacts.native_target.resolve(strict=True) != Path(identity.path):
+            if not isinstance(native_identity, ContentIdentity):
                 raise ValueError("validated native target identity is inconsistent")
-            identities.append(identity)
-    seen: set[Path] = set()
-    unique_identities: list[ContentIdentity] = []
-    for identity in identities:
-        identity_path = Path(identity.path)
-        if identity_path in seen:
-            continue
-        seen.add(identity_path)
-        unique_identities.append(identity)
-    for path in paths:
-        resolved = path.resolve(strict=True)
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        unique_identities.append(ContentIdentity.from_path(resolved))
-    snapshot = PreflightSnapshot(report.rounds, tuple(unique_identities))
+            retain_identity(native_identity)
+        canonical_rounds.append(
+            replace(
+                round_spec,
+                nd2_path=canonical_nd2,
+                tiff_directory=canonical_tiff_directory,
+                dataset_manifest=canonical_manifest,
+                execution_profile=canonical_profile,
+            )
+        )
+        canonical_artifacts.append(
+            replace(
+                artifacts,
+                workflow_output_root=artifacts.workflow_output_root.resolve(
+                    strict=True
+                ),
+                **artifact_paths,
+                completion_record_paths=tuple(canonical_record_paths),
+                native_target=canonical_native_target,
+            )
+        )
+    canonical_cell = replace(task.cell, rounds=tuple(canonical_rounds))
+    matching_cells = tuple(
+        cell
+        for cell in task.config.cells
+        if (cell.cohort, cell.cell_id) == (task.cell.cohort, task.cell.cell_id)
+    )
+    if len(matching_cells) != 1:
+        raise ValueError("task cell is not unique in the analysis configuration")
+    canonical_config = replace(
+        task.config,
+        cells=tuple(
+            canonical_cell
+            if (cell.cohort, cell.cell_id) == (task.cell.cohort, task.cell.cell_id)
+            else cell
+            for cell in task.config.cells
+        ),
+    )
+    snapshot = PreflightSnapshot(tuple(canonical_artifacts), tuple(identities))
     return replace(
         task,
+        cell=canonical_cell,
+        config=canonical_config,
         input_identities=(*task.input_identities, *snapshot.input_identities),
         preflight=snapshot,
     )
@@ -885,12 +1006,9 @@ def _run_task_locked(
     terminal_path = task_dir / "terminal.json"
     _remove_pointer(task_dir / "complete.json")
     requires_current_preflight = isinstance(task, CellTask) and task.config is not None
-    prior_terminal_payload: bytes | None = None
+    prior_terminal_snapshot: _TerminalSnapshot | None = None
     if requires_current_preflight and not task.force:
-        try:
-            _, prior_terminal_payload = ContentIdentity.read_bytes(terminal_path)
-        except (OSError, ValueError):
-            pass
+        prior_terminal_snapshot = _terminal_snapshot(terminal_path)
     elif not task.force:
         reusable = _read_reusable(task, terminal_path)
         if reusable is not None:
@@ -935,11 +1053,12 @@ def _run_task_locked(
             ):
                 raise TypeError("cell task inputs require content-bound identities")
             _qc_gate(task)
-            if prior_terminal_payload is not None:
+            if prior_terminal_snapshot is not None:
                 reusable = _read_reusable(
                     task,
                     terminal_path,
-                    terminal_payload=prior_terminal_payload,
+                    terminal_snapshot=prior_terminal_snapshot,
+                    recheck_terminal=False,
                 )
                 if reusable is not None:
                     stop.set()
@@ -949,7 +1068,7 @@ def _run_task_locked(
                         raise ValueError(
                             "one or more immutable task inputs changed before reuse"
                         )
-                    _atomic_bytes(terminal_path, prior_terminal_payload)
+                    _atomic_bytes(terminal_path, prior_terminal_snapshot.payload)
                     return reusable
         if not _current_identities_match(task.input_identities):
             raise ValueError(

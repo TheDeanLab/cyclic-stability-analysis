@@ -124,6 +124,52 @@ def test_golgi_reference_resolves_acquisition_round_two_from_workflow_round_one(
     )
 
 
+def test_execution_profile_rewrite_during_status_cannot_select_another_root(
+    golgi_round_two: RoundSpec,
+) -> None:
+    """Status and artifact selection must consume one exact profile snapshot."""
+    profile = golgi_round_two.execution_profile
+    root_a = profile.parent / "workflow-root"
+    root_b = profile.parent / "workflow-root-b"
+    channels_b = root_b / "synthetic" / "rounds" / "round-001" / "channels"
+    for filename in (
+        "round_2_405_DAPI.tif",
+        "round_2_488_tubulin.tif",
+        "round_2_647_golgi.tif",
+    ):
+        write_completion_fixture(channels_b / filename, f"root-b-{filename}".encode())
+    original_profile = profile.read_bytes()
+    replacement_profile = original_profile.replace(
+        str(root_a).encode(), str(root_b).encode()
+    )
+    assert replacement_profile != original_profile
+    inspected_roots: list[Path] = []
+
+    def rewrite_after_status_root_selected(output_root: str | Path, dataset_id: str):
+        inspected_roots.append(Path(output_root))
+        profile.write_bytes(replacement_profile)
+        return WorkflowStatus(
+            dataset_id=dataset_id,
+            scientific_fingerprint="synthetic",
+            rounds=(),
+            complete=True,
+        )
+
+    artifacts = resolve_round_artifacts(
+        golgi_round_two, rewrite_after_status_root_selected
+    )
+
+    assert inspected_roots == [root_a.resolve()]
+    assert artifacts.workflow_output_root == root_a.resolve()
+    assert (
+        artifacts.registered_dapi.parent
+        == (root_a / "synthetic" / "rounds" / "round-001" / "channels").resolve()
+    )
+    assert artifacts.execution_profile_identity is not None
+    assert Path(artifacts.execution_profile_identity.path) == profile.resolve()
+    assert artifacts.execution_profile_identity.matches_path() is False
+
+
 def _golgi_moving_round_with_native_source(
     tmp_path: Path,
 ) -> tuple[RoundSpec, Path, Path, Path, Path]:
