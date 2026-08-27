@@ -5,15 +5,15 @@ from __future__ import annotations
 import csv
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from itertools import pairwise
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.ndimage import (
     binary_erosion,
-    distance_transform_edt,
     gaussian_filter,
     maximum_filter,
 )
@@ -39,6 +39,7 @@ from cyclic_stability.nuclear import (
     _accepted_rounds,
     _atomic_publish_directory,
     consensus_nuclear_surface,
+    write_nuclear_component_diagnostic,
 )
 from cyclic_stability.units import ResolutionReference, theoretical_resolution
 
@@ -471,29 +472,41 @@ def eligible_lamp_cells(config: AnalysisConfig) -> tuple[CellSpec, ...]:
 
 def _with_nuclear_distances(
     detections: DetectionSet,
-    surface: NuclearSurface,
+    surfaces: tuple[NuclearSurface, ...],
 ) -> DetectionSet:
-    """Annotate object centroids with physical distance to the target-independent nucleus."""
-    sx, sy, sz = surface.spacing_xyz_um
-    distances = distance_transform_edt(~surface.mask_zyx, sampling=(sz, sy, sx))
-    objects = []
-    for object_ in detections.objects:
-        x, y, z = object_.centroid_xyz_um
-        index = tuple(round(value) for value in (z / sz, y / sy, x / sx))
-        objects.append(
-            replace(object_, nucleus_relative_distance_um=float(distances[index]))
-        )
-    return replace(detections, objects=tuple(objects))
+    """Annotate objects with minimum distance to any accepted nuclear surface."""
+    if not surfaces:
+        raise ValueError("LAMP1 nuclear distance requires accepted nuclei")
+    spacing = surfaces[0].spacing_xyz_um
+    if any(surface.spacing_xyz_um != spacing for surface in surfaces):
+        raise ValueError("accepted nuclear surfaces must share physical spacing")
+    vertices_xyz_um = np.concatenate(
+        tuple(surface.vertices_xyz_um for surface in surfaces), axis=0
+    )
+    if not detections.objects:
+        return detections
+    coordinates_xyz_um = np.asarray(detections.coordinates_xyz_um, dtype=np.float64)
+    distances = cKDTree(vertices_xyz_um).query(coordinates_xyz_um, k=1)[0]
+    return replace(
+        detections,
+        objects=tuple(
+            replace(object_, nucleus_relative_distance_um=float(distance))
+            for object_, distance in zip(detections.objects, distances, strict=True)
+        ),
+    )
 
 
 def _fixed_lamp_roi(
-    surface: NuclearSurface,
+    nuclear_mask: NDArray[np.bool_],
     validity_masks: Mapping[int, NDArray[np.bool_]],
 ) -> NDArray[np.bool_]:
     """Return one target-independent exterior ROI on common producer-valid support."""
     if not validity_masks:
         raise ValueError("LAMP1 ROI requires producer-attested transform support")
-    common = np.ones(surface.mask_zyx.shape, dtype=bool)
+    nucleus = validated_binary_mask(nuclear_mask, "consensus nuclear mask")
+    if nucleus.ndim != 3:
+        raise ValueError("consensus nuclear mask must be 3D ZYX")
+    common = np.ones(nucleus.shape, dtype=bool)
     for number, raw_mask in validity_masks.items():
         mask = validated_binary_mask(raw_mask, f"validity mask for round {number}")
         if mask.ndim != 3 or mask.shape != common.shape:
@@ -501,7 +514,7 @@ def _fixed_lamp_roi(
                 "transform support and consensus nucleus must share geometry"
             )
         common &= mask
-    roi = common & ~surface.mask_zyx
+    roi = common & ~nucleus
     if not np.any(roi):
         raise ValueError("fixed LAMP1 ROI is empty")
     roi.setflags(write=False)
@@ -563,15 +576,18 @@ def _rows_for_detections(
     }
     return tuple(
         EnsembleRow(
-            cell.cohort,
-            cell.cell_id,
-            round_number,
-            endpoint,
-            name,
-            detections.detection_sbr,
-            value,
-            units,
-            config.config_digest,
+            cohort=cell.cohort,
+            cell_id=cell.cell_id,
+            acquisition_round=round_number,
+            endpoint=endpoint,
+            ensemble_name=name,
+            ensemble_value=detections.detection_sbr,
+            sigma_um=detections.sigma_um,
+            threshold_sbr=detections.detection_sbr,
+            surface_tolerance_resolution_units=None,
+            value=value,
+            units=units,
+            source_task_identity=config.config_digest,
         )
         for endpoint, (value, units) in values.items()
     )
@@ -605,13 +621,16 @@ def analyze_lamp1_cell(
     dapi = {
         number: load_volume(by_round[number].registered_dapi) for number in accepted
     }
-    surface = consensus_nuclear_surface(
-        dapi, config.voxel_spacing_xyz_um, config.nuclear
+    consensus = consensus_nuclear_surface(
+        dapi,
+        config.voxel_spacing_xyz_um,
+        config.nuclear,
+        config.nominal_expansion_factor,
     )
     validity_masks, validity_digest, validity_identities = _artifact_validity_masks(
         {number: by_round[number] for number in accepted}, config
     )
-    roi = _fixed_lamp_roi(surface, validity_masks)
+    roi = _fixed_lamp_roi(consensus.mask_zyx, validity_masks)
     lamp = {
         number: load_volume(by_round[number].registered_target) for number in accepted
     }
@@ -627,7 +646,7 @@ def analyze_lamp1_cell(
     )
     detections = {
         number: tuple(
-            _with_nuclear_distances(item, surface)
+            _with_nuclear_distances(item, consensus.nuclei)
             for item in detect_lysosomes(
                 lamp[number],
                 roi,
@@ -705,6 +724,9 @@ def analyze_lamp1_cell(
     def populate(staged: Path) -> None:
         nonlocal staged_paths, staging_root
         staging_root = staged
+        component_diagnostic = write_nuclear_component_diagnostic(
+            staged, cell.cell_id, dapi, consensus
+        )
         diagnostic = staged / "lamp1-detections.npz"
         np.savez_compressed(
             diagnostic,
@@ -741,6 +763,7 @@ def analyze_lamp1_cell(
                     "sphericity",
                     "nearest_neighbor_distance_um",
                     "nucleus_relative_distance_um",
+                    "nucleus_id",
                 )
             )
             for number, members in sorted(detections.items()):
@@ -758,6 +781,7 @@ def analyze_lamp1_cell(
                                 object_.sphericity,
                                 object_.nearest_neighbor_distance_um,
                                 object_.nucleus_relative_distance_um,
+                                "aggregate",
                             )
                         )
         matches_table = staged / "matches.csv"
@@ -781,6 +805,7 @@ def analyze_lamp1_cell(
                     "lateral_displacement_um",
                     "axial_displacement_um",
                     "normalized_displacement",
+                    "nucleus_id",
                 )
             )
             for (
@@ -813,9 +838,16 @@ def analyze_lamp1_cell(
                             match.lateral_displacements_um[pair_index],
                             match.axial_displacements_um[pair_index],
                             match.normalized_displacements[pair_index],
+                            "aggregate",
                         )
                     )
-        staged_paths = (diagnostic, table, objects_table, matches_table)
+        staged_paths = (
+            component_diagnostic,
+            diagnostic,
+            table,
+            objects_table,
+            matches_table,
+        )
 
     _atomic_publish_directory(output_dir, populate)
     assert staging_root is not None
@@ -839,6 +871,7 @@ def analyze_lamp1_cell(
         ensemble_rows,
         diagnostics,
         identities,
+        tuple(MappingProxyType(asdict(row)) for row in consensus.component_qc),
     )
 
 

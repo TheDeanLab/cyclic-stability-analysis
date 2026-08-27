@@ -242,6 +242,7 @@ def _target_blind_inputs(tmp_path: Path) -> tuple[CellSpec, tuple[RoundArtifacts
             nd2_path=tmp_path / f"round-{acquisition}.nd2",
             tiff_directory=tmp_path / "raw",
             z_start_offset=0,
+            producer_source_z_start_offset=0,
             target_exposure_ms=1.0,
             target_laser_percent=1.0,
             tubulin_exposure_ms=1.0,
@@ -290,6 +291,7 @@ def test_analyzer_reads_only_blinded_channels_and_writes_metrics_and_stages(
     cell, artifacts = _target_blind_inputs(tmp_path)
     read_paths: list[Path] = []
     backend_read_paths: list[Path] = []
+    backend_spacings: list[tuple[float, float, float]] = []
 
     class Backend:
         def __init__(self, native_threads: object) -> None:
@@ -311,6 +313,7 @@ def test_analyzer_reads_only_blinded_channels_and_writes_metrics_and_stages(
 
         def load_image(self, path: Path, spacing: tuple[float, float, float]) -> Path:
             backend_read_paths.append(path)
+            backend_spacings.append(spacing)
             return path
 
         def apply_affine(self, **kwargs: object) -> object:
@@ -322,6 +325,7 @@ def test_analyzer_reads_only_blinded_channels_and_writes_metrics_and_stages(
 
     metric_paths: list[Path] = []
     gradient_calls = 0
+    gradient_spacings: list[tuple[float, float, float]] = []
     real_deformation_gradient = registration_qc.deformation_gradient
 
     def counted_deformation_gradient(
@@ -329,6 +333,7 @@ def test_analyzer_reads_only_blinded_channels_and_writes_metrics_and_stages(
     ) -> np.ndarray:
         nonlocal gradient_calls
         gradient_calls += 1
+        gradient_spacings.append(spacing)
         return real_deformation_gradient(warp, spacing)
 
     monkeypatch.setattr(registration_qc, "AntsRegistrationBackend", Backend)
@@ -351,6 +356,8 @@ def test_analyzer_reads_only_blinded_channels_and_writes_metrics_and_stages(
     assert gradient_calls == 1
     assert all("FORBIDDEN" not in str(path) for path in read_paths)
     assert all("FORBIDDEN" not in str(path) for path in backend_read_paths)
+    assert set(backend_spacings) == {(0.1083, 0.1083, 0.3)}
+    assert gradient_spacings == [(0.1083, 0.1083, 0.3)]
     assert {path.name.split("-")[2] for path in result.overlay_paths} == {
         "pre",
         "affine",

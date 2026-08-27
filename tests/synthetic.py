@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -15,9 +16,9 @@ from cyclic_stability.models import CellSpec, NuclearConfig, RoundSpec
 from cyclic_stability.review_inventory import build_review_manifest
 from cyclic_stability.review_models import CaseKey, ReviewManifest
 from cyclic_stability.review_store import ReviewStore
-from cyclic_stability.task import CellTask, TaskOutput
+from cyclic_stability.task import CellTask, ContentIdentity, TaskOutput
 from cyclic_stability.units import theoretical_resolution
-from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
+from cyexm.registration.artifacts import ArtifactStore, StageRequest
 from cyexm.spatial import ImageGeometry
 from numpy.typing import NDArray
 
@@ -29,6 +30,7 @@ CORRESPONDENCE_COLUMNS = (
     "nd2_relative",
     "tiff_directory_relative",
     "z_start_offset",
+    "producer_source_z_start_offset",
     "target_channel",
     "target_exposure_ms",
     "target_laser_percent",
@@ -250,7 +252,7 @@ def cell_task(tmp_path: Path, cell_id: str = "Cell1") -> CellTask:
     for round_number in range(1, 6):
         path = inputs / f"round-{round_number}.bin"
         path.write_bytes(f"{cell_id}-{round_number}".encode())
-        identities.append(FileIdentity.from_path(path))
+        identities.append(ContentIdentity.from_path(path))
     rounds = tuple(replace(item, cell_id=cell_id) for item in synthetic_round_specs())
     cell = CellSpec("golgi", cell_id, rounds)
     return CellTask(
@@ -280,15 +282,15 @@ def normalized_table_bytes(record) -> bytes:
     return record.compact_table.read_bytes()
 
 
-def different_identity() -> FileIdentity:
+def different_identity() -> ContentIdentity:
     """Return a valid immutable identity unlike a synthetic task input identity."""
-    return FileIdentity.from_path(Path(__file__))
+    return ContentIdentity.from_path(Path(__file__))
 
 
 ANALYSIS_YAML = """\
 schema_version: 1
 reference_acquisition_round: 2
-voxel_spacing_xyz_um: [0.108333, 0.108333, 0.300000]
+voxel_spacing_xyz_um: [0.1083, 0.1083, 0.300000]
 nominal_expansion_factor: 4.5
 optics:
   numerical_aperture: 1.4
@@ -306,6 +308,10 @@ nuclear:
   normal_half_window_um: 1.5
   normal_step_um: 0.05
   ridge_min_sbr: 3.0
+  accepted_component_count: [1, 6]
+  nominal_volume_um3: [100.0, 5000.0]
+  minimum_sphericity: 0.15
+  maximum_face_contact_fraction: 0.10
 golgi:
   perinuclear_outer_distance_um: 18.0
 lysosome:
@@ -339,6 +345,7 @@ def write_synthetic_correspondence(path: Path) -> None:
                         "nd2_relative": f"round{acquisition_round}/DAPI_tubulin_golgi_{cell_index:03d}.nd2",
                         "tiff_directory_relative": f"Golgi/Cell{cell_index}",
                         "z_start_offset": 1,
+                        "producer_source_z_start_offset": 0,
                         "target_channel": "647_golgi",
                         "target_exposure_ms": 150 if acquisition_round == 1 else 200,
                         "target_laser_percent": 50,
@@ -470,6 +477,7 @@ def synthetic_round_specs() -> tuple[RoundSpec, ...]:
             nd2_path=Path(f"round{acquisition_round}.nd2"),
             tiff_directory=Path("tiffs"),
             z_start_offset=0,
+            producer_source_z_start_offset=0,
             target_exposure_ms=100.0 if acquisition_round == 1 else 200.0,
             target_laser_percent=50.0,
             tubulin_exposure_ms=200.0,
@@ -500,6 +508,76 @@ def synthetic_nucleus(
         -0.5 * ((radius - radius_um) / (shell_width_um / 2.355)) ** 2
     )
     return dapi, lamin
+
+
+def ellipsoid_dapi(
+    centers_xyz_um: Sequence[tuple[float, float, float]],
+    radii_xyz_um: Sequence[tuple[float, float, float]],
+    spacing_xyz_um: tuple[float, float, float],
+    shape_zyx: tuple[int, int, int],
+) -> NDArray[np.float32]:
+    """Place nonoverlapping bright ellipsoids in one physical ZYX volume."""
+    if len(centers_xyz_um) != len(radii_xyz_um):
+        raise ValueError("ellipsoid centers and radii must have matching lengths")
+    if any(value <= 0.0 for value in (*spacing_xyz_um, *shape_zyx)):
+        raise ValueError("ellipsoid spacing and shape must be positive")
+    sx, sy, sz = spacing_xyz_um
+    z, y, x = np.ogrid[: shape_zyx[0], : shape_zyx[1], : shape_zyx[2]]
+    foreground = np.zeros(shape_zyx, dtype=bool)
+    for center, radii in zip(centers_xyz_um, radii_xyz_um, strict=True):
+        if any(value <= 0.0 for value in radii):
+            raise ValueError("ellipsoid radii must be positive")
+        cx, cy, cz = center
+        rx, ry, rz = radii
+        component = ((x * sx - cx) / rx) ** 2 + ((y * sy - cy) / ry) ** 2 + (
+            (z * sz - cz) / rz
+        ) ** 2 <= 1.0
+        if np.any(foreground & component):
+            raise ValueError("synthetic ellipsoids must not overlap")
+        foreground |= component
+    background_x = np.sin(x * sx).astype(np.float32)
+    background_y = np.cos(y * sy).astype(np.float32)
+    image = np.empty(shape_zyx, dtype=np.float32)
+    image[...] = 1.0 + 0.05 * background_x * background_y
+    image[foreground] = 41.0
+    return image
+
+
+def separated_nuclei(
+    count: int, spacing_xyz_um: tuple[float, float, float]
+) -> NDArray[np.float32]:
+    """Return one through seven valid expanded-space nuclei on a compact grid."""
+    if count < 1 or count > 7:
+        raise ValueError("count must be between one and seven")
+    radius_um = 13.25
+    gap_um = 1.5
+    margin_um = 1.5
+    columns = min(count, 4 if count == 7 else 3)
+    rows = math.ceil(count / columns)
+    diameter_um = 2.0 * radius_um
+    centers = tuple(
+        (
+            margin_um + radius_um + (index % columns) * (diameter_um + gap_um),
+            margin_um + radius_um + (index // columns) * (diameter_um + gap_um),
+            margin_um + radius_um,
+        )
+        for index in range(count)
+    )
+    extent_xyz_um = (
+        2.0 * margin_um + columns * diameter_um + (columns - 1) * gap_um,
+        2.0 * margin_um + rows * diameter_um + (rows - 1) * gap_um,
+        2.0 * margin_um + diameter_um,
+    )
+    shape_zyx = tuple(
+        math.ceil(extent / step) + 1
+        for extent, step in zip(extent_xyz_um[::-1], spacing_xyz_um[::-1], strict=True)
+    )
+    return ellipsoid_dapi(
+        centers,
+        ((radius_um, radius_um, radius_um),) * count,
+        spacing_xyz_um,
+        shape_zyx,
+    )
 
 
 def synthetic_shell(radius_um: float, shell_width_um: float) -> NDArray[np.float64]:
@@ -565,4 +643,8 @@ NUCLEAR_CONFIG = NuclearConfig(
     normal_half_window_um=1.5,
     normal_step_um=0.05,
     ridge_min_sbr=3.0,
+    accepted_component_count=(1, 6),
+    nominal_volume_um3=(100.0, 5000.0),
+    minimum_sphericity=0.15,
+    maximum_face_contact_fraction=0.10,
 )

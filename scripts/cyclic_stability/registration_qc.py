@@ -202,7 +202,10 @@ def _summarize_measurements(
     )
     if selected.shape != measurements.displacement.shape or not selected.any():
         raise ValueError("summary mask must select at least one ZYX voxel")
-    values = lambda array: array[selected]
+
+    def values(array: NDArray[np.float64]) -> NDArray[np.float64]:
+        return array[selected]
+
     nonpositive = int(np.count_nonzero(values(measurements.jacobian) <= 0.0))
     flags = ("nonpositive-jacobian",) if nonpositive else ()
     return WarpSummary(
@@ -395,16 +398,16 @@ def _write_target_blind_overlays(
         _source_channel(moving_spec, "488_tubulin")
     )
     reference_dapi_image = backend.load_image(
-        _source_channel(reference_spec, "405_DAPI"), (0.108333, 0.108333, 0.3)
+        _source_channel(reference_spec, "405_DAPI"), (0.1083, 0.1083, 0.3)
     )
     reference_tubulin_image = backend.load_image(
-        _source_channel(reference_spec, "488_tubulin"), (0.108333, 0.108333, 0.3)
+        _source_channel(reference_spec, "488_tubulin"), (0.1083, 0.1083, 0.3)
     )
     moving_dapi_image = backend.load_image(
-        _source_channel(moving_spec, "405_DAPI"), (0.108333, 0.108333, 0.3)
+        _source_channel(moving_spec, "405_DAPI"), (0.1083, 0.1083, 0.3)
     )
     moving_tubulin_image = backend.load_image(
-        _source_channel(moving_spec, "488_tubulin"), (0.108333, 0.108333, 0.3)
+        _source_channel(moving_spec, "488_tubulin"), (0.1083, 0.1083, 0.3)
     )
     moving_dapi_affine = np.asarray(
         backend.to_array(
@@ -575,7 +578,7 @@ def analyze_registration_qc(
     ):
         raise ValueError("cell and artifact acquisition-round inventories disagree")
     resolution = theoretical_resolution(0.640, 1.4, 1.515, 4.5)
-    spacing = (0.108333, 0.108333, 0.3)
+    spacing = (0.1083, 0.1083, 0.3)
     backend = AntsRegistrationBackend(NativeThreadConfig(itk_threads=1, blas_threads=1))
     registration_rows: list[dict[str, object]] = []
     deformation_rows: list[dict[str, object]] = []

@@ -5,7 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +20,8 @@ from cyclic_stability.lysosome import (
     _fixed_lamp_roi,
     _maxima,
     _physical_log_response,
+    _rows_for_detections,
+    _with_nuclear_distances,
     analyze_lamp1_cell,
     detect_lysosomes,
     eligible_lamp_cells,
@@ -27,11 +29,12 @@ from cyclic_stability.lysosome import (
 )
 from cyclic_stability.models import CellSpec, QcDecision, RoundSpec
 from cyclic_stability.morphology import gaussian_sigma_zyx
-from cyclic_stability.nuclear import NuclearSurface
+from cyclic_stability.nuclear import consensus_nuclear_surface
 from cyclic_stability.units import ResolutionReference
 from synthetic import (
     RESOLUTION,
     SPACING,
+    ellipsoid_dapi,
     moved_lost_new_detections,
     reference_detections,
     synthetic_lamp_spots,
@@ -193,22 +196,61 @@ def test_fixed_lamp_roi_intersects_producer_support_outside_one_consensus_nucleu
     """Round-specific padding must not create an intensity-dependent ROI edge."""
     nucleus = np.zeros((7, 7, 7), dtype=bool)
     nucleus[3, 3, 3] = True
-    surface = NuclearSurface(
-        nucleus,
-        np.empty((0, 3)),
-        np.empty((0, 3), dtype=int),
-        np.empty((0, 3)),
-        np.zeros(3),
-        np.empty(0),
-        SPACING,
-    )
     padded = np.ones_like(nucleus)
     padded[:, :, 0] = False
-    roi = _fixed_lamp_roi(surface, {1: np.ones_like(nucleus), 3: padded})
+    roi = _fixed_lamp_roi(nucleus, {1: np.ones_like(nucleus), 3: padded})
     assert not roi[:, :, 0].any()
     assert not roi[3, 3, 3]
     with pytest.raises(ValueError, match="empty"):
-        _fixed_lamp_roi(surface, {2: nucleus})
+        _fixed_lamp_roi(nucleus, {2: nucleus})
+
+
+def test_lamp_union_roi_and_surface_distance_consume_every_accepted_nucleus(
+    analysis_config,
+) -> None:
+    """Using one selected nucleus would admit or mis-distance the second nucleus."""
+    spacing = (0.5, 0.5, 0.5)
+    dapi = ellipsoid_dapi(
+        ((6.0, 6.0, 6.0), (20.0, 6.0, 6.0)),
+        ((4.0, 4.0, 4.0), (4.0, 4.0, 4.0)),
+        spacing,
+        (28, 28, 56),
+    )
+    consensus = consensus_nuclear_surface(
+        {2: dapi},
+        spacing,
+        analysis_config.nuclear,
+        nominal_expansion_factor=1.0,
+    )
+    roi = _fixed_lamp_roi(
+        consensus.mask_zyx, {2: np.ones(consensus.mask_zyx.shape, dtype=bool)}
+    )
+    assert not np.any(roi & consensus.nuclei[0].mask_zyx)
+    assert not np.any(roi & consensus.nuclei[1].mask_zyx)
+
+    centroid = (24.5, 6.0, 6.0)
+    annotated = _with_nuclear_distances(_detections(centroid), consensus.nuclei)
+    expected = min(
+        float(
+            np.linalg.norm(surface.vertices_xyz_um - np.asarray(centroid), axis=1).min()
+        )
+        for surface in consensus.nuclei
+    )
+    assert annotated.objects[0].nucleus_relative_distance_um == pytest.approx(expected)
+    assert expected < float(
+        np.linalg.norm(
+            consensus.nuclei[0].vertices_xyz_um - np.asarray(centroid), axis=1
+        ).min()
+    )
+
+
+def test_lamp_rows_serialize_explicit_aggregate_nucleus_id(analysis_config) -> None:
+    """Field-level LAMP1 rows must not infer ownership by a particular nucleus."""
+    cell = analysis_config.cell("golgi", "Cell1")
+    lamp_cell = replace(cell, cohort="lamp1")
+    rows = _rows_for_detections(lamp_cell, 2, reference_detections(), analysis_config)
+    assert rows
+    assert all(asdict(row)["nucleus_id"] == "aggregate" for row in rows)
 
 
 def test_detector_is_invariant_to_arbitrary_values_outside_common_support() -> None:
@@ -289,6 +331,7 @@ def _lamp_cell_and_artifacts(
                 tmp_path / f"round-{number}.nd2",
                 tmp_path,
                 0,
+                0,
                 200.0,
                 50.0,
                 200.0,
@@ -336,7 +379,13 @@ def test_lamp_analysis_emits_round_two_and_adjacent_comparisons_for_every_ensemb
         )
         for number in (1, 3, 4, 5)
     )
-    config = replace(analysis_config, cells=(cell,), qc_decisions=decisions)
+    config = replace(
+        analysis_config,
+        cells=(cell,),
+        qc_decisions=decisions,
+        nominal_expansion_factor=1.0,
+        nuclear=replace(analysis_config.nuclear, nominal_volume_um3=(1.0, 5000.0)),
+    )
     from cyclic_stability import lysosome
 
     shape = synthetic_lamp_spots().shape
@@ -355,10 +404,27 @@ def test_lamp_analysis_emits_round_two_and_adjacent_comparisons_for_every_ensemb
         "round2-relative",
         "adjacent",
     }
+    assert all(
+        asdict(row)["nucleus_id"] == "aggregate"
+        for row in (*result.summary_rows, *result.ensemble_rows)
+    )
+    assert all(
+        row.sigma_um in config.lysosome.log_sigma_um
+        and row.threshold_sbr in config.lysosome.detection_sbr
+        and row.surface_tolerance_resolution_units is None
+        for row in result.ensemble_rows
+    )
+    assert (tmp_path / "output" / "nuclear-component-inventory.pdf").is_file()
     assert (tmp_path / "output" / "lamp1-detections.npz").is_file()
     assert (tmp_path / "output" / "lamp1-ensemble.csv").is_file()
     assert (tmp_path / "output" / "objects.csv").is_file()
     assert (tmp_path / "output" / "matches.csv").is_file()
+    with (tmp_path / "output" / "lamp1-ensemble.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        ensemble_csv = list(csv.DictReader(handle))
+    assert ensemble_csv
+    assert all(row["surface_tolerance_resolution_units"] == "" for row in ensemble_csv)
     with (tmp_path / "output" / "objects.csv").open(
         newline="", encoding="utf-8"
     ) as handle:
@@ -379,6 +445,8 @@ def test_lamp_analysis_emits_round_two_and_adjacent_comparisons_for_every_ensemb
         "moving_object_index",
         "normalized_displacement",
     }
+    assert {row["nucleus_id"] for row in objects} == {"aggregate"}
+    assert {row["nucleus_id"] for row in matches} == {"aggregate"}
     stale = tmp_path / "output" / "stale.txt"
     stale.write_text("obsolete", encoding="utf-8")
     analyze_lamp1_cell(cell, artifacts, config, tmp_path / "output")
@@ -421,7 +489,13 @@ def test_excluded_lamp_round_never_opens_its_target(
         )
         for number in (1, 3, 4, 5)
     )
-    config = replace(analysis_config, cells=(cell,), qc_decisions=decisions)
+    config = replace(
+        analysis_config,
+        cells=(cell,),
+        qc_decisions=decisions,
+        nominal_expansion_factor=1.0,
+        nuclear=replace(analysis_config.nuclear, nominal_volume_um3=(1.0, 5000.0)),
+    )
     shape = synthetic_lamp_spots().shape
     monkeypatch.setattr(
         lysosome,

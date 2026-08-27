@@ -74,6 +74,7 @@ def fake_round(tmp_path: Path) -> RoundSpec:
         nd2_path=tmp_path / "source.nd2",
         tiff_directory=tmp_path,
         z_start_offset=1,
+        producer_source_z_start_offset=0,
         target_exposure_ms=200.0,
         target_laser_percent=50.0,
         tubulin_exposure_ms=200.0,

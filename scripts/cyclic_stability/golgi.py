@@ -7,8 +7,9 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
 from cyexm.registration._request_policy import channel_transform_parameters
@@ -37,11 +38,13 @@ from cyclic_stability.morphology import (
 )
 from cyclic_stability.nuclear import (
     REFERENCE_ROUND,
+    NuclearConsensus,
     NuclearSurface,
     _accepted_rounds,
     _atomic_publish_directory,
     _surface_from_mask,
     consensus_nuclear_surface,
+    write_nuclear_component_diagnostic,
 )
 from cyclic_stability.units import theoretical_resolution
 
@@ -233,26 +236,38 @@ def multiscale_gradient_similarity(
 
 def golgi_nucleus_distances(
     mask: NDArray[np.bool_],
-    nuclear_surface: NuclearSurface,
+    nuclear_surfaces: NuclearSurface | tuple[NuclearSurface, ...],
     spacing_xyz_um: tuple[float, float, float],
 ) -> NDArray[np.float64]:
-    """Return physical XYZ distances to the nearest sampled nuclear mesh vertex.
+    """Return physical XYZ distances to the nearest accepted surface vertex.
 
     Target voxels are represented by their voxel centers.  This is a reproducible
     nearest-vertex approximation to a triangulated surface distance, not an exact
     point-to-triangle distance; spacing anisotropy is nevertheless preserved.
     """
     positive = validated_binary_mask(mask, "Golgi mask")
-    if positive.ndim != 3 or positive.shape != nuclear_surface.mask_zyx.shape:
-        raise ValueError("Golgi mask and nuclear surface must share 3D ZYX geometry")
-    if tuple(spacing_xyz_um) != tuple(nuclear_surface.spacing_xyz_um):
+    surfaces = (
+        (nuclear_surfaces,)
+        if isinstance(nuclear_surfaces, NuclearSurface)
+        else nuclear_surfaces
+    )
+    if positive.ndim != 3 or not surfaces:
+        raise ValueError("Golgi distance requires a 3D mask and accepted nuclei")
+    if any(positive.shape != surface.mask_zyx.shape for surface in surfaces):
+        raise ValueError("Golgi mask and nuclear surfaces must share 3D ZYX geometry")
+    if any(
+        tuple(spacing_xyz_um) != tuple(surface.spacing_xyz_um) for surface in surfaces
+    ):
         raise ValueError("Golgi and nuclear-surface spacing must match")
     indices_zyx = np.argwhere(positive)
     if indices_zyx.size == 0:
         return np.empty(0, dtype=np.float64)
     sx, sy, sz = spacing_xyz_um
     points_xyz = indices_zyx[:, ::-1] * np.array((sx, sy, sz))
-    return cKDTree(nuclear_surface.vertices_xyz_um).query(points_xyz, k=1)[0]
+    vertices_xyz_um = np.concatenate(
+        tuple(surface.vertices_xyz_um for surface in surfaces), axis=0
+    )
+    return cKDTree(vertices_xyz_um).query(points_xyz, k=1)[0]
 
 
 def _component_volume_gini(volumes_um3: NDArray[np.float64]) -> float:
@@ -580,17 +595,26 @@ def _ensemble_row(
     value: float,
     units: str,
     config: AnalysisConfig,
+    *,
+    surface_tolerance_resolution_units: float | None = None,
 ) -> EnsembleRow:
     return EnsembleRow(
-        "golgi",
-        "array",
-        round_number,
-        endpoint,
-        f"sigma={sigma_um:g};sbr={threshold_sbr:g}",
-        threshold_sbr,
-        value,
-        units,
-        config.config_digest,
+        cohort="golgi",
+        cell_id="array",
+        acquisition_round=round_number,
+        endpoint=endpoint,
+        ensemble_name=f"sigma={sigma_um:g};sbr={threshold_sbr:g}",
+        ensemble_value=(
+            surface_tolerance_resolution_units
+            if surface_tolerance_resolution_units is not None
+            else threshold_sbr
+        ),
+        sigma_um=sigma_um,
+        threshold_sbr=threshold_sbr,
+        surface_tolerance_resolution_units=surface_tolerance_resolution_units,
+        value=value,
+        units=units,
+        source_task_identity=config.config_digest,
     )
 
 
@@ -598,18 +622,18 @@ def _comparison_values(
     reference_mask: NDArray[np.bool_],
     moving_mask: NDArray[np.bool_],
     config: AnalysisConfig,
-) -> dict[str, float]:
+) -> tuple[tuple[str, float, float | None], ...]:
     """Return reference-round surface measures without favorable empty agreement."""
     if not np.any(reference_mask) or not np.any(moving_mask):
-        return {
-            "jaccard": math.nan,
-            "fixed_to_moving_boundary_distance_p95": math.nan,
-            "moving_to_fixed_boundary_distance_p95": math.nan,
-            **{
-                f"surface_dice_{tolerance:g}": math.nan
+        return (
+            ("jaccard", math.nan, None),
+            ("fixed_to_moving_boundary_distance_p95", math.nan, None),
+            ("moving_to_fixed_boundary_distance_p95", math.nan, None),
+            *(
+                (f"surface_dice_{tolerance:g}", math.nan, tolerance)
                 for tolerance in config.ensembles.surface_tolerance_resolution_units
-            },
-        }
+            ),
+        )
     resolution = theoretical_resolution(
         config.optics.target_wavelength_um,
         config.optics.numerical_aperture,
@@ -623,19 +647,23 @@ def _comparison_values(
         resolution,
         config.ensembles.surface_tolerance_resolution_units,
     )
-    return {
-        "jaccard": metrics.jaccard,
-        "fixed_to_moving_boundary_distance_p95": float(
-            metrics.fixed_to_moving_normalized_distance_p95
+    return (
+        ("jaccard", metrics.jaccard, None),
+        (
+            "fixed_to_moving_boundary_distance_p95",
+            float(metrics.fixed_to_moving_normalized_distance_p95),
+            None,
         ),
-        "moving_to_fixed_boundary_distance_p95": float(
-            metrics.moving_to_fixed_normalized_distance_p95
+        (
+            "moving_to_fixed_boundary_distance_p95",
+            float(metrics.moving_to_fixed_normalized_distance_p95),
+            None,
         ),
-        **{
-            f"surface_dice_{tolerance:g}": value
+        *(
+            (f"surface_dice_{tolerance:g}", value, tolerance)
             for tolerance, value in metrics.surface_dice.items()
-        },
-    }
+        ),
+    )
 
 
 def analyze_golgi_arrays(
@@ -665,10 +693,13 @@ def analyze_golgi_arrays(
         raise ValueError("registered Golgi rounds must share fixed-grid geometry")
     common_validity = _common_validity_masks(rounds, validity_masks)
     common_support = np.logical_and.reduce(tuple(common_validity.values()))
-    surface = consensus_nuclear_surface(
-        dapi_rounds, config.voxel_spacing_xyz_um, config.nuclear
+    consensus = consensus_nuclear_surface(
+        dapi_rounds,
+        config.voxel_spacing_xyz_um,
+        config.nuclear,
+        config.nominal_expansion_factor,
     )
-    roi = _perinuclear_roi(surface.mask_zyx, common_validity, config)
+    roi = _perinuclear_roi(consensus.mask_zyx, common_validity, config)
     reference = rounds[REFERENCE_ROUND]
     ensemble_by_round = {
         round_number: _support_threshold_ensemble(
@@ -735,7 +766,7 @@ def analyze_golgi_arrays(
         ):
             geometry = _mask_geometry(member.mask_zyx, config.voxel_spacing_xyz_um)
             distances = golgi_nucleus_distances(
-                member.mask_zyx, surface, config.voxel_spacing_xyz_um
+                member.mask_zyx, consensus.nuclei, config.voxel_spacing_xyz_um
             )
             background = member.background
             corrected_signal = float(
@@ -755,11 +786,14 @@ def analyze_golgi_arrays(
                 "nuclear_distance_p75_um": float(np.percentile(distances, 75.0))
                 if distances.size
                 else math.nan,
-                **_comparison_values(
-                    reference_member.mask_zyx, member.mask_zyx, config
-                ),
             }
-            for endpoint, value in values.items():
+            exact_values = [
+                (endpoint, value, None) for endpoint, value in values.items()
+            ]
+            exact_values.extend(
+                _comparison_values(reference_member.mask_zyx, member.mask_zyx, config)
+            )
+            for endpoint, value, tolerance in exact_values:
                 ensemble_rows.append(
                     _ensemble_row(
                         round_number,
@@ -769,6 +803,7 @@ def analyze_golgi_arrays(
                         value,
                         units[endpoint],
                         config,
+                        surface_tolerance_resolution_units=tolerance,
                     )
                 )
                 if math.isfinite(value):
@@ -789,7 +824,13 @@ def analyze_golgi_arrays(
                 )
             )
     return MarkerResult(
-        "golgi", "array", tuple(summary_rows), tuple(ensemble_rows), (), ()
+        "golgi",
+        "array",
+        tuple(summary_rows),
+        tuple(ensemble_rows),
+        (),
+        (),
+        tuple(MappingProxyType(asdict(row)) for row in consensus.component_qc),
     )
 
 
@@ -808,14 +849,16 @@ def _rebind_cell(result: MarkerResult, cell: CellSpec) -> MarkerResult:
         ),
         result.diagnostics,
         result.input_identities,
+        result.component_qc_rows,
     )
 
 
 def _write_diagnostics(
     output_dir: Path,
     rounds: Mapping[int, NDArray[np.float64]],
+    dapi_rounds: Mapping[int, NDArray[np.float64]],
     result: MarkerResult,
-    surface: NuclearSurface,
+    consensus: NuclearConsensus,
     roi: NDArray[np.bool_],
     threshold_masks: Mapping[int, tuple[MaskMember, ...]],
 ) -> tuple[Path, ...]:
@@ -828,10 +871,13 @@ def _write_diagnostics(
         import matplotlib.pyplot as plt
 
         staging_root = staged
+        component_diagnostic = write_nuclear_component_diagnostic(
+            staged, result.cell_id, dapi_rounds, consensus
+        )
         overlay = staged / "golgi-registered-overlays.npz"
         np.savez_compressed(
             overlay,
-            consensus_nuclear_mask_zyx=surface.mask_zyx,
+            consensus_nuclear_mask_zyx=consensus.mask_zyx,
             fixed_perinuclear_roi_zyx=roi,
             **{f"round_{number}_target_zyx": image for number, image in rounds.items()},
             **{
@@ -853,7 +899,7 @@ def _write_diagnostics(
         )
         reference = rounds[REFERENCE_ROUND].max(axis=0)
         roi_mip = roi.max(axis=0)
-        nucleus_mip = surface.mask_zyx.max(axis=0)
+        nucleus_mip = consensus.mask_zyx.max(axis=0)
         figure_paths: list[Path] = []
         union_masks = {
             number: np.logical_or.reduce([member.mask_zyx for member in members])
@@ -889,7 +935,7 @@ def _write_diagnostics(
             figure.savefig(path, dpi=200)
             plt.close(figure)
             figure_paths.append(path)
-        staged_paths = (overlay, curves, *figure_paths)
+        staged_paths = (component_diagnostic, overlay, curves, *figure_paths)
 
     _atomic_publish_directory(output_dir, populate)
     assert staging_root is not None
@@ -928,10 +974,13 @@ def analyze_golgi_cell(
     result = _rebind_cell(
         analyze_golgi_arrays(golgi, dapi, config, validity_masks=common_validity), cell
     )
-    surface = consensus_nuclear_surface(
-        dapi, config.voxel_spacing_xyz_um, config.nuclear
+    consensus = consensus_nuclear_surface(
+        dapi,
+        config.voxel_spacing_xyz_um,
+        config.nuclear,
+        config.nominal_expansion_factor,
     )
-    roi = _perinuclear_roi(surface.mask_zyx, common_validity, config)
+    roi = _perinuclear_roi(consensus.mask_zyx, common_validity, config)
     threshold_masks = {
         round_number: _support_threshold_ensemble(
             image,
@@ -942,7 +991,7 @@ def analyze_golgi_cell(
         for round_number, image in golgi.items()
     }
     diagnostics = _write_diagnostics(
-        output_dir, golgi, result, surface, roi, threshold_masks
+        output_dir, golgi, dapi, result, consensus, roi, threshold_masks
     )
     return replace(
         result,

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from os import PathLike
 from pathlib import Path
+from typing import BinaryIO
 
 import numpy as np
 import tifffile
@@ -34,17 +36,21 @@ def _validated_volume(image: NDArray[np.generic]) -> NDArray[np.generic]:
     return image
 
 
-def load_volume(path: Path) -> NDArray[np.generic]:
+def load_volume(source: Path | str | PathLike[str] | BinaryIO) -> NDArray[np.generic]:
     """Load one finite ZYX TIFF volume without permitting source mutation.
 
-    Memory mapping is used when TIFF layout permits it; compressed or otherwise
-    non-mappable TIFFs are read normally.  Both paths return a non-writeable
-    array and reject non-3D or non-finite data at the analysis boundary.
+    Path inputs use memory mapping when TIFF layout permits it; compressed files
+    and already-open binary handles are read normally. Every path returns a
+    non-writeable array and rejects non-3D or non-finite data at the analysis
+    boundary.
     """
-    try:
-        image = tifffile.memmap(path, mode="r")
-    except (OSError, TypeError, ValueError, tifffile.TiffFileError):
-        image = tifffile.imread(path)
+    if isinstance(source, str | PathLike):
+        try:
+            image = tifffile.memmap(source, mode="r")
+        except (OSError, TypeError, ValueError, tifffile.TiffFileError):
+            image = tifffile.imread(source)
+    else:
+        image = tifffile.imread(source)
     result = _validated_volume(np.asarray(image))
     result.setflags(write=False)
     return result

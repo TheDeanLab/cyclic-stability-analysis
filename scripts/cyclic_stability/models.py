@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -35,6 +36,10 @@ class NuclearConfig:
     normal_half_window_um: float
     normal_step_um: float
     ridge_min_sbr: float
+    accepted_component_count: tuple[int, int]
+    nominal_volume_um3: tuple[float, float]
+    minimum_sphericity: float
+    maximum_face_contact_fraction: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +69,7 @@ class RoundSpec:
     nd2_path: Path
     tiff_directory: Path
     z_start_offset: int
+    producer_source_z_start_offset: int | None
     target_exposure_ms: float
     target_laser_percent: float
     tubulin_exposure_ms: float
@@ -124,6 +130,7 @@ class MetricRow:
     comparison_set: str
     qc_included: bool
     source_task_identity: str
+    nucleus_id: str = "aggregate"
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +143,13 @@ class EnsembleRow:
     endpoint: str
     ensemble_name: str
     ensemble_value: float
-    value: float
+    sigma_um: float
+    threshold_sbr: float
+    surface_tolerance_resolution_units: float | None
+    value: float | str
     units: str
     source_task_identity: str
+    nucleus_id: str = "aggregate"
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +162,7 @@ class MarkerResult:
     ensemble_rows: tuple[EnsembleRow, ...]
     diagnostics: tuple[Path, ...]
     input_identities: tuple[str, ...]
+    component_qc_rows: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import inspect
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -9,15 +11,21 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from skimage.measure import mesh_surface_area
 from cyclic_stability import nuclear
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
+from cyclic_stability.morphology import threshold_ensemble
 from cyclic_stability.models import (
     AnalysisConfig,
     CellSpec,
+    EnsembleRow,
+    NuclearConfig,
     QcDecision,
 )
 from cyclic_stability.nuclear import (
     LaminProfileRow,
+    _aggregate_ensemble_rows,
+    _geometry,
     _metric_rows,
     _ridge,
     _surface_from_mask,
@@ -29,17 +37,266 @@ from cyclic_stability.nuclear import (
 from synthetic import (
     NUCLEAR_CONFIG,
     SPACING,
+    ellipsoid_dapi,
+    separated_nuclei,
     synthetic_backgrounds,
     synthetic_nucleus,
     synthetic_shell,
 )
 
 
+@pytest.mark.parametrize("count", range(1, 7))
+def test_consensus_accepts_one_through_six_nuclei(count: int) -> None:
+    """Discarding all but the largest component loses valid nuclei in one field."""
+    dapi = separated_nuclei(count, SPACING)
+    result = consensus_nuclear_surface(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=4.5
+    )
+    assert [item.nucleus_id for item in result.nuclei] == [
+        f"N{index:03d}" for index in range(1, count + 1)
+    ]
+    assert [item.nucleus_id for item in result.component_qc if item.accepted] == [
+        f"N{index:03d}" for index in range(1, count + 1)
+    ]
+    assert set(np.unique(result.labels_zyx)) == set(range(count + 1))
+    assert np.array_equal(result.mask_zyx, result.labels_zyx > 0)
+    centroids = [tuple(item.centroid_xyz_um) for item in result.nuclei]
+    assert centroids == sorted(centroids)
+
+
+def test_consensus_rejects_zero_valid_nuclear_components() -> None:
+    """A field containing only subminimum debris must fail closed as count zero."""
+    dapi = ellipsoid_dapi(
+        ((5.0, 5.0, 5.0),), ((2.0, 2.0, 2.0),), (0.5, 0.5, 0.5), (24, 24, 24)
+    )
+    with pytest.raises(ValueError, match="accepted nuclear component count 0"):
+        consensus_nuclear_surface(
+            {2: dapi}, (0.5, 0.5, 0.5), NUCLEAR_CONFIG, nominal_expansion_factor=1.0
+        )
+
+
+def test_consensus_rejects_seven_valid_nuclear_components() -> None:
+    """A field with seven plausible nuclei must not silently select six."""
+    dapi = separated_nuclei(7, SPACING)
+    with pytest.raises(ValueError, match="accepted nuclear component count 7"):
+        consensus_nuclear_surface(
+            {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=4.5
+        )
+
+
+def test_component_adjudication_survives_strict_surface_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving normal realization back into adjudication would hide valid QC."""
+    dapi = separated_nuclei(1, SPACING)
+
+    def fail_normals(*_args):
+        raise ValueError("synthetic strict-normal failure")
+
+    monkeypatch.setattr(nuclear, "_surface_normals_and_curvature", fail_normals)
+    adjudication = nuclear.adjudicate_nuclear_components(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=4.5
+    )
+
+    assert len(adjudication.component_qc) == 1
+    assert adjudication.component_qc[0].accepted is True
+    assert adjudication.component_qc[0].nucleus_id == "N001"
+    with pytest.raises(ValueError, match="synthetic strict-normal failure"):
+        nuclear.realize_nuclear_surfaces(adjudication, NUCLEAR_CONFIG)
+    with pytest.raises(ValueError, match="synthetic strict-normal failure"):
+        consensus_nuclear_surface(
+            {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=4.5
+        )
+
+
+def test_component_diagnostic_renderer_contract_is_target_blind() -> None:
+    """A target argument would permit cohort signal to contaminate nuclear QC."""
+    assert tuple(
+        inspect.signature(nuclear.write_nuclear_component_diagnostic).parameters
+    ) == ("output_dir", "cell_id", "dapi_rounds", "consensus")
+
+
+def test_component_adjudication_freezes_retained_geometry() -> None:
+    """Mutable retained arrays could silently change inventory-to-surface evidence."""
+    dapi = separated_nuclei(1, SPACING)
+    adjudication = nuclear.adjudicate_nuclear_components(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=4.5
+    )
+    geometry = adjudication._candidates[0].accepted_geometry
+    assert geometry is not None
+
+    for array in (geometry.mask_zyx, geometry.vertices_xyz_um, geometry.faces):
+        assert array.flags.writeable is False
+        with pytest.raises(ValueError, match="read-only"):
+            array.flat[0] = array.flat[0]
+
+    realized = nuclear.realize_nuclear_surfaces(adjudication, NUCLEAR_CONFIG)
+    direct = consensus_nuclear_surface(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=4.5
+    )
+    assert np.array_equal(realized.labels_zyx, direct.labels_zyx)
+    assert np.array_equal(
+        realized.nuclei[0].vertices_xyz_um, direct.nuclei[0].vertices_xyz_um
+    )
+    assert np.array_equal(realized.nuclei[0].faces, direct.nuclei[0].faces)
+
+
+@pytest.mark.parametrize(
+    ("centers", "radii", "shape", "config", "reason"),
+    (
+        (
+            ((6.0, 6.0, 6.0), (15.0, 6.0, 6.0)),
+            ((4.0, 4.0, 4.0), (2.0, 2.0, 2.0)),
+            (28, 48, 48),
+            NUCLEAR_CONFIG,
+            "volume-below-minimum",
+        ),
+        (
+            ((7.0, 7.0, 7.0), (24.0, 7.0, 7.0)),
+            ((4.0, 4.0, 4.0), (6.0, 6.0, 6.0)),
+            (32, 48, 64),
+            replace(NUCLEAR_CONFIG, nominal_volume_um3=(100.0, 500.0)),
+            "volume-above-maximum",
+        ),
+        (
+            ((7.0, 7.0, 25.0), (22.0, 7.0, 7.0)),
+            ((1.5, 1.5, 20.0), (4.0, 4.0, 4.0)),
+            (100, 48, 56),
+            replace(
+                NUCLEAR_CONFIG,
+                nominal_volume_um3=(100.0, 500.0),
+                minimum_sphericity=0.75,
+            ),
+            "sphericity-below-minimum",
+        ),
+        (
+            ((1.0, 7.0, 7.0), (20.0, 15.0, 10.0)),
+            ((4.0, 4.0, 4.0), (4.0, 4.0, 4.0)),
+            (50, 80, 80),
+            replace(
+                NUCLEAR_CONFIG,
+                nominal_volume_um3=(10.0, 1000.0),
+                minimum_sphericity=0.10,
+                maximum_face_contact_fraction=0.02,
+            ),
+            "face-contact-above-maximum",
+        ),
+    ),
+)
+def test_component_qc_records_exact_rejection_reason(
+    centers: tuple[tuple[float, float, float], ...],
+    radii: tuple[tuple[float, float, float], ...],
+    shape: tuple[int, int, int],
+    config: NuclearConfig,
+    reason: str,
+) -> None:
+    """Rejected DAPI candidates remain auditable beside a valid nucleus."""
+    spacing = (0.5, 0.5, 0.5)
+    dapi = ellipsoid_dapi(centers, radii, spacing, shape)
+    result = consensus_nuclear_surface(
+        {2: dapi}, spacing, config, nominal_expansion_factor=1.0
+    )
+    rejected = [item for item in result.component_qc if not item.accepted]
+    assert len(result.nuclei) == 1
+    assert len(rejected) == 1
+    assert rejected[0].rejection_reasons == (reason,)
+    diagnostic = next(
+        item
+        for item in result.component_diagnostics
+        if item.nucleus_id == rejected[0].nucleus_id
+    )
+    assert diagnostic.accepted is False
+    assert diagnostic.rejection_reasons == (reason,)
+    assert diagnostic.diagnostic_only is True
+    assert {projection.plane for projection in diagnostic.projections} == {
+        "XY",
+        "XZ",
+        "YZ",
+    }
+    assert all(
+        0 < projection.retained_point_count <= 2048
+        and projection.retained_point_count <= projection.source_point_count
+        for projection in diagnostic.projections
+    )
+    assert all(
+        not outline.flags.writeable
+        for projection in diagnostic.projections
+        for outline in projection.outlines_ab_um
+    )
+
+
+def test_component_qc_collects_every_applicable_rejection_reason() -> None:
+    """Stopping after one failed bound would hide additional DAPI QC evidence."""
+    spacing = (0.5, 0.5, 0.5)
+    dapi = ellipsoid_dapi(
+        ((0.5, 5.0, 10.0), (20.0, 15.0, 10.0)),
+        ((1.0, 1.0, 8.0), (4.0, 4.0, 4.0)),
+        spacing,
+        (50, 80, 80),
+    )
+    config = replace(
+        NUCLEAR_CONFIG,
+        nominal_volume_um3=(100.0, 1000.0),
+        minimum_sphericity=0.75,
+        maximum_face_contact_fraction=0.01,
+    )
+    result = consensus_nuclear_surface(
+        {2: dapi}, spacing, config, nominal_expansion_factor=1.0
+    )
+    rejected = [item for item in result.component_qc if not item.accepted]
+    assert len(result.nuclei) == 1
+    assert len(rejected) == 1
+    assert rejected[0].rejection_reasons == (
+        "volume-below-minimum",
+        "sphericity-below-minimum",
+        "face-contact-above-maximum",
+    )
+
+
+def test_component_qc_uses_exact_expansion_volume_conversion() -> None:
+    """Using a linear or area expansion correction misclassifies nuclear volume."""
+    spacing = (0.5, 0.5, 0.5)
+    dapi = ellipsoid_dapi(((6.0, 6.0, 6.0),), ((4.0, 4.0, 4.0),), spacing, (28, 28, 28))
+    config = replace(NUCLEAR_CONFIG, nominal_volume_um3=(1.0, 10.0))
+    result = consensus_nuclear_surface(
+        {2: dapi}, spacing, config, nominal_expansion_factor=4.5
+    )
+    qc = result.component_qc[0]
+    assert qc.nominal_volume_um3 == pytest.approx(qc.expanded_volume_um3 / 4.5**3)
+
+
+def test_multinuclear_consensus_arrays_are_read_only() -> None:
+    """Mutating accepted labels or one surface would invalidate component QC."""
+    result = consensus_nuclear_surface(
+        {2: separated_nuclei(1, SPACING)},
+        SPACING,
+        NUCLEAR_CONFIG,
+        nominal_expansion_factor=4.5,
+    )
+    surface = result.nuclei[0]
+    assert result.mask_zyx.flags.writeable is False
+    assert result.labels_zyx.dtype == np.uint16
+    assert result.labels_zyx.flags.writeable is False
+    assert all(
+        array.flags.writeable is False
+        for array in (
+            surface.mask_zyx,
+            surface.vertices_xyz_um,
+            surface.faces,
+            surface.normals_xyz,
+            surface.centroid_xyz_um,
+            surface.mean_curvature_um_inverse,
+        )
+    )
+
+
 def test_lamin_profiles_recover_known_outward_displacement() -> None:
     """Flipping the outward normal would turn a known positive shell shift negative."""
     dapi, reference_lamin = synthetic_nucleus(radius_um=5.0, shell_width_um=0.4)
     moved_lamin = synthetic_shell(radius_um=5.6, shell_width_um=0.4)
-    surface = consensus_nuclear_surface({2: dapi, 3: dapi}, SPACING, NUCLEAR_CONFIG)
+    surface = consensus_nuclear_surface(
+        {2: dapi, 3: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=1.0
+    ).nuclei[0]
     rows = lamin_normal_profiles(
         surface,
         {2: reference_lamin, 3: moved_lamin},
@@ -58,7 +315,9 @@ def test_lamin_profiles_recover_known_outward_displacement() -> None:
 def test_missing_lamin_peak_is_missing_not_zero_displacement() -> None:
     """Replacing missing ridges with zero would invent stability evidence."""
     dapi, reference_lamin = synthetic_nucleus(radius_um=5.0, shell_width_um=0.4)
-    surface = consensus_nuclear_surface({2: dapi, 4: dapi}, SPACING, NUCLEAR_CONFIG)
+    surface = consensus_nuclear_surface(
+        {2: dapi, 4: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=1.0
+    ).nuclei[0]
     rows = lamin_normal_profiles(
         surface,
         {2: reference_lamin, 4: np.zeros_like(reference_lamin)},
@@ -75,7 +334,9 @@ def test_acquisition_round_two_is_reference_not_mapping_order() -> None:
     """Using insertion order as reference changes the scientific comparison silently."""
     dapi, reference_lamin = synthetic_nucleus(radius_um=5.0, shell_width_um=0.4)
     moved_lamin = synthetic_shell(radius_um=5.4, shell_width_um=0.4)
-    surface = consensus_nuclear_surface({3: dapi, 2: dapi}, SPACING, NUCLEAR_CONFIG)
+    surface = consensus_nuclear_surface(
+        {3: dapi, 2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=1.0
+    ).nuclei[0]
     rows = lamin_normal_profiles(
         surface,
         {3: moved_lamin, 2: reference_lamin},
@@ -93,7 +354,9 @@ def test_acquisition_round_two_is_reference_not_mapping_order() -> None:
 def test_normals_are_physical_xyz_and_point_away_from_centroid() -> None:
     """Treating anisotropic ZYX indices as XYZ produces inward or distorted normals."""
     dapi, _ = synthetic_nucleus(radius_um=5.0, shell_width_um=0.4)
-    surface = consensus_nuclear_surface({2: dapi}, SPACING, NUCLEAR_CONFIG)
+    surface = consensus_nuclear_surface(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=1.0
+    ).nuclei[0]
     outward = surface.vertices_xyz_um - surface.centroid_xyz_um
     assert np.all(np.sum(outward * surface.normals_xyz, axis=1) > 0.0)
     assert np.allclose(np.linalg.norm(surface.normals_xyz, axis=1), 1.0)
@@ -131,7 +394,9 @@ def test_consensus_keeps_surface_for_permitted_small_face_contact() -> None:
     )
     dapi = 1.0 + 0.05 * np.sin(x * SPACING[0]) * np.cos(y * SPACING[1])
     dapi += 40.0 * (radius <= 5.0)
-    surface = consensus_nuclear_surface({2: dapi}, SPACING, NUCLEAR_CONFIG)
+    surface = consensus_nuclear_surface(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=1.0
+    ).nuclei[0]
     assert surface.vertices_xyz_um[:, 0].min() < 0.05
 
 
@@ -142,13 +407,17 @@ def test_consensus_rejects_face_touching_nucleus() -> None:
     shifted = 1.0 + 0.05 * np.sin(x * SPACING[0]) * np.cos(y * SPACING[1])
     shifted[:, :, :78] = dapi[:, :, 50:]
     with pytest.raises(ValueError, match="face"):
-        consensus_nuclear_surface({2: shifted}, SPACING, NUCLEAR_CONFIG)
+        consensus_nuclear_surface(
+            {2: shifted}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=1.0
+        )
 
 
 def test_profiles_reject_missing_acquisition_round_two() -> None:
     """A displacement has no scientific origin when round 2 is unavailable."""
     dapi, lamin = synthetic_nucleus(radius_um=5.0, shell_width_um=0.4)
-    surface = consensus_nuclear_surface({2: dapi}, SPACING, NUCLEAR_CONFIG)
+    surface = consensus_nuclear_surface(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=1.0
+    ).nuclei[0]
     with pytest.raises(ValueError, match="round 2"):
         lamin_normal_profiles(
             surface,
@@ -161,7 +430,9 @@ def test_profiles_reject_missing_acquisition_round_two() -> None:
 def test_continuity_is_edge_connected_and_coverage_is_not_imputed() -> None:
     """Disconnected supported regions cannot be reported as a continuous envelope."""
     dapi, lamin = synthetic_nucleus(radius_um=5.0, shell_width_um=0.4)
-    surface = consensus_nuclear_surface({2: dapi}, SPACING, NUCLEAR_CONFIG)
+    surface = consensus_nuclear_surface(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=1.0
+    ).nuclei[0]
     half_shell = lamin.copy()
     half_shell[:, :, :64] = 1.0
     rows = lamin_normal_profiles(
@@ -234,6 +505,460 @@ def test_metric_rows_mark_round_one_as_exposure_sensitivity(
     }
 
 
+def test_per_nucleus_lamin_profiles_and_metrics_isolate_local_ridges(
+    analysis_config: AnalysisConfig, tmp_path: Path
+) -> None:
+    """Pooling vertices or threshold masks would mix two known local offsets."""
+    spacing = (0.3, 0.3, 0.3)
+    shape = (56, 72, 128)
+    centers = ((11.0, 10.5, 8.1), (27.0, 10.5, 8.1))
+    z, y, x = np.indices(shape, dtype=np.float64)
+    physical_x = x * spacing[0]
+    physical_y = y * spacing[1]
+    physical_z = z * spacing[2]
+    background = 1.0 + 0.05 * np.sin(physical_x) * np.cos(physical_y)
+    dapi = background.copy()
+    reference_lamin = background.copy()
+    moved_lamin = background.copy()
+    for center, moved_radius in zip(centers, (5.3, 5.8), strict=True):
+        radius = np.sqrt(
+            (physical_x - center[0]) ** 2
+            + (physical_y - center[1]) ** 2
+            + (physical_z - center[2]) ** 2
+        )
+        dapi += 40.0 * (radius <= 5.0)
+        reference_lamin += 20.0 * np.exp(-0.5 * ((radius - 5.0) / (0.4 / 2.355)) ** 2)
+        moved_lamin += 20.0 * np.exp(
+            -0.5 * ((radius - moved_radius) / (0.4 / 2.355)) ** 2
+        )
+
+    source_rounds = analysis_config.cells[0].rounds
+    cell = CellSpec(
+        cohort="lamin",
+        cell_id="TwoNucleusField",
+        rounds=tuple(
+            replace(source_rounds[index], cohort="lamin", cell_id="TwoNucleusField")
+            for index in (1, 2)
+        ),
+    )
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=spacing,
+        nominal_expansion_factor=1.0,
+        cells=(cell,),
+        qc_decisions=(
+            QcDecision(
+                cohort="lamin",
+                cell_id=cell.cell_id,
+                acquisition_round=3,
+                decision="accept",
+                reasons=("synthetic-target-blind-acceptance",),
+                reviewer="Synthetic reviewer",
+                reviewed_at="2026-08-26T00:00:00Z",
+            ),
+        ),
+    )
+    artifacts = (
+        _write_round_artifacts(tmp_path, 2, dapi, reference_lamin),
+        _write_round_artifacts(tmp_path, 3, dapi, moved_lamin),
+    )
+
+    result = analyze_lamin_cell(cell, artifacts, config, tmp_path / "out")
+
+    expected_displacements = {"N001": 0.3, "N002": 0.8}
+    for nucleus_id, expected in expected_displacements.items():
+        profile_path = tmp_path / "out" / nucleus_id / "lamin-normal-profiles.csv"
+        with profile_path.open(newline="", encoding="utf-8") as handle:
+            profiles = tuple(csv.DictReader(handle))
+        assert profiles
+        assert {row["nucleus_id"] for row in profiles} == {nucleus_id}
+        measured = [
+            float(row["displacement_um"])
+            for row in profiles
+            if row["acquisition_round"] == "3" and row["supported"] == "True"
+        ]
+        assert np.median(measured) == pytest.approx(expected, abs=0.12)
+
+    displacement_rows = {
+        row.nucleus_id: row.value
+        for row in result.summary_rows
+        if row.acquisition_round == 3
+        and row.endpoint == "lamin_signed_displacement_median"
+    }
+    assert displacement_rows == {
+        "N001": pytest.approx(0.3, abs=0.12),
+        "N002": pytest.approx(0.8, abs=0.12),
+        "aggregate": pytest.approx(0.55, abs=0.12),
+    }
+    assert {row.nucleus_id for row in result.summary_rows} == {
+        "N001",
+        "N002",
+        "aggregate",
+    }
+    assert {row.nucleus_id for row in result.ensemble_rows} == {
+        "N001",
+        "N002",
+        "aggregate",
+    }
+    assert all(
+        row.sigma_um in config.ensembles.gaussian_sigma_um
+        and row.threshold_sbr in config.ensembles.threshold_sbr
+        and (
+            row.surface_tolerance_resolution_units
+            in config.ensembles.surface_tolerance_resolution_units
+        )
+        == (row.endpoint == "lamin_surface_dice")
+        for row in result.ensemble_rows
+    )
+    assert (tmp_path / "out" / "nuclear-component-inventory.pdf").is_file()
+    volume_rows = {
+        row.nucleus_id: row.value
+        for row in result.ensemble_rows
+        if row.acquisition_round == 3
+        and row.endpoint == "lamin_mask_volume"
+        and row.ensemble_name == "sigma=0.279;sbr=3"
+    }
+    assert float(volume_rows["N002"]) != pytest.approx(float(volume_rows["N001"]))
+    assert volume_rows["aggregate"] == pytest.approx(
+        np.median((float(volume_rows["N001"]), float(volume_rows["N002"])))
+    )
+
+
+def test_streamed_lamin_members_exactly_match_full_grid_ensemble() -> None:
+    """Bounded streaming must preserve every old full-grid threshold voxel."""
+    rng = np.random.default_rng(48)
+    image = rng.normal(5.0, 1.0, size=(17, 23, 29))
+    z, y, x = np.indices(image.shape)
+    roi = ((z - 8) / 5) ** 2 + ((y - 11) / 7) ** 2 + ((x - 14) / 8) ** 2 <= 1
+    spacing = (0.2, 0.2, 0.5)
+    sigmas = (0.19, 0.31, 0.47)
+    thresholds = (2.5, 3.0, 3.5)
+    legacy = threshold_ensemble(image, roi, sigmas, thresholds, spacing)
+    bounded_roi = nuclear._bounded_nuclear_roi("N001", roi, spacing)
+
+    streamed = nuclear._build_lamin_reference_masks(
+        image,
+        (bounded_roi,),
+        sigmas,
+        thresholds,
+        spacing,
+        nuclear.robust_background(image),
+    )
+
+    assert len(legacy) == len(streamed.members) == 9
+    for old in legacy:
+        current = streamed.members[("N001", old.sigma_um, old.threshold_sbr)]
+        expanded = np.zeros(image.shape, dtype=bool)
+        expanded[current.region_zyx] = current.mask_zyx
+        assert np.array_equal(expanded, old.mask_zyx)
+        assert current.origin_xyz_um == pytest.approx(
+            tuple(
+                int(region.start) * step
+                for region, step in zip(
+                    current.region_zyx,
+                    spacing[::-1],
+                    strict=True,
+                )
+            )[::-1]
+        )
+
+
+def test_streamed_lamin_smooths_once_per_round_and_sigma(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nuclei and thresholds must reuse one full-grid convolution per sigma."""
+    image = np.arange(17 * 23 * 29, dtype=float).reshape((17, 23, 29))
+    first = np.zeros(image.shape, dtype=bool)
+    first[2:8, 3:10, 4:12] = True
+    second = np.zeros(image.shape, dtype=bool)
+    second[9:15, 12:20, 16:25] = True
+    spacing = (0.2, 0.2, 0.5)
+    sigmas = (0.19, 0.31, 0.47)
+    calls: list[tuple[float, ...]] = []
+    real_gaussian_filter = nuclear.gaussian_filter
+
+    def count_gaussian_filter(source, *, sigma):
+        calls.append(tuple(float(value) for value in sigma))
+        return real_gaussian_filter(source, sigma=sigma)
+
+    monkeypatch.setattr(nuclear, "gaussian_filter", count_gaussian_filter)
+    streamed = nuclear._build_lamin_reference_masks(
+        image,
+        (
+            nuclear._bounded_nuclear_roi("N001", first, spacing),
+            nuclear._bounded_nuclear_roi("N002", second, spacing),
+        ),
+        sigmas,
+        (2.5, 3.0, 3.5),
+        spacing,
+        nuclear.robust_background(image),
+    )
+
+    assert len(streamed.members) == 2 * 3 * 3
+    assert calls == [nuclear.gaussian_sigma_zyx(sigma, spacing) for sigma in sigmas]
+
+
+def test_lamin_reference_storage_scales_with_bounded_rois_not_full_grid() -> None:
+    """Production geometry metadata must not allocate legacy full-grid ensembles."""
+    full_shape = (320, 2048, 2048)
+    roi_shape = (72, 192, 192)
+    member_count = 9
+    nucleus_count = 6
+    round_count = 5
+    members = {}
+    for nucleus_index in range(nucleus_count):
+        nucleus_id = f"N{nucleus_index + 1:03d}"
+        region = (
+            slice(20, 20 + roi_shape[0]),
+            slice(100 + nucleus_index * 250, 100 + nucleus_index * 250 + roi_shape[1]),
+            slice(200, 200 + roi_shape[2]),
+        )
+        for member_index in range(member_count):
+            mask = np.zeros(roi_shape, dtype=bool)
+            mask.setflags(write=False)
+            members[(nucleus_id, float(member_index), 3.0)] = nuclear._BoundedLaminMask(
+                nucleus_id,
+                region,
+                (40.0, float(region[1].start) * 0.2, 10.0),
+                mask,
+                float(member_index),
+                3.0,
+            )
+    store = nuclear._LaminReferenceMasks(full_shape, members)
+
+    expected = nucleus_count * member_count * int(np.prod(roi_shape))
+    legacy = int(np.prod(full_shape)) * nucleus_count * round_count * member_count
+    assert store.retained_mask_voxels == expected
+    assert store.retained_mask_voxels < legacy // 100
+    assert all(item.mask_zyx.shape == roi_shape for item in store.members.values())
+
+
+def test_aggregate_collision_uses_exact_sigma_not_display_name() -> None:
+    """Rounded display labels must not merge distinct Gaussian scales."""
+    sigma_a = 0.12345671
+    sigma_b = 0.12345672
+    sbr = 3.0
+    name_a = f"sigma={sigma_a:g};sbr={sbr:g}"
+    name_b = f"sigma={sigma_b:g};sbr={sbr:g}"
+    assert name_a == name_b
+    rows = (
+        EnsembleRow(
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_mask_volume",
+            ensemble_name=name_a,
+            ensemble_value=sbr,
+            sigma_um=sigma_a,
+            threshold_sbr=sbr,
+            surface_tolerance_resolution_units=None,
+            value=1.0,
+            units="um3",
+            source_task_identity="digest",
+            nucleus_id="N001",
+        ),
+        EnsembleRow(
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_mask_volume",
+            ensemble_name=name_a,
+            ensemble_value=sbr,
+            sigma_um=sigma_a,
+            threshold_sbr=sbr,
+            surface_tolerance_resolution_units=None,
+            value=3.0,
+            units="um3",
+            source_task_identity="digest",
+            nucleus_id="N002",
+        ),
+        EnsembleRow(
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_mask_volume",
+            ensemble_name=name_b,
+            ensemble_value=sbr,
+            sigma_um=sigma_b,
+            threshold_sbr=sbr,
+            surface_tolerance_resolution_units=None,
+            value=10.0,
+            units="um3",
+            source_task_identity="digest",
+            nucleus_id="N001",
+        ),
+        EnsembleRow(
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_mask_volume",
+            ensemble_name=name_b,
+            ensemble_value=sbr,
+            sigma_um=sigma_b,
+            threshold_sbr=sbr,
+            surface_tolerance_resolution_units=None,
+            value=14.0,
+            units="um3",
+            source_task_identity="digest",
+            nucleus_id="N002",
+        ),
+    )
+
+    aggregated = _aggregate_ensemble_rows(rows)
+
+    assert [row.value for row in aggregated] == [2.0, 12.0]
+    assert [row.ensemble_name for row in aggregated] == [name_a, name_b]
+    assert [row.ensemble_value for row in aggregated] == [sbr, sbr]
+    assert [row.sigma_um for row in aggregated] == [sigma_a, sigma_b]
+
+
+def test_surface_dice_aggregate_collision_uses_exact_sbr_and_tolerance() -> None:
+    """Surface Dice retains tolerance publicly but groups on its exact SBR too."""
+    sigma = 0.25
+    sbr_a = 3.1234561
+    sbr_b = 3.1234562
+    tolerance = 0.5
+    name_a = f"sigma={sigma:g};sbr={sbr_a:g}"
+    name_b = f"sigma={sigma:g};sbr={sbr_b:g}"
+    assert name_a == name_b
+    rows = (
+        EnsembleRow(
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_surface_dice",
+            ensemble_name=name_a,
+            ensemble_value=tolerance,
+            sigma_um=sigma,
+            threshold_sbr=sbr_a,
+            surface_tolerance_resolution_units=tolerance,
+            value=0.1,
+            units="fraction",
+            source_task_identity="digest",
+            nucleus_id="N001",
+        ),
+        EnsembleRow(
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_surface_dice",
+            ensemble_name=name_a,
+            ensemble_value=tolerance,
+            sigma_um=sigma,
+            threshold_sbr=sbr_a,
+            surface_tolerance_resolution_units=tolerance,
+            value=0.3,
+            units="fraction",
+            source_task_identity="digest",
+            nucleus_id="N002",
+        ),
+        EnsembleRow(
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_surface_dice",
+            ensemble_name=name_b,
+            ensemble_value=tolerance,
+            sigma_um=sigma,
+            threshold_sbr=sbr_b,
+            surface_tolerance_resolution_units=tolerance,
+            value=0.6,
+            units="fraction",
+            source_task_identity="digest",
+            nucleus_id="N001",
+        ),
+        EnsembleRow(
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_surface_dice",
+            ensemble_name=name_b,
+            ensemble_value=tolerance,
+            sigma_um=sigma,
+            threshold_sbr=sbr_b,
+            surface_tolerance_resolution_units=tolerance,
+            value=1.0,
+            units="fraction",
+            source_task_identity="digest",
+            nucleus_id="N002",
+        ),
+    )
+
+    aggregated = _aggregate_ensemble_rows(rows)
+
+    assert [row.value for row in aggregated] == [0.2, 0.8]
+    assert [row.ensemble_name for row in aggregated] == [name_a, name_b]
+    assert [row.ensemble_value for row in aggregated] == [tolerance, tolerance]
+    assert [row.threshold_sbr for row in aggregated] == [sbr_a, sbr_b]
+
+
+def _fragmented_envelope(isolated_count: int) -> np.ndarray:
+    """Return one valid envelope plus separated single-voxel components."""
+    z, y, x = np.indices((32, 32, 32))
+    mask = (z - 16) ** 2 + (y - 16) ** 2 + (x - 16) ** 2 <= 6**2
+    isolated = (
+        (1, 1, 1),
+        (1, 1, 3),
+        (1, 1, 5),
+        (1, 1, 7),
+        (1, 3, 1),
+        (1, 3, 3),
+        (1, 3, 5),
+        (1, 3, 7),
+    )
+    for index in isolated[:isolated_count]:
+        mask[index] = True
+    return mask
+
+
+def test_fragmented_lamin_mask_preserves_geometry_without_curvature_abort() -> None:
+    """Degenerate curvature vertices must not alter the measured threshold mask."""
+    spacing = (1.0, 1.0, 1.0)
+    mask = _fragmented_envelope(8)
+    original = mask.copy()
+    vertices, faces = _surface_from_mask(mask, spacing)
+    expected_volume = float(mask.sum())
+    expected_area = float(mesh_surface_area(vertices, faces))
+
+    geometry = _geometry(mask, spacing)
+
+    assert np.array_equal(mask, original)
+    assert geometry["volume_um3"] == expected_volume
+    assert geometry["area_to_volume_um_inverse"] == pytest.approx(
+        expected_area / expected_volume
+    )
+    assert geometry["geometry_status"] in {
+        "partial-curvature",
+        "invalid-curvature",
+    }
+    assert 0.0 < geometry["valid_curvature_vertex_fraction"] < 1.0
+
+
+def test_curvature_coverage_uses_exact_ninety_nine_percent_rule() -> None:
+    """Curvature is reportable at 99% valid vertices and missing below it."""
+    at_least_ninety_nine = _geometry(_fragmented_envelope(4), (1.0, 1.0, 1.0))
+    below_ninety_nine = _geometry(_fragmented_envelope(8), (1.0, 1.0, 1.0))
+
+    assert at_least_ninety_nine["valid_curvature_vertex_fraction"] >= 0.99
+    assert all(
+        math.isfinite(at_least_ninety_nine[name])
+        for name in (
+            "mean_curvature_p25_um_inverse",
+            "mean_curvature_p50_um_inverse",
+            "mean_curvature_p75_um_inverse",
+        )
+    )
+    assert below_ninety_nine["valid_curvature_vertex_fraction"] < 0.99
+    assert all(
+        math.isnan(below_ninety_nine[name])
+        for name in (
+            "mean_curvature_p25_um_inverse",
+            "mean_curvature_p50_um_inverse",
+            "mean_curvature_p75_um_inverse",
+        )
+    )
+
+
 def test_ridge_requires_strict_sbr_and_rejects_search_endpoints() -> None:
     """An equality threshold or endpoint peak is not a localized supported ridge."""
     offsets = np.array((-0.1, 0.0, 0.1))
@@ -290,6 +1015,7 @@ def test_cell_analysis_retains_every_frozen_ensemble_member(
     )
     revised_config = replace(
         analysis_config,
+        nominal_expansion_factor=1.0,
         cells=(cell,),
         qc_decisions=(
             QcDecision(
@@ -338,12 +1064,18 @@ def test_cell_analysis_retains_every_frozen_ensemble_member(
             if row.acquisition_round == acquisition_round
             and row.endpoint == "lamin_jaccard"
         ]
-        assert len(round_rows) == 9
+        assert len(round_rows) == 18
         assert {row.ensemble_name for row in round_rows} == combinations
+        assert {
+            nucleus_id: sum(row.nucleus_id == nucleus_id for row in round_rows)
+            for nucleus_id in ("N001", "aggregate")
+        } == {"N001": 9, "aggregate": 9}
     assert {
         "lamin_mask_volume",
         "lamin_mask_area_to_volume",
         "lamin_mask_sphericity",
+        "lamin_mask_geometry_status",
+        "lamin_mask_valid_curvature_vertex_fraction",
         "lamin_fixed_to_moving_boundary_distance_p95",
         "lamin_moving_to_fixed_boundary_distance_p95",
         "lamin_surface_dice",

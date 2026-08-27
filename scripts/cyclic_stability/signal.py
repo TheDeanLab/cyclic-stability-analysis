@@ -35,6 +35,7 @@ class SignalRow:
     positive_volume_um3: float | None
     raw_percentiles: Mapping[int, float]
     corrected_percentiles: Mapping[int, float]
+    nucleus_id: str = "aggregate"
 
 
 PERCENTILES = (10, 25, 50, 75, 90, 95, 99)
@@ -50,15 +51,16 @@ def raw_structure_roi(
     """
     from cyclic_stability.nuclear import consensus_nuclear_surface
 
-    surface = consensus_nuclear_surface(
+    consensus = consensus_nuclear_surface(
         {config.reference_acquisition_round: raw_dapi_zyx},
         config.voxel_spacing_xyz_um,
         config.nuclear,
+        config.nominal_expansion_factor,
     )
     if cohort == "lamin":
-        return surface.mask_zyx
+        return consensus.mask_zyx
     if cohort in {"golgi", "lamp1"}:
-        return ~surface.mask_zyx
+        return ~consensus.mask_zyx
     raise ValueError(f"unsupported cohort for raw signal ROI: {cohort}")
 
 

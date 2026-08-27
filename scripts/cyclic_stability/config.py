@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
 import re
@@ -36,6 +37,7 @@ CORRESPONDENCE_COLUMNS = (
     "nd2_relative",
     "tiff_directory_relative",
     "z_start_offset",
+    "producer_source_z_start_offset",
     "target_channel",
     "target_exposure_ms",
     "target_laser_percent",
@@ -88,6 +90,48 @@ def _positive_int(value: object, name: str) -> int:
     return value
 
 
+def _integer_pair(value: object, name: str) -> tuple[int, int]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"{name} must be a pair of positive integers")  # noqa: TRY004
+    if len(value) != 2:
+        raise ValueError(f"{name} must have length 2")
+    lower = _positive_int(value[0], f"{name}[0]")
+    upper = _positive_int(value[1], f"{name}[1]")
+    if lower > upper:
+        raise ValueError(f"{name} must be ordered")
+    return lower, upper
+
+
+def _accepted_component_count(value: object) -> tuple[int, int]:
+    result = _integer_pair(value, "nuclear.accepted_component_count")
+    if result[1] > 6:
+        raise ValueError("nuclear.accepted_component_count must not exceed 6")
+    return result
+
+
+def _ordered_positive_pair(value: object, name: str) -> tuple[float, float]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError(f"{name} must be a pair of positive numbers")  # noqa: TRY004
+    if len(value) != 2:
+        raise ValueError(f"{name} must have length 2")
+    lower = _number(value[0], f"{name}[0]")
+    upper = _number(value[1], f"{name}[1]")
+    if lower > upper:
+        raise ValueError(f"{name} must be ordered")
+    return lower, upper
+
+
+def _closed_fraction(value: object, name: str, *, lower_open: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a fraction")  # noqa: TRY004
+    result = float(value)
+    lower_invalid = result <= 0 if lower_open else result < 0
+    if not math.isfinite(result) or lower_invalid or result > 1:
+        lower = "(0, 1]" if lower_open else "[0, 1]"
+        raise ValueError(f"{name} must be finite and in {lower}")
+    return result
+
+
 def _nonnegative_int(value: str, name: str) -> int:
     try:
         result = int(value)
@@ -96,6 +140,18 @@ def _nonnegative_int(value: str, name: str) -> int:
     if result < 0:
         raise ValueError(f"{name} must be non-negative")
     return result
+
+
+def _producer_source_z_start_offset(value: str) -> int | None:
+    if value == "unresolved":
+        return None
+    try:
+        return _nonnegative_int(value, "producer_source_z_start_offset")
+    except ValueError as error:
+        raise ValueError(
+            "producer_source_z_start_offset must be a non-negative integer "
+            "or 'unresolved'"
+        ) from error
 
 
 def _csv_number(value: str, name: str) -> float:
@@ -129,10 +185,11 @@ def _sequence_numbers(
     return result
 
 
-def _load_yaml(path: Path) -> Mapping[str, Any]:
+def _load_yaml_bytes(payload: bytes, path: Path) -> Mapping[str, Any]:
+    """Parse one analysis YAML from bytes already owned by a caller snapshot."""
     try:
-        value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
+        value = yaml.safe_load(payload.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
         raise ValueError(f"cannot read YAML {path}: {error}") from error
     return _mapping(
         value,
@@ -150,6 +207,14 @@ def _load_yaml(path: Path) -> Mapping[str, Any]:
             "paths",
         },
     )
+
+
+def _load_yaml(path: Path) -> Mapping[str, Any]:
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read YAML {path}: {error}") from error
+    return _load_yaml_bytes(payload, path)
 
 
 def _parse_scientific_config(
@@ -198,6 +263,10 @@ def _parse_scientific_config(
             "normal_half_window_um",
             "normal_step_um",
             "ridge_min_sbr",
+            "accepted_component_count",
+            "nominal_volume_um3",
+            "minimum_sphericity",
+            "maximum_face_contact_fraction",
         },
     )
     golgi_data = _mapping(data["golgi"], "golgi", {"perinuclear_outer_distance_um"})
@@ -240,15 +309,35 @@ def _parse_scientific_config(
             ),
         ),
         NuclearConfig(
-            *(
-                _number(nuclear_data[key], f"nuclear.{key}")
-                for key in (
-                    "consensus_smoothing_um",
-                    "normal_half_window_um",
-                    "normal_step_um",
-                    "ridge_min_sbr",
-                )
-            )
+            consensus_smoothing_um=_number(
+                nuclear_data["consensus_smoothing_um"],
+                "nuclear.consensus_smoothing_um",
+            ),
+            normal_half_window_um=_number(
+                nuclear_data["normal_half_window_um"],
+                "nuclear.normal_half_window_um",
+            ),
+            normal_step_um=_number(
+                nuclear_data["normal_step_um"], "nuclear.normal_step_um"
+            ),
+            ridge_min_sbr=_number(
+                nuclear_data["ridge_min_sbr"], "nuclear.ridge_min_sbr"
+            ),
+            accepted_component_count=_accepted_component_count(
+                nuclear_data["accepted_component_count"]
+            ),
+            nominal_volume_um3=_ordered_positive_pair(
+                nuclear_data["nominal_volume_um3"], "nuclear.nominal_volume_um3"
+            ),
+            minimum_sphericity=_closed_fraction(
+                nuclear_data["minimum_sphericity"],
+                "nuclear.minimum_sphericity",
+                lower_open=True,
+            ),
+            maximum_face_contact_fraction=_closed_fraction(
+                nuclear_data["maximum_face_contact_fraction"],
+                "nuclear.maximum_face_contact_fraction",
+            ),
         ),
         GolgiConfig(
             _number(
@@ -268,17 +357,21 @@ def _parse_scientific_config(
     )
 
 
-def _read_csv(path: Path, columns: tuple[str, ...], label: str) -> list[dict[str, str]]:
+def _read_csv_bytes(
+    payload: bytes,
+    path: Path,
+    columns: tuple[str, ...],
+    label: str,
+) -> list[dict[str, str]]:
+    """Parse one strict CSV from bytes already owned by a caller snapshot."""
     try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            if tuple(reader.fieldnames or ()) != columns:
-                raise ValueError(
-                    f"{label} columns must exactly match the frozen schema"
-                )
-            rows = list(reader)
-    except OSError as error:
+        handle = io.StringIO(payload.decode("utf-8"), newline="")
+    except UnicodeDecodeError as error:
         raise ValueError(f"cannot read {label} {path}: {error}") from error
+    reader = csv.DictReader(handle)
+    if tuple(reader.fieldnames or ()) != columns:
+        raise ValueError(f"{label} columns must exactly match the frozen schema")
+    rows = list(reader)
     for line_number, row in enumerate(rows, start=2):
         if None in row or any(value is None for value in row.values()):
             raise ValueError(
@@ -287,6 +380,14 @@ def _read_csv(path: Path, columns: tuple[str, ...], label: str) -> list[dict[str
         if any(not value.strip() for value in row.values()):
             raise ValueError(f"{label} row {line_number} contains an empty value")
     return rows
+
+
+def _read_csv(path: Path, columns: tuple[str, ...], label: str) -> list[dict[str, str]]:
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read {label} {path}: {error}") from error
+    return _read_csv_bytes(payload, path, columns, label)
 
 
 def _resolve_path(root: Path, relative: str, name: str) -> Path:
@@ -347,6 +448,9 @@ def _parse_rounds(
                 nd2_root, row["tiff_directory_relative"], "tiff_directory_relative"
             ),
             z_start_offset=_nonnegative_int(row["z_start_offset"], "z_start_offset"),
+            producer_source_z_start_offset=_producer_source_z_start_offset(
+                row["producer_source_z_start_offset"]
+            ),
             target_exposure_ms=_csv_number(
                 row["target_exposure_ms"], "target_exposure_ms"
             ),
@@ -425,10 +529,9 @@ def _validate_cohort_settings(
                     )
 
 
-def _parse_qc_decisions(
-    path: Path, valid_rounds: set[tuple[str, str, int]]
+def _parse_qc_decision_rows(
+    rows: list[dict[str, str]], valid_rounds: set[tuple[str, str, int]]
 ) -> tuple[QcDecision, ...]:
-    rows = _read_csv(path, QC_COLUMNS, "QC decisions")
     decisions: list[QcDecision] = []
     seen: set[tuple[str, str, int]] = set()
     for line_number, row in enumerate(rows, start=2):
@@ -469,6 +572,14 @@ def _parse_qc_decisions(
     return tuple(decisions)
 
 
+def _parse_qc_decisions(
+    path: Path, valid_rounds: set[tuple[str, str, int]]
+) -> tuple[QcDecision, ...]:
+    return _parse_qc_decision_rows(
+        _read_csv(path, QC_COLUMNS, "QC decisions"), valid_rounds
+    )
+
+
 def _digest(
     analysis: Mapping[str, Any],
     correspondence: list[dict[str, str]],
@@ -499,7 +610,47 @@ def load_analysis_config(
     path: Path, correspondence_path: Path, qc_path: Path
 ) -> AnalysisConfig:
     """Load all frozen scientific inputs and reject malformed or incomplete inventories."""
-    data = _load_yaml(path)
+    try:
+        payloads = (
+            path.read_bytes(),
+            correspondence_path.read_bytes(),
+            qc_path.read_bytes(),
+        )
+    except OSError as error:
+        raise ValueError(f"cannot read scientific configuration: {error}") from error
+    return load_analysis_config_bytes(
+        *payloads,
+        analysis_path=path,
+        correspondence_path=correspondence_path,
+        qc_path=qc_path,
+    )
+
+
+def load_analysis_config_bytes(
+    analysis_payload: bytes,
+    correspondence_payload: bytes,
+    qc_payload: bytes,
+    *,
+    analysis_path: Path,
+    correspondence_path: Path,
+    qc_path: Path,
+) -> AnalysisConfig:
+    """Parse exact snapshotted scientific bytes without reopening source paths.
+
+    Parameters
+    ----------
+    analysis_payload, correspondence_payload, qc_payload : bytes
+        Exact bytes already hashed by the caller.
+    analysis_path, correspondence_path, qc_path : pathlib.Path
+        Canonical source names used only for error context and relative semantics.
+
+    Returns
+    -------
+    AnalysisConfig
+        Strict immutable scientific configuration derived solely from the supplied
+        byte strings.
+    """
+    data = _load_yaml_bytes(analysis_payload, analysis_path)
     (
         reference,
         spacing,
@@ -511,8 +662,11 @@ def load_analysis_config(
         lysosome,
         paths,
     ) = _parse_scientific_config(data)
-    correspondence = _read_csv(
-        correspondence_path, CORRESPONDENCE_COLUMNS, "correspondence"
+    correspondence = _read_csv_bytes(
+        correspondence_payload,
+        correspondence_path,
+        CORRESPONDENCE_COLUMNS,
+        "correspondence",
     )
     cells = _parse_rounds(correspondence, paths)
     valid_rounds = {
@@ -520,7 +674,9 @@ def load_analysis_config(
         for cell in cells
         for round_spec in cell.rounds
     }
-    decisions = _parse_qc_decisions(qc_path, valid_rounds)
+    decisions = _parse_qc_decision_rows(
+        _read_csv_bytes(qc_payload, qc_path, QC_COLUMNS, "QC decisions"), valid_rounds
+    )
     return AnalysisConfig(
         reference,
         spacing,
@@ -539,9 +695,35 @@ def load_analysis_config(
 def load_execution_profile(path: Path) -> ExecutionProfile:
     """Load a strict machine-specific profile without changing scientific inputs."""
     try:
-        value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
+        payload = path.read_bytes()
+    except OSError as error:
         raise ValueError(f"cannot read execution profile {path}: {error}") from error
+    return load_execution_profile_bytes(payload, source_path=path)
+
+
+def load_execution_profile_bytes(
+    payload: bytes, *, source_path: Path
+) -> ExecutionProfile:
+    """Parse an execution profile solely from exact bytes already hashed.
+
+    Parameters
+    ----------
+    payload : bytes
+        Exact execution-profile bytes owned by the caller snapshot.
+    source_path : pathlib.Path
+        Canonical source name used for error context.
+
+    Returns
+    -------
+    ExecutionProfile
+        Strict immutable operational configuration.
+    """
+    try:
+        value = yaml.safe_load(payload.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ValueError(
+            f"cannot read execution profile {source_path}: {error}"
+        ) from error
     base_keys = {"mode", "max_workers", "native_threads", "scratch_root"}
     allowed_keys = base_keys | {"slurm"}
     if not isinstance(value, Mapping):

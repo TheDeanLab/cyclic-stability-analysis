@@ -1,6 +1,6 @@
 schema_version: 1
 reference_acquisition_round: 2
-voxel_spacing_xyz_um: [0.108333, 0.108333, 0.300000]
+voxel_spacing_xyz_um: [0.1083, 0.1083, 0.300000]
 nominal_expansion_factor: 4.5
 optics:
   numerical_aperture: 1.4
@@ -18,6 +18,10 @@ nuclear:
   normal_half_window_um: 1.5
   normal_step_um: 0.05
   ridge_min_sbr: 3.0
+  accepted_component_count: [1, 6]
+  nominal_volume_um3: [100.0, 5000.0]
+  minimum_sphericity: 0.15
+  maximum_face_contact_fraction: 0.10
 golgi:
   perinuclear_outer_distance_um: 18.0
 lysosome:
