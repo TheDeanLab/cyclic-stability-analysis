@@ -107,6 +107,31 @@ def test_component_adjudication_survives_strict_surface_failure(
         )
 
 
+def test_component_adjudication_freezes_retained_geometry() -> None:
+    """Mutable retained arrays could silently change inventory-to-surface evidence."""
+    dapi = separated_nuclei(1, SPACING)
+    adjudication = nuclear.adjudicate_nuclear_components(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=4.5
+    )
+    geometry = adjudication._candidates[0].accepted_geometry
+    assert geometry is not None
+
+    for array in (geometry.mask_zyx, geometry.vertices_xyz_um, geometry.faces):
+        assert array.flags.writeable is False
+        with pytest.raises(ValueError, match="read-only"):
+            array.flat[0] = array.flat[0]
+
+    realized = nuclear.realize_nuclear_surfaces(adjudication, NUCLEAR_CONFIG)
+    direct = consensus_nuclear_surface(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=4.5
+    )
+    assert np.array_equal(realized.labels_zyx, direct.labels_zyx)
+    assert np.array_equal(
+        realized.nuclei[0].vertices_xyz_um, direct.nuclei[0].vertices_xyz_um
+    )
+    assert np.array_equal(realized.nuclei[0].faces, direct.nuclei[0].faces)
+
+
 @pytest.mark.parametrize(
     ("centers", "radii", "shape", "config", "reason"),
     (

@@ -275,6 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     from cyclic_stability.runner import initialize_run, run_tasks
     from cyclic_stability.task import (
         ArtifactTask,
+        ContentIdentity,
         build_tasks,
         configure_native_threads,
         run_artifact_task,
@@ -353,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
             for round_spec in _inventory_rounds(config, cell)
         }
         input_identities = tuple(
-            FileIdentity.from_path(path)
+            ContentIdentity.from_path(path)
             for path in (
                 args.analysis_config,
                 args.correspondence,

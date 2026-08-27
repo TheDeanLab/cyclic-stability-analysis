@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -42,6 +43,76 @@ _THREAD_ENVIRONMENT = (
 CYEXM_PIN = "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52"
 
 
+def _sha256_path(path: Path) -> str:
+    """Return the SHA-256 of one regular file without following a new path."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class ContentIdentity:
+    """Exact file metadata plus authoritative SHA-256 content identity.
+
+    Parameters
+    ----------
+    path : str
+        Resolved absolute file path.
+    st_size : int
+        Byte size captured with the digest.
+    st_mtime_ns : int
+        Nanosecond modification time captured with the digest.
+    sha256 : str
+        Lower-case SHA-256 digest of the complete file content.
+    """
+
+    path: str
+    st_size: int
+    st_mtime_ns: int
+    sha256: str
+
+    @classmethod
+    def from_path(cls, path: Path) -> ContentIdentity:
+        """Snapshot stable metadata and complete file content."""
+        before = FileIdentity.from_path(path)
+        resolved = Path(before.path)
+        digest = _sha256_path(resolved)
+        after = FileIdentity.from_path(resolved)
+        if after != before:
+            raise ValueError(f"file changed while hashing: {resolved}")
+        return cls(before.path, before.st_size, before.st_mtime_ns, digest)
+
+    @classmethod
+    def from_dict(
+        cls, payload: Mapping[str, object], *, name: str = "content identity"
+    ) -> ContentIdentity:
+        """Validate and reconstruct an identity from persisted JSON."""
+        if set(payload) != {"path", "st_size", "st_mtime_ns", "sha256"}:
+            raise ValueError(f"{name} has invalid fields")
+        metadata = FileIdentity.from_dict(
+            {key: payload[key] for key in ("path", "st_size", "st_mtime_ns")},
+            name=name,
+        )
+        digest = payload["sha256"]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError(f"{name} has invalid sha256")
+        return cls(metadata.path, metadata.st_size, metadata.st_mtime_ns, digest)
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the canonical JSON representation."""
+        return {
+            "path": self.path,
+            "st_size": self.st_size,
+            "st_mtime_ns": self.st_mtime_ns,
+            "sha256": self.sha256,
+        }
+
+
+TaskFileIdentity = FileIdentity | ContentIdentity
+
+
 @dataclass(frozen=True, slots=True)
 class TaskOutput:
     """Compact per-cell tables and paths produced by one analyzer."""
@@ -64,7 +135,7 @@ class ArtifactTask:
         Stable path-safe task identity within a run.
     config_digest : str
         Exact frozen scientific configuration digest.
-    input_identities : tuple[FileIdentity, ...]
+    input_identities : tuple[ContentIdentity, ...]
         Every immutable input consumed by ``producer``.
     software_identity : str
         Frozen software and repository identity used to authorize reuse.
@@ -82,7 +153,7 @@ class ArtifactTask:
 
     key: str
     config_digest: str
-    input_identities: tuple[FileIdentity, ...]
+    input_identities: tuple[ContentIdentity, ...]
     software_identity: str
     producer: ArtifactProducer
     native_threads: int = 1
@@ -131,9 +202,9 @@ class TaskRecord:
     attempt_id: str
     attempt_dir: Path
     config_digest: str
-    input_identities: tuple[FileIdentity, ...]
+    input_identities: tuple[TaskFileIdentity, ...]
     software_identity: str
-    output_identities: tuple[FileIdentity, ...]
+    output_identities: tuple[TaskFileIdentity, ...]
     status: Literal["complete", "failed"]
     started_at: float
     completed_at: float
@@ -177,16 +248,25 @@ def _json_bytes(payload: Mapping[str, object]) -> bytes:
     return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
-def _identity_payload(values: tuple[FileIdentity, ...]) -> list[dict[str, object]]:
+def _identity_payload(
+    values: tuple[TaskFileIdentity, ...],
+) -> list[dict[str, object]]:
     return [dict(value.to_dict()) for value in values]
 
 
-def _identity_values(value: object) -> tuple[FileIdentity, ...]:
+def _identity_values(value: object) -> tuple[TaskFileIdentity, ...]:
     if not isinstance(value, list):
         raise TypeError("identities must be a list")
     if not all(isinstance(item, Mapping) for item in value):
         raise TypeError("task identities must be mappings")
-    return tuple(FileIdentity.from_dict(item, name="task identity") for item in value)
+    return tuple(
+        (
+            ContentIdentity.from_dict(item, name="task content identity")
+            if "sha256" in item
+            else FileIdentity.from_dict(item, name="task identity")
+        )
+        for item in value
+    )
 
 
 def _record_payload(record: TaskRecord) -> dict[str, object]:
@@ -267,32 +347,47 @@ def _record_from_payload(payload: Mapping[str, object]) -> TaskRecord:
     )
 
 
-def _current_identities_match(values: tuple[FileIdentity, ...]) -> bool:
+def _current_identities_match(values: tuple[TaskFileIdentity, ...]) -> bool:
     try:
         return all(
-            FileIdentity.from_path(Path(value.path)) == value for value in values
+            (
+                ContentIdentity.from_path(Path(value.path))
+                if isinstance(value, ContentIdentity)
+                else FileIdentity.from_path(Path(value.path))
+            )
+            == value
+            for value in values
         )
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
-def _read_reusable(task: CellTask | ArtifactTask, complete: Path) -> TaskRecord | None:
+def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord | None:
     try:
-        pointer = json.loads(complete.read_text(encoding="utf-8"))
-        if set(pointer) != {
-            "attempt_id",
-            "record",
-            "record_identity",
-            "output_manifest_identity",
-        }:
+        if terminal.is_symlink() or not stat.S_ISREG(terminal.stat().st_mode):
+            return None
+        pointer = json.loads(terminal.read_text(encoding="utf-8"))
+        if (
+            set(pointer)
+            != {
+                "status",
+                "attempt_id",
+                "record",
+                "record_identity",
+                "output_manifest",
+                "output_manifest_identity",
+            }
+            or pointer["status"] != "complete"
+        ):
             return None
         attempt_id = str(pointer["attempt_id"])
         if (
             not re.fullmatch(r"[0-9a-f]{32}", attempt_id)
             or pointer["record"] != "record.json"
+            or pointer["output_manifest"] != "output-manifest.json"
         ):
             return None
-        attempts_root = (complete.parent / "attempts").resolve(strict=True)
+        attempts_root = (terminal.parent / "attempts").resolve(strict=True)
         attempt_dir = (attempts_root / attempt_id).resolve(strict=True)
         if attempt_dir.parent != attempts_root:
             return None
@@ -303,17 +398,23 @@ def _read_reusable(task: CellTask | ArtifactTask, complete: Path) -> TaskRecord 
             json.loads(record_path.read_text(encoding="utf-8"))
         )
         manifest_path = attempt_dir / "output-manifest.json"
-        record_identity = FileIdentity.from_dict(pointer["record_identity"])
-        manifest_identity = FileIdentity.from_dict(pointer["output_manifest_identity"])
+        if manifest_path.is_symlink() or not stat.S_ISREG(manifest_path.stat().st_mode):
+            return None
+        record_identity = ContentIdentity.from_dict(
+            pointer["record_identity"], name="terminal record identity"
+        )
+        manifest_identity = ContentIdentity.from_dict(
+            pointer["output_manifest_identity"], name="terminal manifest identity"
+        )
         if (
-            FileIdentity.from_path(record_path) != record_identity
-            or FileIdentity.from_path(manifest_path) != manifest_identity
+            ContentIdentity.from_path(record_path) != record_identity
+            or ContentIdentity.from_path(manifest_path) != manifest_identity
         ):
             return None
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if set(manifest) != {"outputs"} or not isinstance(manifest["outputs"], list):
             return None
-        expected: list[FileIdentity] = []
+        expected: list[TaskFileIdentity] = []
         expected_relative: set[str] = set()
         for entry in manifest["outputs"]:
             if not isinstance(entry, Mapping) or set(entry) != {"relative", "identity"}:
@@ -329,7 +430,16 @@ def _read_reusable(task: CellTask | ArtifactTask, complete: Path) -> TaskRecord 
             ):
                 return None
             expected_relative.add(relative)
-            expected.append(FileIdentity.from_dict(entry["identity"]))
+            identity_payload = entry["identity"]
+            if not isinstance(identity_payload, Mapping):
+                return None
+            expected.append(
+                (
+                    ContentIdentity.from_dict(identity_payload)
+                    if "sha256" in identity_payload
+                    else FileIdentity.from_dict(identity_payload)
+                )
+            )
         actual_relative = {
             path.relative_to(attempt_dir).as_posix()
             for path in attempt_dir.rglob("*")
@@ -354,6 +464,19 @@ def _read_reusable(task: CellTask | ArtifactTask, complete: Path) -> TaskRecord 
         or record.input_identities != task.input_identities
         or record.attempt_dir.resolve(strict=True) != attempt_dir
         or not record.output_identities
+        or (
+            isinstance(task, ArtifactTask)
+            and (
+                not all(
+                    isinstance(identity, ContentIdentity)
+                    for identity in record.input_identities
+                )
+                or not all(
+                    isinstance(identity, ContentIdentity)
+                    for identity in record.output_identities
+                )
+            )
+        )
         or any(
             path.is_symlink()
             or not stat.S_ISREG(path.stat().st_mode)
@@ -608,6 +731,10 @@ def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
 def run_artifact_task(task: ArtifactTask, run_dir: Path) -> TaskRecord:
     """Run or exactly reuse one generic immutable file-producing attempt."""
     configure_native_threads(task.native_threads)
+    if not task.input_identities or not all(
+        isinstance(identity, ContentIdentity) for identity in task.input_identities
+    ):
+        raise TypeError("artifact task inputs require content-bound identities")
     task_dir = _task_directory(task, run_dir)
     with (task_dir / ".task.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -620,7 +747,7 @@ def _run_task_locked(
     producer: ArtifactProducer,
 ) -> TaskRecord:
     """Execute under the kernel lock that serializes reuse and publication."""
-    reusable = None if task.force else _read_reusable(task, task_dir / "complete.json")
+    reusable = None if task.force else _read_reusable(task, task_dir / "terminal.json")
     if reusable is not None:
         return reusable
     attempt_id = uuid.uuid4().hex
@@ -663,6 +790,19 @@ def _run_task_locked(
             for path in output_paths
         ):
             raise ValueError("analyzer did not produce valid task outputs")
+        after = process.io_counters()
+        stop.set()
+        sampler.join()
+        peak = max(samples["rss"], process.memory_info().rss)
+        scratch_bytes = max(samples["scratch"], _directory_size(scratch_dir))
+        shutil.rmtree(scratch_dir)
+        if not all(
+            path.is_file()
+            and not path.is_symlink()
+            and attempt_dir in path.resolve(strict=True).parents
+            for path in output_paths
+        ):
+            raise ValueError("scratch cleanup removed a declared task output")
         manifest_paths = tuple(
             sorted(
                 (
@@ -675,11 +815,11 @@ def _run_task_locked(
         )
         for path in manifest_paths:
             _validate_output(path)
-        after = process.io_counters()
-        stop.set()
-        sampler.join()
-        peak = max(samples["rss"], process.memory_info().rss)
-        scratch_bytes = max(samples["scratch"], _directory_size(scratch_dir))
+        identity_factory = (
+            ContentIdentity.from_path
+            if isinstance(task, ArtifactTask)
+            else FileIdentity.from_path
+        )
         record = TaskRecord(
             task.key,
             attempt_id,
@@ -687,7 +827,7 @@ def _run_task_locked(
             task.config_digest,
             task.input_identities,
             task.software_identity,
-            tuple(FileIdentity.from_path(path) for path in manifest_paths),
+            tuple(identity_factory(path) for path in manifest_paths),
             "complete",
             started,
             time.time(),
@@ -712,19 +852,20 @@ def _run_task_locked(
         record_path = attempt_dir / "record.json"
         _atomic_bytes(record_path, _json_bytes(_record_payload(record)))
         _atomic_bytes(
-            task_dir / "complete.json",
+            task_dir / "terminal.json",
             _json_bytes(
                 {
+                    "status": "complete",
                     "attempt_id": attempt_id,
                     "record": "record.json",
-                    "record_identity": FileIdentity.from_path(record_path).to_dict(),
-                    "output_manifest_identity": FileIdentity.from_path(
+                    "record_identity": ContentIdentity.from_path(record_path).to_dict(),
+                    "output_manifest": "output-manifest.json",
+                    "output_manifest_identity": ContentIdentity.from_path(
                         manifest_path
                     ).to_dict(),
                 }
             ),
         )
-        shutil.rmtree(scratch_dir)
         return record
     except Exception as error:  # noqa: BLE001 - persist analyzer failures, preserve interrupts
         stop.set()
@@ -743,7 +884,21 @@ def _run_task_locked(
             "started_at": started,
             "failed_at": time.time(),
         }
-        _atomic_bytes(attempt_dir / "failure.json", _json_bytes(failure))
+        failure_path = attempt_dir / "failure.json"
+        _atomic_bytes(failure_path, _json_bytes(failure))
+        _atomic_bytes(
+            task_dir / "terminal.json",
+            _json_bytes(
+                {
+                    "status": "failed",
+                    "attempt_id": attempt_id,
+                    "failure": "failure.json",
+                    "failure_identity": ContentIdentity.from_path(
+                        failure_path
+                    ).to_dict(),
+                }
+            ),
+        )
         return TaskRecord(
             task.key,
             attempt_id,
@@ -813,6 +968,7 @@ __all__ = [
     "ArtifactTask",
     "CYEXM_PIN",
     "CellTask",
+    "ContentIdentity",
     "TaskOutput",
     "TaskRecord",
     "build_tasks",

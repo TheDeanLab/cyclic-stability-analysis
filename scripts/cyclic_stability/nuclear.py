@@ -463,11 +463,14 @@ def adjudicate_nuclear_components(
             for fraction in face_contact_fractions
         ):
             rejection_reasons.append("face-contact-above-maximum")
-        accepted_geometry = (
-            None
-            if rejection_reasons
-            else _AcceptedCandidateGeometry(region_zyx, component_mask, vertices, faces)
-        )
+        if rejection_reasons:
+            accepted_geometry = None
+        else:
+            for array in (component_mask, vertices, faces):
+                array.setflags(write=False)
+            accepted_geometry = _AcceptedCandidateGeometry(
+                region_zyx, component_mask, vertices, faces
+            )
         candidates.append(
             _NuclearCandidate(
                 accepted_geometry,

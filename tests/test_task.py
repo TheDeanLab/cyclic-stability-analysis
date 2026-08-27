@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
@@ -22,7 +24,6 @@ from cyclic_stability.task import (
     run_cell_task,
 )
 from synthetic import cell_task, different_identity
-from cyexm.registration.artifacts import FileIdentity
 
 
 def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
@@ -160,7 +161,7 @@ def test_artifact_task_changed_input_or_repository_preserves_prior_evidence(
     task = task_module.ArtifactTask(
         key="nuclear-inventory",
         config_digest="config-v1",
-        input_identities=(FileIdentity.from_path(source),),
+        input_identities=(task_module.ContentIdentity.from_path(source),),
         software_identity="repository-v1",
         producer=publish,
     )
@@ -170,7 +171,9 @@ def test_artifact_task_changed_input_or_repository_preserves_prior_evidence(
     assert reopened.reused is True
 
     source.write_bytes(b"dapi-v2")
-    changed_input = replace(task, input_identities=(FileIdentity.from_path(source),))
+    changed_input = replace(
+        task, input_identities=(task_module.ContentIdentity.from_path(source),)
+    )
     second = task_module.run_artifact_task(changed_input, tmp_path / "run")
     changed_repository = replace(changed_input, software_identity="repository-v2")
     third = task_module.run_artifact_task(changed_repository, tmp_path / "run")
@@ -179,8 +182,9 @@ def test_artifact_task_changed_input_or_repository_preserves_prior_evidence(
     assert first.attempt_dir.is_dir()
     assert (first.attempt_dir / "nuclear-inventory.json").is_file()
     pointer = json.loads(
-        (tmp_path / "run" / "tasks" / task.key / "complete.json").read_text()
+        (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
     )
+    assert pointer["status"] == "complete"
     assert pointer["attempt_id"] == third.attempt_id
     assert (third.attempt_dir / "record.json").is_file()
     manifest = json.loads(
@@ -197,7 +201,7 @@ def test_artifact_task_changed_input_or_repository_preserves_prior_evidence(
     assert after_tamper.reused is False
 
 
-def test_artifact_task_failure_has_record_without_completion_pointer(
+def test_artifact_task_failure_has_failed_terminal_pointer(
     tmp_path: Path,
 ) -> None:
     """Publishing complete.json for a failed producer would authorize bad reuse."""
@@ -210,7 +214,7 @@ def test_artifact_task_failure_has_record_without_completion_pointer(
     task = task_module.ArtifactTask(
         key="nuclear-inventory",
         config_digest="config-v1",
-        input_identities=(FileIdentity.from_path(source),),
+        input_identities=(task_module.ContentIdentity.from_path(source),),
         software_identity="repository-v1",
         producer=fail,
     )
@@ -229,6 +233,172 @@ def test_artifact_task_failure_has_record_without_completion_pointer(
         dict(item.to_dict()) for item in task.input_identities
     ]
     assert failure["software_identity"] == task.software_identity
+    terminal = json.loads(
+        (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_id"] == record.attempt_id
+    assert not (tmp_path / "run" / "tasks" / task.key / "complete.json").exists()
+
+
+def test_artifact_task_rejects_same_metadata_dapi_tampering(tmp_path: Path) -> None:
+    """Metadata-only input checks would authorize stale DAPI evidence."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi-v1")
+    original_mtime = source.stat().st_mtime_ns
+
+    def publish(output_dir: Path) -> tuple[Path, ...]:
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text('{"value":"a"}\n', encoding="utf-8")
+        return (output,)
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(task_module.ContentIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=publish,
+    )
+    first = task_module.run_artifact_task(task, tmp_path / "run")
+    source.write_bytes(b"dapi-v2")
+    os.utime(source, ns=(source.stat().st_atime_ns, original_mtime))
+
+    after_tamper = task_module.run_artifact_task(task, tmp_path / "run")
+
+    assert after_tamper.status == "failed"
+    assert after_tamper.attempt_id != first.attempt_id
+    terminal = json.loads(
+        (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_id"] == after_tamper.attempt_id
+    assert (first.attempt_dir / "record.json").is_file()
+
+
+@pytest.mark.parametrize("artifact", ("output", "record", "manifest"))
+def test_artifact_task_rejects_same_metadata_published_byte_tampering(
+    tmp_path: Path, artifact: str
+) -> None:
+    """Every file trusted during reopen must be bound to its exact content."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi-v1")
+
+    def publish(output_dir: Path) -> tuple[Path, ...]:
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text('{"value":"a"}\n', encoding="utf-8")
+        return (output,)
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(task_module.ContentIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=publish,
+    )
+    first = task_module.run_artifact_task(task, tmp_path / "run")
+    paths = {
+        "output": first.attempt_dir / "nuclear-inventory.json",
+        "record": first.attempt_dir / "record.json",
+        "manifest": first.attempt_dir / "output-manifest.json",
+    }
+    path = paths[artifact]
+    original_mtime = path.stat().st_mtime_ns
+    payload = path.read_bytes()
+    if artifact == "output":
+        tampered = payload.replace(b'"a"', b'"b"', 1)
+    elif artifact == "record":
+        match = re.search(rb'"peak_rss_bytes":([0-9])', payload)
+        assert match is not None
+        digit = match.group(1)
+        replacement = b"1" if digit != b"1" else b"2"
+        tampered = payload[: match.start(1)] + replacement + payload[match.end(1) :]
+    else:
+        tampered = payload.replace(b'{"outputs":[', b'{"outputs": [', 1)[:-1]
+    assert len(tampered) == len(payload)
+    path.write_bytes(tampered)
+    os.utime(path, ns=(path.stat().st_atime_ns, original_mtime))
+
+    after_tamper = task_module.run_artifact_task(task, tmp_path / "run")
+
+    assert after_tamper.status == "complete"
+    assert after_tamper.reused is False
+    assert after_tamper.attempt_id != first.attempt_id
+
+
+def test_changed_input_failure_supersedes_prior_success_terminal(
+    tmp_path: Path,
+) -> None:
+    """A stale success pointer must not survive a newer failed attempt."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi-v1")
+
+    def publish(output_dir: Path) -> tuple[Path, ...]:
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text('{"value":"a"}\n', encoding="utf-8")
+        return (output,)
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(task_module.ContentIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=publish,
+    )
+    first = task_module.run_artifact_task(task, tmp_path / "run")
+    source.write_bytes(b"dapi-v2")
+
+    def fail(_output_dir: Path) -> tuple[Path, ...]:
+        raise ValueError("synthetic changed-input failure")
+
+    changed = replace(
+        task,
+        input_identities=(task_module.ContentIdentity.from_path(source),),
+        producer=fail,
+    )
+    failed = task_module.run_artifact_task(changed, tmp_path / "run")
+
+    assert failed.status == "failed"
+    assert failed.attempt_id != first.attempt_id
+    terminal = json.loads(
+        (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_id"] == failed.attempt_id
+    assert (first.attempt_dir / "record.json").is_file()
+
+
+def test_cleanup_failure_publishes_only_failed_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Publishing success before fallible cleanup creates contradictory state."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi-v1")
+
+    def publish(output_dir: Path) -> tuple[Path, ...]:
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text('{"value":"a"}\n', encoding="utf-8")
+        return (output,)
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(task_module.ContentIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=publish,
+    )
+
+    def fail_cleanup(_path: Path) -> None:
+        raise OSError("synthetic scratch cleanup failure")
+
+    monkeypatch.setattr(task_module.shutil, "rmtree", fail_cleanup)
+    failed = task_module.run_artifact_task(task, tmp_path / "run")
+
+    assert failed.status == "failed"
+    terminal_path = tmp_path / "run" / "tasks" / task.key / "terminal.json"
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_id"] == failed.attempt_id
+    assert not (failed.attempt_dir / "record.json").exists()
     assert not (tmp_path / "run" / "tasks" / task.key / "complete.json").exists()
 
 

@@ -154,8 +154,9 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         "round-4-405-DAPI.tif",
     ]
     task_dir = run_dir / "tasks" / "nuclear-inventory"
-    complete = json.loads((task_dir / "complete.json").read_text(encoding="utf-8"))
-    first_attempt = complete["attempt_id"]
+    terminal = json.loads((task_dir / "terminal.json").read_text(encoding="utf-8"))
+    assert terminal["status"] == "complete"
+    first_attempt = terminal["attempt_id"]
     attempt_dir = task_dir / "attempts" / first_attempt
     inventory = attempt_dir / "nuclear-inventory.json"
     payload = json.loads(inventory.read_text(encoding="utf-8"))
@@ -226,7 +227,7 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         )
         == 0
     )
-    assert json.loads((task_dir / "complete.json").read_text())["attempt_id"] == (
+    assert json.loads((task_dir / "terminal.json").read_text())["attempt_id"] == (
         first_attempt
     )
 
@@ -249,7 +250,7 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         )
         == 0
     )
-    second_attempt = json.loads((task_dir / "complete.json").read_text())["attempt_id"]
+    second_attempt = json.loads((task_dir / "terminal.json").read_text())["attempt_id"]
     assert second_attempt != first_attempt
     assert inventory.is_file()
 
@@ -272,7 +273,7 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         )
         == 0
     )
-    third_attempt = json.loads((task_dir / "complete.json").read_text())["attempt_id"]
+    third_attempt = json.loads((task_dir / "terminal.json").read_text())["attempt_id"]
     assert third_attempt not in {first_attempt, second_attempt}
 
 
