@@ -75,14 +75,18 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
             AssertionError("target task inventory must not be built")
         ),
     )
+    dapi_paths = {}
+    for number in (1, 2, 4):
+        path = tmp_path / f"round-{number}-405-DAPI.tif"
+        path.write_bytes(f"dapi-{number}-v1".encode())
+        dapi_paths[number] = path
     monkeypatch.setattr(
         run_analysis,
         "_validated_registered_dapi",
-        lambda round_spec: (
-            tmp_path / f"round-{round_spec.acquisition_round}-405-DAPI.tif"
-        ),
+        lambda round_spec: dapi_paths[round_spec.acquisition_round],
         raising=False,
     )
+    monkeypatch.setattr(run_analysis, "_software_identity", lambda: "repository-v1")
     opened: list[str] = []
 
     def load_volume(path: Path) -> np.ndarray:
@@ -118,6 +122,14 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         "cyclic_stability.nuclear.consensus_nuclear_surface",
         lambda *_args: SimpleNamespace(component_qc=component_qc),
     )
+    monkeypatch.setattr(
+        "cyclic_stability.nuclear.adjudicate_nuclear_components",
+        lambda *_args: SimpleNamespace(component_qc=component_qc),
+    )
+    monkeypatch.setattr(
+        "cyclic_stability.nuclear.realize_nuclear_surfaces",
+        lambda *_args: SimpleNamespace(component_qc=component_qc),
+    )
     run_dir = tmp_path / "inventory-run"
     result = run_analysis.main(
         [
@@ -141,7 +153,11 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         "round-2-405-DAPI.tif",
         "round-4-405-DAPI.tif",
     ]
-    inventory = run_dir / "nuclear-inventory.json"
+    task_dir = run_dir / "tasks" / "nuclear-inventory"
+    complete = json.loads((task_dir / "complete.json").read_text(encoding="utf-8"))
+    first_attempt = complete["attempt_id"]
+    attempt_dir = task_dir / "attempts" / first_attempt
+    inventory = attempt_dir / "nuclear-inventory.json"
     payload = json.loads(inventory.read_text(encoding="utf-8"))
     assert payload["accepted_component_count_range"] == [1, 6]
     assert payload["all_fields_within_contract"] is True
@@ -178,13 +194,86 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
                 },
             ],
             "field_id": "lamin/Field-A",
+            "surface_realization": {"status": "complete"},
             "within_accepted_component_contract": True,
         }
     ]
     assert inventory.read_text(encoding="utf-8") == (
         json.dumps(payload, indent=4, sort_keys=True) + "\n"
     )
-    assert not list(run_dir.glob(".nuclear-inventory.json.*.tmp"))
+    assert not list(attempt_dir.glob(".nuclear-inventory.json.*.tmp"))
+    record = json.loads((attempt_dir / "record.json").read_text(encoding="utf-8"))
+    assert record["software_identity"] == "repository-v1"
+    assert {Path(item["path"]) for item in record["input_identities"]}.issuperset(
+        set(dapi_paths.values())
+    )
+
+    assert (
+        run_analysis.main(
+            [
+                "--analysis-config",
+                str(inputs[0]),
+                "--correspondence",
+                str(inputs[1]),
+                "--qc-decisions",
+                str(inputs[2]),
+                "--execution-profile",
+                str(inputs[3]),
+                "--run-dir",
+                str(run_dir),
+                "--nuclear-inventory-only",
+            ]
+        )
+        == 0
+    )
+    assert json.loads((task_dir / "complete.json").read_text())["attempt_id"] == (
+        first_attempt
+    )
+
+    dapi_paths[1].write_bytes(b"dapi-1-v2")
+    assert (
+        run_analysis.main(
+            [
+                "--analysis-config",
+                str(inputs[0]),
+                "--correspondence",
+                str(inputs[1]),
+                "--qc-decisions",
+                str(inputs[2]),
+                "--execution-profile",
+                str(inputs[3]),
+                "--run-dir",
+                str(run_dir),
+                "--nuclear-inventory-only",
+            ]
+        )
+        == 0
+    )
+    second_attempt = json.loads((task_dir / "complete.json").read_text())["attempt_id"]
+    assert second_attempt != first_attempt
+    assert inventory.is_file()
+
+    monkeypatch.setattr(run_analysis, "_software_identity", lambda: "repository-v2")
+    assert (
+        run_analysis.main(
+            [
+                "--analysis-config",
+                str(inputs[0]),
+                "--correspondence",
+                str(inputs[1]),
+                "--qc-decisions",
+                str(inputs[2]),
+                "--execution-profile",
+                str(inputs[3]),
+                "--run-dir",
+                str(run_dir),
+                "--nuclear-inventory-only",
+            ]
+        )
+        == 0
+    )
+    third_attempt = json.loads((task_dir / "complete.json").read_text())["attempt_id"]
+    assert third_attempt not in {first_attempt, second_attempt}
 
 
 def test_nuclear_inventory_reports_out_of_contract_before_target_work(
@@ -229,6 +318,15 @@ def test_nuclear_inventory_reports_out_of_contract_before_target_work(
         "cyclic_stability.nuclear.consensus_nuclear_surface",
         lambda *_args: SimpleNamespace(component_qc=()),
     )
+    monkeypatch.setattr(
+        "cyclic_stability.nuclear.adjudicate_nuclear_components",
+        lambda *_args: SimpleNamespace(component_qc=()),
+    )
+
+    def fail_count(*_args):
+        raise ValueError("accepted nuclear component count 0 is outside range")
+
+    monkeypatch.setattr("cyclic_stability.nuclear.realize_nuclear_surfaces", fail_count)
 
     payload = run_analysis._nuclear_inventory_payload(config, (cell,))
 
@@ -244,7 +342,150 @@ def test_nuclear_inventory_reports_out_of_contract_before_target_work(
                 "cohort": "lamin",
                 "components": [],
                 "field_id": "lamin/Field-Z",
+                "surface_realization": {
+                    "error_type": "ValueError",
+                    "message": "accepted nuclear component count 0 is outside range",
+                    "status": "failed",
+                },
                 "within_accepted_component_contract": False,
             }
         ],
     }
+
+
+def test_nuclear_inventory_publishes_component_qc_when_strict_normals_fail(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Letting strict realization abort would discard target-blind component rows."""
+    cell = SimpleNamespace(
+        cohort="golgi",
+        cell_id="Field-N",
+        rounds=(
+            SimpleNamespace(cohort="golgi", cell_id="Field-N", acquisition_round=2),
+        ),
+    )
+    config = SimpleNamespace(
+        cells=(cell,),
+        qc_decisions=(),
+        reference_acquisition_round=2,
+        voxel_spacing_xyz_um=(0.1, 0.1, 0.3),
+        nominal_expansion_factor=4.5,
+        nuclear=NuclearConfig(
+            consensus_smoothing_um=0.5,
+            normal_half_window_um=1.5,
+            normal_step_um=0.05,
+            ridge_min_sbr=3.0,
+            accepted_component_count=(1, 6),
+            nominal_volume_um3=(100.0, 5000.0),
+            minimum_sphericity=0.15,
+            maximum_face_contact_fraction=0.1,
+        ),
+    )
+    component = NuclearComponentQc(
+        "N001",
+        True,
+        (),
+        72900.0,
+        800.0,
+        0.91,
+        (1.0, 2.0, 3.0),
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+    )
+    monkeypatch.setattr(
+        run_analysis,
+        "_validated_registered_dapi",
+        lambda _round: tmp_path / "round-2-405-DAPI.tif",
+    )
+    monkeypatch.setattr(
+        "cyclic_stability.images.load_volume",
+        lambda _path: np.ones((3, 3, 3), dtype=np.float64),
+    )
+    monkeypatch.setattr(
+        "cyclic_stability.nuclear.adjudicate_nuclear_components",
+        lambda *_args: SimpleNamespace(component_qc=(component,)),
+    )
+    monkeypatch.setattr(
+        "cyclic_stability.nuclear.consensus_nuclear_surface",
+        lambda *_args: SimpleNamespace(component_qc=(component,)),
+    )
+
+    def fail_surface(*_args):
+        raise ValueError("surface normal interpolation is degenerate")
+
+    monkeypatch.setattr(
+        "cyclic_stability.nuclear.realize_nuclear_surfaces", fail_surface
+    )
+
+    payload = run_analysis._nuclear_inventory_payload(config, (cell,))
+
+    assert payload["all_fields_within_contract"] is False
+    row = payload["cells"][0]
+    assert row["candidate_count"] == 1
+    assert row["accepted_count"] == 1
+    assert row["components"][0]["nucleus_id"] == "N001"
+    assert row["within_accepted_component_contract"] is True
+    assert row["surface_realization"] == {
+        "error_type": "ValueError",
+        "message": "surface normal interpolation is degenerate",
+        "status": "failed",
+    }
+
+
+def test_nuclear_inventory_rejects_empty_selection(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Treating an empty cohort filter as all-valid would be vacuous success."""
+    inputs = []
+    for name in (
+        "analysis.yaml",
+        "correspondence.csv",
+        "qc-decisions.csv",
+        "execution.yaml",
+    ):
+        path = tmp_path / name
+        path.write_text(name, encoding="utf-8")
+        inputs.append(path)
+    config = SimpleNamespace(
+        cells=(),
+        qc_decisions=(),
+        reference_acquisition_round=2,
+        config_digest="empty-inventory",
+    )
+    profile = SimpleNamespace(mode="sequential", native_threads=1)
+    monkeypatch.setattr(
+        "cyclic_stability.config.load_analysis_config", lambda *_args: config
+    )
+    monkeypatch.setattr(
+        "cyclic_stability.config.load_execution_profile", lambda _path: profile
+    )
+    monkeypatch.setattr(
+        "cyclic_stability.task.build_tasks",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("target task inventory must not be built")
+        ),
+    )
+
+    result = run_analysis.main(
+        [
+            "--analysis-config",
+            str(inputs[0]),
+            "--correspondence",
+            str(inputs[1]),
+            "--qc-decisions",
+            str(inputs[2]),
+            "--execution-profile",
+            str(inputs[3]),
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--cohort",
+            "lamp1",
+            "--nuclear-inventory-only",
+        ]
+    )
+
+    assert result == 1
+    assert (
+        "unavailable: no cells selected for nuclear inventory"
+        in capsys.readouterr().out
+    )
+    assert not (tmp_path / "run" / "nuclear-inventory.json").exists()

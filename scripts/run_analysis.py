@@ -128,51 +128,78 @@ def _validated_registered_dapi(round_spec) -> Path:
     return path
 
 
-def _nuclear_inventory_payload(config, cells) -> dict[str, object]:
-    """Build complete DAPI component evidence without opening a target channel."""
-    from cyclic_stability.images import load_volume
-    from cyclic_stability.nuclear import consensus_nuclear_surface
-
+def _inventory_rounds(config, cell) -> tuple[object, ...]:
+    """Return reference and target-blind-QC-accepted rounds for one field."""
     decisions = {
         (item.cohort, item.cell_id, item.acquisition_round): item.decision
         for item in config.qc_decisions
     }
+    missing = [
+        item.acquisition_round
+        for item in cell.rounds
+        if item.acquisition_round != config.reference_acquisition_round
+        and (item.cohort, item.cell_id, item.acquisition_round) not in decisions
+    ]
+    if missing:
+        raise ValueError(
+            f"target-blind QC decisions are missing for moving rounds: {missing}"
+        )
+    return tuple(
+        item
+        for item in sorted(cell.rounds, key=lambda value: value.acquisition_round)
+        if item.acquisition_round == config.reference_acquisition_round
+        or decisions[(item.cohort, item.cell_id, item.acquisition_round)] == "accept"
+    )
+
+
+def _nuclear_inventory_payload(
+    config,
+    cells,
+    dapi_paths: dict[tuple[str, str, int], Path] | None = None,
+) -> dict[str, object]:
+    """Build complete DAPI component evidence without opening a target channel."""
+    from cyclic_stability.images import load_volume
+    from cyclic_stability.nuclear import (
+        adjudicate_nuclear_components,
+        realize_nuclear_surfaces,
+    )
+
     minimum_count, maximum_count = config.nuclear.accepted_component_count
-    inventory_config = replace(config.nuclear, accepted_component_count=(0, 2**16 - 1))
     rows: list[dict[str, object]] = []
     for cell in sorted(cells, key=lambda value: (value.cohort, value.cell_id)):
-        missing = [
-            item.acquisition_round
-            for item in cell.rounds
-            if item.acquisition_round != config.reference_acquisition_round
-            and (item.cohort, item.cell_id, item.acquisition_round) not in decisions
-        ]
-        if missing:
-            raise ValueError(
-                f"target-blind QC decisions are missing for moving rounds: {missing}"
-            )
-        accepted_rounds = tuple(
-            item
-            for item in sorted(cell.rounds, key=lambda value: value.acquisition_round)
-            if item.acquisition_round == config.reference_acquisition_round
-            or decisions[(item.cohort, item.cell_id, item.acquisition_round)]
-            == "accept"
-        )
+        accepted_rounds = _inventory_rounds(config, cell)
         dapi = {
-            item.acquisition_round: load_volume(_validated_registered_dapi(item))
+            item.acquisition_round: load_volume(
+                (
+                    dapi_paths[(item.cohort, item.cell_id, item.acquisition_round)]
+                    if dapi_paths is not None
+                    else _validated_registered_dapi(item)
+                )
+            )
             for item in accepted_rounds
         }
-        consensus = consensus_nuclear_surface(
+        adjudication = adjudicate_nuclear_components(
             dapi,
             config.voxel_spacing_xyz_um,
-            inventory_config,
+            config.nuclear,
             config.nominal_expansion_factor,
         )
-        components = tuple(asdict(item) for item in consensus.component_qc)
+        components = tuple(asdict(item) for item in adjudication.component_qc)
         accepted_ids = [
             str(item["nucleus_id"]) for item in components if item["accepted"] is True
         ]
         accepted_count = len(accepted_ids)
+        count_within_contract = minimum_count <= accepted_count <= maximum_count
+        try:
+            realize_nuclear_surfaces(adjudication, config.nuclear)
+        except Exception as error:  # noqa: BLE001 - inventory records strict failure
+            surface_realization = {
+                "error_type": type(error).__name__,
+                "message": str(error),
+                "status": "failed",
+            }
+        else:
+            surface_realization = {"status": "complete"}
         rows.append(
             {
                 "accepted_count": accepted_count,
@@ -182,15 +209,16 @@ def _nuclear_inventory_payload(config, cells) -> dict[str, object]:
                 "cohort": cell.cohort,
                 "components": list(components),
                 "field_id": f"{cell.cohort}/{cell.cell_id}",
-                "within_accepted_component_contract": (
-                    minimum_count <= accepted_count <= maximum_count
-                ),
+                "surface_realization": surface_realization,
+                "within_accepted_component_contract": count_within_contract,
             }
         )
     return {
         "accepted_component_count_range": [minimum_count, maximum_count],
         "all_fields_within_contract": all(
-            bool(item["within_accepted_component_contract"]) for item in rows
+            bool(item["within_accepted_component_contract"])
+            and item["surface_realization"] == {"status": "complete"}
+            for item in rows
         ),
         "cells": rows,
     }
@@ -246,8 +274,10 @@ def main(argv: list[str] | None = None) -> int:
     from cyclic_stability.config import load_analysis_config, load_execution_profile
     from cyclic_stability.runner import initialize_run, run_tasks
     from cyclic_stability.task import (
+        ArtifactTask,
         build_tasks,
         configure_native_threads,
+        run_artifact_task,
         run_cell_task,
     )
     from cyexm.registration.artifacts import FileIdentity
@@ -289,6 +319,15 @@ def main(argv: list[str] | None = None) -> int:
                 "--nuclear-inventory-only cannot be combined with pilot, task-index, "
                 "or force selection"
             )
+        inventory_cells = tuple(
+            cell
+            for cell in config.cells
+            if (not cohorts or cell.cohort in cohorts)
+            and (selected is None or cell == selected)
+        )
+        if not inventory_cells:
+            print("unavailable: no cells selected for nuclear inventory")
+            return 1
         if args.run_dir is not None:
             run_dir = args.run_dir
             results_root = None
@@ -306,17 +345,57 @@ def main(argv: list[str] | None = None) -> int:
             config_digest=config.config_digest,
             results_root=results_root,
         )
-        inventory_cells = tuple(
-            cell
-            for cell in config.cells
-            if (not cohorts or cell.cohort in cohorts)
-            and (selected is None or cell == selected)
+        dapi_paths = {
+            (round_spec.cohort, round_spec.cell_id, round_spec.acquisition_round): (
+                _validated_registered_dapi(round_spec)
+            )
+            for cell in inventory_cells
+            for round_spec in _inventory_rounds(config, cell)
+        }
+        input_identities = tuple(
+            FileIdentity.from_path(path)
+            for path in (
+                args.analysis_config,
+                args.correspondence,
+                args.qc_decisions,
+                args.execution_profile,
+                *(dapi_paths[key] for key in sorted(dapi_paths)),
+            )
         )
-        payload = _nuclear_inventory_payload(config, inventory_cells)
-        path = run_dir / "nuclear-inventory.json"
-        _write_pretty_json(path, payload)
+
+        def publish_inventory(attempt_dir: Path) -> tuple[Path, ...]:
+            payload = _nuclear_inventory_payload(config, inventory_cells, dapi_paths)
+            path = attempt_dir / "nuclear-inventory.json"
+            _write_pretty_json(path, payload)
+            return (path,)
+
+        record = run_artifact_task(
+            ArtifactTask(
+                key="nuclear-inventory",
+                config_digest=config.config_digest,
+                input_identities=input_identities,
+                software_identity=_software_identity(),
+                producer=publish_inventory,
+                native_threads=profile.native_threads,
+                scratch_root=getattr(profile, "scratch_root", None),
+            ),
+            run_dir,
+        )
+        if record.status != "complete":
+            print(f"failed target-blind nuclear inventory: {record.attempt_dir}")
+            return 1
+        inventory_outputs = [
+            Path(identity.path)
+            for identity in record.output_identities
+            if Path(identity.path).name == "nuclear-inventory.json"
+        ]
+        if len(inventory_outputs) != 1:
+            raise ValueError("complete nuclear inventory lacks one exact JSON output")
+        path = inventory_outputs[0]
+        payload = json.loads(path.read_text(encoding="utf-8"))
         print(
-            f"wrote target-blind nuclear inventory for {len(inventory_cells)} cells: {path}"
+            f"{'reused' if record.reused else 'wrote'} target-blind nuclear inventory "
+            f"for {len(inventory_cells)} cells: {path}"
         )
         return 0 if payload["all_fields_within_contract"] is True else 1
     tasks = build_tasks(

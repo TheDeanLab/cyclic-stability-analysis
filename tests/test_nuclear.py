@@ -82,6 +82,31 @@ def test_consensus_rejects_seven_valid_nuclear_components() -> None:
         )
 
 
+def test_component_adjudication_survives_strict_surface_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving normal realization back into adjudication would hide valid QC."""
+    dapi = separated_nuclei(1, SPACING)
+
+    def fail_normals(*_args):
+        raise ValueError("synthetic strict-normal failure")
+
+    monkeypatch.setattr(nuclear, "_surface_normals_and_curvature", fail_normals)
+    adjudication = nuclear.adjudicate_nuclear_components(
+        {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=4.5
+    )
+
+    assert len(adjudication.component_qc) == 1
+    assert adjudication.component_qc[0].accepted is True
+    assert adjudication.component_qc[0].nucleus_id == "N001"
+    with pytest.raises(ValueError, match="synthetic strict-normal failure"):
+        nuclear.realize_nuclear_surfaces(adjudication, NUCLEAR_CONFIG)
+    with pytest.raises(ValueError, match="synthetic strict-normal failure"):
+        consensus_nuclear_surface(
+            {2: dapi}, SPACING, NUCLEAR_CONFIG, nominal_expansion_factor=4.5
+        )
+
+
 @pytest.mark.parametrize(
     ("centers", "radii", "shape", "config", "reason"),
     (

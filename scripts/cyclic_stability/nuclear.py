@@ -112,6 +112,36 @@ class _NuclearCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class NuclearComponentAdjudication:
+    """Target-blind component evidence before strict surface realization.
+
+    Parameters
+    ----------
+    component_qc : tuple[NuclearComponentQc, ...]
+        Exact candidate rows ordered by physical XYZ centroid. Accepted rows use
+        stable ``N###`` identifiers; rejected rows retain candidate ``C###``
+        identifiers.
+    spacing_xyz_um : tuple[float, float, float]
+        Physical voxel spacing in public ``(x, y, z)`` micrometers.
+    nominal_expansion_factor : float
+        Linear expansion factor used for nominal-volume conversion.
+
+    Notes
+    -----
+    This value deliberately does not claim that accepted candidates have usable
+    normals or curvature. Pass it to :func:`realize_nuclear_surfaces` to enforce
+    the normal scientific surface contract without repeating segmentation.
+    """
+
+    component_qc: tuple[NuclearComponentQc, ...]
+    spacing_xyz_um: tuple[float, float, float]
+    nominal_expansion_factor: float
+    _candidates: tuple[_NuclearCandidate, ...]
+    _full_shape_zyx: tuple[int, int, int]
+    _config: NuclearConfig
+
+
+@dataclass(frozen=True, slots=True)
 class LaminProfileRow:
     """One surface-vertex normal profile and its round-level support summaries."""
 
@@ -318,18 +348,39 @@ def _surface_normals_and_curvature(
     return normals, centroid, curvature
 
 
-def consensus_nuclear_surface(
+def adjudicate_nuclear_components(
     dapi_rounds: Mapping[int, NDArray[np.generic]],
     spacing_xyz_um: tuple[float, float, float],
     config: NuclearConfig,
     nominal_expansion_factor: float,
-) -> NuclearConsensus:
-    """Construct a target-independent, component-aware median DAPI consensus.
+) -> NuclearComponentAdjudication:
+    """Adjudicate target-independent median-DAPI components without normals.
 
-    ``dapi_rounds`` must already contain only the acquisition rounds admitted by
-    recorded target-blind QC.  Acquisition round 2 is required even when no
-    moving round was accepted, preventing a consensus without the biological
-    reference image.
+    Parameters
+    ----------
+    dapi_rounds : Mapping[int, numpy.ndarray]
+        Registered DAPI volumes keyed by acquisition round. The mapping must
+        already contain only rounds admitted by recorded target-blind QC and
+        must include biological reference round 2. Arrays use ``(z, y, x)``.
+    spacing_xyz_um : tuple[float, float, float]
+        Physical voxel spacing in public ``(x, y, z)`` micrometers.
+    config : NuclearConfig
+        Frozen segmentation and physical component-adjudication policy.
+    nominal_expansion_factor : float
+        Positive linear expansion factor for nominal-volume conversion.
+
+    Returns
+    -------
+    NuclearComponentAdjudication
+        Exact candidate QC plus bounded geometry that can subsequently undergo
+        strict surface realization without repeating segmentation.
+
+    Raises
+    ------
+    ValueError
+        If inputs, spacing, configuration, or reference-round geometry are
+        invalid. Component-count and surface-normal failures are intentionally
+        deferred to :func:`realize_nuclear_surfaces`.
     """
     spacing = _spacing(spacing_xyz_um)
     _validate_config(config)
@@ -432,6 +483,66 @@ def consensus_nuclear_surface(
         del component_mask, faces, vertices
 
     candidates.sort(key=lambda item: item.centroid_xyz_um)
+    component_qc: list[NuclearComponentQc] = []
+    accepted_index = 0
+    for candidate_index, candidate in enumerate(candidates, start=1):
+        if candidate.accepted:
+            accepted_index += 1
+            nucleus_id = f"N{accepted_index:03d}"
+        else:
+            nucleus_id = f"C{candidate_index:03d}"
+        component_qc.append(
+            NuclearComponentQc(
+                nucleus_id,
+                candidate.accepted,
+                candidate.rejection_reasons,
+                candidate.expanded_volume_um3,
+                candidate.nominal_volume_um3,
+                candidate.sphericity,
+                candidate.centroid_xyz_um,
+                candidate.face_contact_fractions,
+            )
+        )
+    del candidate_labels, component_regions
+    return NuclearComponentAdjudication(
+        tuple(component_qc),
+        spacing,
+        expansion,
+        tuple(candidates),
+        full_shape_zyx,
+        config,
+    )
+
+
+def realize_nuclear_surfaces(
+    adjudication: NuclearComponentAdjudication,
+    config: NuclearConfig,
+) -> NuclearConsensus:
+    """Realize strict surfaces and normals from target-blind component evidence.
+
+    Parameters
+    ----------
+    adjudication : NuclearComponentAdjudication
+        Component evidence returned by :func:`adjudicate_nuclear_components`.
+    config : NuclearConfig
+        The exact configuration used for adjudication.
+
+    Returns
+    -------
+    NuclearConsensus
+        Immutable accepted surfaces, labels, union mask, and component QC.
+
+    Raises
+    ------
+    ValueError
+        If configuration changed, accepted count is outside its configured
+        range, or any accepted component cannot satisfy strict surface-normal or
+        curvature realization.
+    """
+    if config != adjudication._config:
+        raise ValueError("surface realization requires the adjudication configuration")
+    candidates = adjudication._candidates
+    component_qc = adjudication.component_qc
     accepted_count = sum(item.accepted for item in candidates)
     minimum_count, maximum_count = config.accepted_component_count
     if not minimum_count <= accepted_count <= maximum_count:
@@ -453,67 +564,54 @@ def consensus_nuclear_surface(
             f"[{minimum_count}, {maximum_count}]{reason_suffix}"
         )
 
-    del candidate_labels, component_regions
+    spacing = adjudication.spacing_xyz_um
+    sx, sy, sz = spacing
+    full_shape_zyx = adjudication._full_shape_zyx
     accepted_labels = np.zeros(full_shape_zyx, dtype=np.uint16)
     nuclei: list[NuclearSurface] = []
-    component_qc: list[NuclearComponentQc] = []
     accepted_index = 0
-    for candidate_index, candidate in enumerate(candidates, start=1):
-        if candidate.accepted:
-            accepted_index += 1
-            nucleus_id = f"N{accepted_index:03d}"
-            geometry = candidate.accepted_geometry
-            if geometry is None:
-                raise RuntimeError("accepted DAPI component has no bounded geometry")
-            normals, local_centroid, curvature = _surface_normals_and_curvature(
-                geometry.mask_zyx, geometry.vertices_xyz_um, spacing
+    for candidate, qc in zip(candidates, component_qc, strict=True):
+        if not candidate.accepted:
+            continue
+        accepted_index += 1
+        geometry = candidate.accepted_geometry
+        if geometry is None:
+            raise RuntimeError("accepted DAPI component has no bounded geometry")
+        normals, local_centroid, curvature = _surface_normals_and_curvature(
+            geometry.mask_zyx, geometry.vertices_xyz_um, spacing
+        )
+        z_region, y_region, x_region = geometry.region_zyx
+        origin_xyz_um = np.array(
+            (
+                int(x_region.start) * sx,
+                int(y_region.start) * sy,
+                int(z_region.start) * sz,
             )
-            z_region, y_region, x_region = geometry.region_zyx
-            origin_xyz_um = np.array(
-                (
-                    int(x_region.start) * sx,
-                    int(y_region.start) * sy,
-                    int(z_region.start) * sz,
-                )
-            )
-            vertices = geometry.vertices_xyz_um + origin_xyz_um
-            centroid = local_centroid + origin_xyz_um
-            component_mask = np.zeros(full_shape_zyx, dtype=bool)
-            component_mask[geometry.region_zyx] = geometry.mask_zyx
-            for array in (
+        )
+        vertices = geometry.vertices_xyz_um + origin_xyz_um
+        centroid = local_centroid + origin_xyz_um
+        component_mask = np.zeros(full_shape_zyx, dtype=bool)
+        component_mask[geometry.region_zyx] = geometry.mask_zyx
+        for array in (
+            component_mask,
+            vertices,
+            geometry.faces,
+            normals,
+            centroid,
+            curvature,
+        ):
+            array.setflags(write=False)
+        accepted_labels[component_mask] = accepted_index
+        nuclei.append(
+            NuclearSurface(
+                qc.nucleus_id,
                 component_mask,
                 vertices,
                 geometry.faces,
                 normals,
                 centroid,
                 curvature,
-            ):
-                array.setflags(write=False)
-            accepted_labels[component_mask] = accepted_index
-            nuclei.append(
-                NuclearSurface(
-                    nucleus_id,
-                    component_mask,
-                    vertices,
-                    geometry.faces,
-                    normals,
-                    centroid,
-                    curvature,
-                    spacing,
-                )
-            )
-        else:
-            nucleus_id = f"C{candidate_index:03d}"
-        component_qc.append(
-            NuclearComponentQc(
-                nucleus_id,
-                candidate.accepted,
-                candidate.rejection_reasons,
-                candidate.expanded_volume_um3,
-                candidate.nominal_volume_um3,
-                candidate.sphericity,
-                candidate.centroid_xyz_um,
-                candidate.face_contact_fractions,
+                spacing,
             )
         )
     union_mask = accepted_labels > 0
@@ -523,10 +621,23 @@ def consensus_nuclear_surface(
         tuple(nuclei),
         union_mask,
         accepted_labels,
-        tuple(component_qc),
+        component_qc,
         spacing,
-        expansion,
+        adjudication.nominal_expansion_factor,
     )
+
+
+def consensus_nuclear_surface(
+    dapi_rounds: Mapping[int, NDArray[np.generic]],
+    spacing_xyz_um: tuple[float, float, float],
+    config: NuclearConfig,
+    nominal_expansion_factor: float,
+) -> NuclearConsensus:
+    """Construct a strict target-independent component-aware DAPI consensus."""
+    adjudication = adjudicate_nuclear_components(
+        dapi_rounds, spacing_xyz_um, config, nominal_expansion_factor
+    )
+    return realize_nuclear_surfaces(adjudication, config)
 
 
 def _profile_offsets(config: NuclearConfig) -> NDArray[np.float64]:
@@ -1570,10 +1681,13 @@ def analyze_lamin_cell(
 
 __all__ = [
     "LaminProfileRow",
+    "NuclearComponentAdjudication",
     "NuclearComponentQc",
     "NuclearConsensus",
     "NuclearSurface",
     "analyze_lamin_cell",
+    "adjudicate_nuclear_components",
     "consensus_nuclear_surface",
     "lamin_normal_profiles",
+    "realize_nuclear_surfaces",
 ]

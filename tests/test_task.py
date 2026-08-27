@@ -9,6 +9,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 import pytest
+from cyclic_stability import task as task_module
 from cyclic_stability.models import MarkerResult, QcDecision
 from cyclic_stability.nuclear import NuclearComponentQc
 from cyclic_stability.signal import SignalRow
@@ -21,6 +22,7 @@ from cyclic_stability.task import (
     run_cell_task,
 )
 from synthetic import cell_task, different_identity
+from cyexm.registration.artifacts import FileIdentity
 
 
 def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
@@ -141,6 +143,93 @@ def test_completed_task_is_reused_only_for_matching_inputs(tmp_path: Path) -> No
     third = run_cell_task(changed, tmp_path)
     assert third.attempt_id != first.attempt_id
     assert third.reused is False
+
+
+def test_artifact_task_changed_input_or_repository_preserves_prior_evidence(
+    tmp_path: Path,
+) -> None:
+    """Reusing or overwriting an old attempt would erase its provenance."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi-v1")
+
+    def publish(output_dir: Path) -> tuple[Path, ...]:
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text('{\n    "status": "complete"\n}\n', encoding="utf-8")
+        return (output,)
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(FileIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=publish,
+    )
+    first = task_module.run_artifact_task(task, tmp_path / "run")
+    reopened = task_module.run_artifact_task(task, tmp_path / "run")
+    assert reopened.attempt_id == first.attempt_id
+    assert reopened.reused is True
+
+    source.write_bytes(b"dapi-v2")
+    changed_input = replace(task, input_identities=(FileIdentity.from_path(source),))
+    second = task_module.run_artifact_task(changed_input, tmp_path / "run")
+    changed_repository = replace(changed_input, software_identity="repository-v2")
+    third = task_module.run_artifact_task(changed_repository, tmp_path / "run")
+
+    assert len({first.attempt_id, second.attempt_id, third.attempt_id}) == 3
+    assert first.attempt_dir.is_dir()
+    assert (first.attempt_dir / "nuclear-inventory.json").is_file()
+    pointer = json.loads(
+        (tmp_path / "run" / "tasks" / task.key / "complete.json").read_text()
+    )
+    assert pointer["attempt_id"] == third.attempt_id
+    assert (third.attempt_dir / "record.json").is_file()
+    manifest = json.loads(
+        (third.attempt_dir / "output-manifest.json").read_text(encoding="utf-8")
+    )
+    assert [item["relative"] for item in manifest["outputs"]] == [
+        "nuclear-inventory.json"
+    ]
+    Path(third.output_identities[0].path).write_text(
+        '{"status":"tampered"}\n', encoding="utf-8"
+    )
+    after_tamper = task_module.run_artifact_task(changed_repository, tmp_path / "run")
+    assert after_tamper.attempt_id != third.attempt_id
+    assert after_tamper.reused is False
+
+
+def test_artifact_task_failure_has_record_without_completion_pointer(
+    tmp_path: Path,
+) -> None:
+    """Publishing complete.json for a failed producer would authorize bad reuse."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi")
+
+    def fail(_output_dir: Path) -> tuple[Path, ...]:
+        raise ValueError("synthetic inventory failure")
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(FileIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=fail,
+    )
+    record = task_module.run_artifact_task(task, tmp_path / "run")
+
+    assert record.status == "failed"
+    failure = json.loads(
+        (record.attempt_dir / "failure.json").read_text(encoding="utf-8")
+    )
+    assert failure["error_type"] == "ValueError"
+    assert failure["message"] == "synthetic inventory failure"
+    assert failure["attempt_id"] == record.attempt_id
+    assert failure["key"] == task.key
+    assert failure["config_digest"] == task.config_digest
+    assert failure["input_identities"] == [
+        dict(item.to_dict()) for item in task.input_identities
+    ]
+    assert failure["software_identity"] == task.software_identity
+    assert not (tmp_path / "run" / "tasks" / task.key / "complete.json").exists()
 
 
 def test_changed_input_identity_invalidates_task_reuse(tmp_path: Path) -> None:

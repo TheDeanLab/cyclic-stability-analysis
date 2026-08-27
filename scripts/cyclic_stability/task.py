@@ -51,6 +51,43 @@ class TaskOutput:
 
 
 TaskAnalyzer = Callable[["CellTask", Path], TaskOutput]
+ArtifactProducer = Callable[[Path], tuple[Path, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactTask:
+    """One immutable file-producing task using the shared attempt store.
+
+    Parameters
+    ----------
+    key : str
+        Stable path-safe task identity within a run.
+    config_digest : str
+        Exact frozen scientific configuration digest.
+    input_identities : tuple[FileIdentity, ...]
+        Every immutable input consumed by ``producer``.
+    software_identity : str
+        Frozen software and repository identity used to authorize reuse.
+    producer : Callable[[Path], tuple[Path, ...]]
+        Function that writes outputs below its unique attempt directory and
+        returns every primary output path. The shared store reopens all files,
+        records their identities, and publishes completion atomically.
+    native_threads : int, default=1
+        Native thread policy applied before production.
+    force : bool, default=False
+        If true, bypass an otherwise reusable complete attempt.
+    scratch_root : Path or None, default=None
+        Optional external scratch root, owned per task attempt.
+    """
+
+    key: str
+    config_digest: str
+    input_identities: tuple[FileIdentity, ...]
+    software_identity: str
+    producer: ArtifactProducer
+    native_threads: int = 1
+    force: bool = False
+    scratch_root: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,7 +276,7 @@ def _current_identities_match(values: tuple[FileIdentity, ...]) -> bool:
         return False
 
 
-def _read_reusable(task: CellTask, complete: Path) -> TaskRecord | None:
+def _read_reusable(task: CellTask | ArtifactTask, complete: Path) -> TaskRecord | None:
     try:
         pointer = json.loads(complete.read_text(encoding="utf-8"))
         if set(pointer) != {
@@ -521,10 +558,10 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     )
 
 
-def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
-    """Run one immutable attempt or return an exactly matching complete attempt."""
-    configure_native_threads(task.native_threads)
-    task = _preflight_task(task)
+def _task_directory(task: CellTask | ArtifactTask, run_dir: Path) -> Path:
+    """Return one validated task directory in the shared immutable store."""
+    if not _SAFE_COMPONENT.fullmatch(task.key):
+        raise ValueError("task key must be a path-safe component")
     run_root = run_dir.resolve()
     tasks_root = run_root / "tasks"
     tasks_root.mkdir(parents=True, exist_ok=True)
@@ -540,12 +577,48 @@ def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
     ):
         raise ValueError("attempts directory must be a real nonsymlink directory")
     attempts_root.mkdir(exist_ok=True)
+    return task_dir
+
+
+def _produce_cell_outputs(task: CellTask, attempt_dir: Path) -> tuple[Path, ...]:
+    """Serialize one marker analyzer result inside its unique attempt."""
+    output = task.analyzer(task, attempt_dir)
+    table_paths: list[Path] = []
+    for name, rows in sorted(output.tables.items()):
+        if not _SAFE_COMPONENT.fullmatch(name):
+            raise ValueError("table names must be path-safe")
+        path = attempt_dir / f"{name}.csv"
+        _csv_table(path, rows)
+        table_paths.append(path)
+    return tuple(table_paths) + tuple(output.diagnostics)
+
+
+def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
+    """Run one immutable cell attempt or reuse an exactly matching completion."""
+    configure_native_threads(task.native_threads)
+    task = _preflight_task(task)
+    task_dir = _task_directory(task, run_dir)
     with (task_dir / ".task.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return _run_cell_task_locked(task, task_dir)
+        return _run_task_locked(
+            task, task_dir, lambda attempt: _produce_cell_outputs(task, attempt)
+        )
 
 
-def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
+def run_artifact_task(task: ArtifactTask, run_dir: Path) -> TaskRecord:
+    """Run or exactly reuse one generic immutable file-producing attempt."""
+    configure_native_threads(task.native_threads)
+    task_dir = _task_directory(task, run_dir)
+    with (task_dir / ".task.lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _run_task_locked(task, task_dir, task.producer)
+
+
+def _run_task_locked(
+    task: CellTask | ArtifactTask,
+    task_dir: Path,
+    producer: ArtifactProducer,
+) -> TaskRecord:
     """Execute under the kernel lock that serializes reuse and publication."""
     reusable = None if task.force else _read_reusable(task, task_dir / "complete.json")
     if reusable is not None:
@@ -576,20 +649,13 @@ def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
         os.environ[name] = str(scratch_dir)
     sampler.start()
     try:
-        _qc_gate(task)
+        if isinstance(task, CellTask):
+            _qc_gate(task)
         if not _current_identities_match(task.input_identities):
             raise ValueError(
                 "one or more immutable task inputs changed before execution"
             )
-        output = task.analyzer(task, attempt_dir)
-        table_paths: list[Path] = []
-        for name, rows in sorted(output.tables.items()):
-            if not _SAFE_COMPONENT.fullmatch(name):
-                raise ValueError("table names must be path-safe")
-            path = attempt_dir / f"{name}.csv"
-            _csv_table(path, rows)
-            table_paths.append(path)
-        output_paths = tuple(table_paths) + tuple(output.diagnostics)
+        output_paths = producer(attempt_dir)
         if not output_paths or not all(
             path.is_file()
             and not path.is_symlink()
@@ -666,8 +732,13 @@ def _run_cell_task_locked(task: CellTask, task_dir: Path) -> TaskRecord:
         after = process.io_counters()
         peak = max(samples["rss"], process.memory_info().rss)
         failure = {
+            "attempt_id": attempt_id,
+            "config_digest": task.config_digest,
             "error_type": type(error).__name__,
+            "input_identities": _identity_payload(task.input_identities),
+            "key": task.key,
             "message": str(error),
+            "software_identity": task.software_identity,
             "traceback": traceback.format_exc(),
             "started_at": started,
             "failed_at": time.time(),
@@ -739,6 +810,7 @@ def build_tasks(
 
 
 __all__ = [
+    "ArtifactTask",
     "CYEXM_PIN",
     "CellTask",
     "TaskOutput",
@@ -746,5 +818,6 @@ __all__ = [
     "build_tasks",
     "configure_native_threads",
     "default_marker_analyzer",
+    "run_artifact_task",
     "run_cell_task",
 ]
