@@ -202,7 +202,10 @@ def _summarize_measurements(
     )
     if selected.shape != measurements.displacement.shape or not selected.any():
         raise ValueError("summary mask must select at least one ZYX voxel")
-    values = lambda array: array[selected]
+
+    def values(array: NDArray[np.float64]) -> NDArray[np.float64]:
+        return array[selected]
+
     nonpositive = int(np.count_nonzero(values(measurements.jacobian) <= 0.0))
     flags = ("nonpositive-jacobian",) if nonpositive else ()
     return WarpSummary(
