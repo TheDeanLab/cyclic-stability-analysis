@@ -281,7 +281,6 @@ def main(argv: list[str] | None = None) -> int:
         run_artifact_task,
         run_cell_task,
     )
-    from cyexm.registration.artifacts import FileIdentity
 
     config = load_analysis_config(
         args.analysis_config, args.correspondence, args.qc_decisions
@@ -405,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         cells=(selected,) if selected is not None else None,
     )
     run_input_identities = tuple(
-        FileIdentity.from_path(path)
+        ContentIdentity.from_path(path)
         for path in (
             args.analysis_config,
             args.correspondence,

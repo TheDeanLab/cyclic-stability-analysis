@@ -110,9 +110,6 @@ class ContentIdentity:
         }
 
 
-TaskFileIdentity = FileIdentity | ContentIdentity
-
-
 @dataclass(frozen=True, slots=True)
 class TaskOutput:
     """Compact per-cell tables and paths produced by one analyzer."""
@@ -166,7 +163,7 @@ class PreflightSnapshot:
     """Picklable validated source/provenance state consumed by one task attempt."""
 
     rounds: tuple[object, ...]
-    input_identities: tuple[FileIdentity, ...]
+    input_identities: tuple[ContentIdentity, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,7 +173,7 @@ class CellTask:
     cell: CellSpec
     config: AnalysisConfig | None
     config_digest: str
-    input_identities: tuple[FileIdentity, ...]
+    input_identities: tuple[ContentIdentity, ...]
     analyzer: TaskAnalyzer
     software_identity: str = CYEXM_PIN
     native_threads: int = 1
@@ -202,9 +199,9 @@ class TaskRecord:
     attempt_id: str
     attempt_dir: Path
     config_digest: str
-    input_identities: tuple[TaskFileIdentity, ...]
+    input_identities: tuple[ContentIdentity, ...]
     software_identity: str
-    output_identities: tuple[TaskFileIdentity, ...]
+    output_identities: tuple[ContentIdentity, ...]
     status: Literal["complete", "failed"]
     started_at: float
     completed_at: float
@@ -244,28 +241,41 @@ def _atomic_bytes(path: Path, payload: bytes) -> None:
         os.close(directory)
 
 
+def _fsync_directory(path: Path) -> None:
+    """Durably publish a directory-entry change."""
+    directory = os.open(path, os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _remove_pointer(path: Path) -> None:
+    """Remove one pointer without following it and fsync the owning directory."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(path.parent)
+
+
 def _json_bytes(payload: Mapping[str, object]) -> bytes:
     return (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
 def _identity_payload(
-    values: tuple[TaskFileIdentity, ...],
+    values: tuple[ContentIdentity, ...],
 ) -> list[dict[str, object]]:
     return [dict(value.to_dict()) for value in values]
 
 
-def _identity_values(value: object) -> tuple[TaskFileIdentity, ...]:
+def _identity_values(value: object) -> tuple[ContentIdentity, ...]:
     if not isinstance(value, list):
         raise TypeError("identities must be a list")
     if not all(isinstance(item, Mapping) for item in value):
         raise TypeError("task identities must be mappings")
     return tuple(
-        (
-            ContentIdentity.from_dict(item, name="task content identity")
-            if "sha256" in item
-            else FileIdentity.from_dict(item, name="task identity")
-        )
-        for item in value
+        ContentIdentity.from_dict(item, name="task content identity") for item in value
     )
 
 
@@ -347,16 +357,10 @@ def _record_from_payload(payload: Mapping[str, object]) -> TaskRecord:
     )
 
 
-def _current_identities_match(values: tuple[TaskFileIdentity, ...]) -> bool:
+def _current_identities_match(values: tuple[ContentIdentity, ...]) -> bool:
     try:
         return all(
-            (
-                ContentIdentity.from_path(Path(value.path))
-                if isinstance(value, ContentIdentity)
-                else FileIdentity.from_path(Path(value.path))
-            )
-            == value
-            for value in values
+            ContentIdentity.from_path(Path(value.path)) == value for value in values
         )
     except (OSError, ValueError):
         return False
@@ -414,7 +418,7 @@ def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if set(manifest) != {"outputs"} or not isinstance(manifest["outputs"], list):
             return None
-        expected: list[TaskFileIdentity] = []
+        expected: list[ContentIdentity] = []
         expected_relative: set[str] = set()
         for entry in manifest["outputs"]:
             if not isinstance(entry, Mapping) or set(entry) != {"relative", "identity"}:
@@ -433,13 +437,7 @@ def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord 
             identity_payload = entry["identity"]
             if not isinstance(identity_payload, Mapping):
                 return None
-            expected.append(
-                (
-                    ContentIdentity.from_dict(identity_payload)
-                    if "sha256" in identity_payload
-                    else FileIdentity.from_dict(identity_payload)
-                )
-            )
+            expected.append(ContentIdentity.from_dict(identity_payload))
         actual_relative = {
             path.relative_to(attempt_dir).as_posix()
             for path in attempt_dir.rglob("*")
@@ -464,19 +462,6 @@ def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord 
         or record.input_identities != task.input_identities
         or record.attempt_dir.resolve(strict=True) != attempt_dir
         or not record.output_identities
-        or (
-            isinstance(task, ArtifactTask)
-            and (
-                not all(
-                    isinstance(identity, ContentIdentity)
-                    for identity in record.input_identities
-                )
-                or not all(
-                    isinstance(identity, ContentIdentity)
-                    for identity in record.output_identities
-                )
-            )
-        )
         or any(
             path.is_symlink()
             or not stat.S_ISREG(path.stat().st_mode)
@@ -578,14 +563,15 @@ def _preflight_task(task: CellTask) -> CellTask:
     from cyclic_stability.provenance import channel_tiff_paths
 
     report = validate_cell_inputs(task.cell)
-    identities: list[FileIdentity] = []
+    identities: list[ContentIdentity] = []
     for round_spec, artifacts in zip(task.cell.rounds, report.rounds, strict=True):
-        identities.append(FileIdentity.from_path(round_spec.nd2_path))
+        identities.append(ContentIdentity.from_path(round_spec.nd2_path))
         identities.extend(
-            FileIdentity.from_path(path) for _, path in channel_tiff_paths(round_spec)
+            ContentIdentity.from_path(path)
+            for _, path in channel_tiff_paths(round_spec)
         )
         identities.extend(
-            FileIdentity.from_path(path)
+            ContentIdentity.from_path(path)
             for path in (
                 artifacts.registered_dapi,
                 artifacts.registered_tubulin,
@@ -720,6 +706,10 @@ def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
     """Run one immutable cell attempt or reuse an exactly matching completion."""
     configure_native_threads(task.native_threads)
     task = _preflight_task(task)
+    if not task.input_identities or not all(
+        isinstance(identity, ContentIdentity) for identity in task.input_identities
+    ):
+        raise TypeError("cell task inputs require content-bound identities")
     task_dir = _task_directory(task, run_dir)
     with (task_dir / ".task.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -747,12 +737,20 @@ def _run_task_locked(
     producer: ArtifactProducer,
 ) -> TaskRecord:
     """Execute under the kernel lock that serializes reuse and publication."""
-    reusable = None if task.force else _read_reusable(task, task_dir / "terminal.json")
+    terminal_path = task_dir / "terminal.json"
+    _remove_pointer(task_dir / "complete.json")
+    reusable = None if task.force else _read_reusable(task, terminal_path)
     if reusable is not None:
         return reusable
+    _remove_pointer(terminal_path)
     attempt_id = uuid.uuid4().hex
     attempt_dir = task_dir / "attempts" / attempt_id
     attempt_dir.mkdir(parents=True, exist_ok=False)
+    _fsync_directory(attempt_dir.parent)
+    _atomic_bytes(
+        terminal_path,
+        _json_bytes({"status": "running", "attempt_id": attempt_id}),
+    )
     scratch_dir = (
         (task.scratch_root / task.key / attempt_id)
         if task.scratch_root is not None
@@ -815,11 +813,6 @@ def _run_task_locked(
         )
         for path in manifest_paths:
             _validate_output(path)
-        identity_factory = (
-            ContentIdentity.from_path
-            if isinstance(task, ArtifactTask)
-            else FileIdentity.from_path
-        )
         record = TaskRecord(
             task.key,
             attempt_id,
@@ -827,7 +820,7 @@ def _run_task_locked(
             task.config_digest,
             task.input_identities,
             task.software_identity,
-            tuple(identity_factory(path) for path in manifest_paths),
+            tuple(ContentIdentity.from_path(path) for path in manifest_paths),
             "complete",
             started,
             time.time(),
@@ -852,7 +845,7 @@ def _run_task_locked(
         record_path = attempt_dir / "record.json"
         _atomic_bytes(record_path, _json_bytes(_record_payload(record)))
         _atomic_bytes(
-            task_dir / "terminal.json",
+            terminal_path,
             _json_bytes(
                 {
                     "status": "complete",
@@ -887,7 +880,7 @@ def _run_task_locked(
         failure_path = attempt_dir / "failure.json"
         _atomic_bytes(failure_path, _json_bytes(failure))
         _atomic_bytes(
-            task_dir / "terminal.json",
+            terminal_path,
             _json_bytes(
                 {
                     "status": "failed",
@@ -943,21 +936,18 @@ def build_tasks(
         # The QC gate in ``run_cell_task`` remains ahead of every target load.
         from cyclic_stability.provenance import channel_tiff_paths
 
-        identities: list[FileIdentity] = []
         for round_spec in sorted(
             cell.rounds, key=lambda value: value.acquisition_round
         ):
-            identities.append(FileIdentity.from_path(round_spec.nd2_path))
-            identities.extend(
+            FileIdentity.from_path(round_spec.nd2_path)
+            for _, path in channel_tiff_paths(round_spec):
                 FileIdentity.from_path(path)
-                for _, path in channel_tiff_paths(round_spec)
-            )
         tasks.append(
             CellTask(
                 cell,
                 config,
                 config.config_digest,
-                tuple(identities),
+                (),
                 default_marker_analyzer,
             )
         )

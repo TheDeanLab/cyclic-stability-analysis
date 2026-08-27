@@ -402,6 +402,156 @@ def test_cleanup_failure_publishes_only_failed_terminal(
     assert not (tmp_path / "run" / "tasks" / task.key / "complete.json").exists()
 
 
+@pytest.mark.parametrize("publication_failure", ("failure-json", "failed-terminal"))
+def test_admitted_attempt_cannot_expose_prior_success_when_failure_publication_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publication_failure: str,
+) -> None:
+    """Failure-publication errors must leave running, never stale success, authoritative."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi-v1")
+
+    def publish(output_dir: Path) -> tuple[Path, ...]:
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text('{"value":"a"}\n', encoding="utf-8")
+        return (output,)
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(task_module.ContentIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=publish,
+    )
+    first = task_module.run_artifact_task(task, tmp_path / "run")
+
+    def fail(_output_dir: Path) -> tuple[Path, ...]:
+        raise ValueError("synthetic scientific failure")
+
+    original_atomic = task_module._atomic_bytes
+
+    def fail_publication(path: Path, payload: bytes) -> None:
+        if publication_failure == "failure-json" and path.name == "failure.json":
+            raise OSError("synthetic failure-json publication failure")
+        if path.name == "terminal.json":
+            status = json.loads(payload)["status"]
+            if publication_failure == "failed-terminal" and status == "failed":
+                raise OSError("synthetic failed-terminal publication failure")
+        original_atomic(path, payload)
+
+    monkeypatch.setattr(task_module, "_atomic_bytes", fail_publication)
+    changed = replace(task, config_digest="config-v2", producer=fail)
+    with pytest.raises(OSError, match="publication failure"):
+        task_module.run_artifact_task(changed, tmp_path / "run")
+
+    terminal = json.loads(
+        (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
+    )
+    assert terminal["status"] == "running"
+    assert terminal["attempt_id"] != first.attempt_id
+    assert (first.attempt_dir / "record.json").is_file()
+
+
+def test_terminal_authority_retires_coexisting_legacy_complete_pointer(
+    tmp_path: Path,
+) -> None:
+    """A legacy completion pointer must never coexist as alternate authority."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi-v1")
+
+    def publish(output_dir: Path) -> tuple[Path, ...]:
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text('{"value":"a"}\n', encoding="utf-8")
+        return (output,)
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(task_module.ContentIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=publish,
+    )
+    first = task_module.run_artifact_task(task, tmp_path / "run")
+    task_dir = tmp_path / "run" / "tasks" / task.key
+    legacy = task_dir / "complete.json"
+    legacy.write_text('{"attempt_id":"stale-legacy"}\n', encoding="utf-8")
+
+    reopened = task_module.run_artifact_task(task, tmp_path / "run")
+
+    assert reopened.reused is True
+    assert reopened.attempt_id == first.attempt_id
+    assert not legacy.exists()
+
+
+def test_cell_task_rejects_same_metadata_input_tampering(tmp_path: Path) -> None:
+    """Normal task inputs need exact content identity, not metadata equality."""
+    task = cell_task(tmp_path)
+    first = run_cell_task(task, tmp_path)
+    source = Path(task.input_identities[0].path)
+    original_mtime = source.stat().st_mtime_ns
+    payload = source.read_bytes()
+    replacement = (b"X" if payload[:1] != b"X" else b"Y") + payload[1:]
+    source.write_bytes(replacement)
+    os.utime(source, ns=(source.stat().st_atime_ns, original_mtime))
+
+    after_tamper = run_cell_task(task, tmp_path)
+
+    assert after_tamper.status == "failed"
+    assert after_tamper.attempt_id != first.attempt_id
+    terminal = json.loads((tmp_path / "tasks" / task.key / "terminal.json").read_text())
+    assert terminal["status"] == "failed"
+
+
+def test_cell_task_rejects_same_metadata_output_tampering(tmp_path: Path) -> None:
+    """Normal task output reopen must recompute exact content identity."""
+    task = cell_task(tmp_path)
+    first = run_cell_task(task, tmp_path)
+    output = next(
+        Path(identity.path)
+        for identity in first.output_identities
+        if Path(identity.path).name == "summary.csv"
+    )
+    original_mtime = output.stat().st_mtime_ns
+    payload = output.read_bytes()
+    tampered = payload.replace(b"synthetic", b"synthetix", 1)
+    assert len(tampered) == len(payload)
+    output.write_bytes(tampered)
+    os.utime(output, ns=(output.stat().st_atime_ns, original_mtime))
+
+    after_tamper = run_cell_task(task, tmp_path)
+
+    assert after_tamper.status == "complete"
+    assert after_tamper.reused is False
+    assert after_tamper.attempt_id != first.attempt_id
+
+
+def test_cell_task_rejects_metadata_only_legacy_record_schema(tmp_path: Path) -> None:
+    """Old metadata-only records must fail closed even with an updated root hash."""
+    task = cell_task(tmp_path)
+    first = run_cell_task(task, tmp_path)
+    record_path = first.attempt_dir / "record.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    for field in ("input_identities", "output_identities"):
+        for identity in record[field]:
+            identity.pop("sha256", None)
+    record_path.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    terminal_path = tmp_path / "tasks" / task.key / "terminal.json"
+    terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+    terminal["record_identity"] = task_module.ContentIdentity.from_path(
+        record_path
+    ).to_dict()
+    terminal_path.write_text(
+        json.dumps(terminal, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    reopened = run_cell_task(task, tmp_path)
+
+    assert reopened.status == "complete"
+    assert reopened.reused is False
+    assert reopened.attempt_id != first.attempt_id
+
+
 def test_changed_input_identity_invalidates_task_reuse(tmp_path: Path) -> None:
     task = cell_task(tmp_path)
     first = run_cell_task(task, tmp_path)

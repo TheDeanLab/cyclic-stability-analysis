@@ -16,9 +16,9 @@ from cyclic_stability.models import CellSpec, NuclearConfig, RoundSpec
 from cyclic_stability.review_inventory import build_review_manifest
 from cyclic_stability.review_models import CaseKey, ReviewManifest
 from cyclic_stability.review_store import ReviewStore
-from cyclic_stability.task import CellTask, TaskOutput
+from cyclic_stability.task import CellTask, ContentIdentity, TaskOutput
 from cyclic_stability.units import theoretical_resolution
-from cyexm.registration.artifacts import ArtifactStore, FileIdentity, StageRequest
+from cyexm.registration.artifacts import ArtifactStore, StageRequest
 from cyexm.spatial import ImageGeometry
 from numpy.typing import NDArray
 
@@ -251,7 +251,7 @@ def cell_task(tmp_path: Path, cell_id: str = "Cell1") -> CellTask:
     for round_number in range(1, 6):
         path = inputs / f"round-{round_number}.bin"
         path.write_bytes(f"{cell_id}-{round_number}".encode())
-        identities.append(FileIdentity.from_path(path))
+        identities.append(ContentIdentity.from_path(path))
     rounds = tuple(replace(item, cell_id=cell_id) for item in synthetic_round_specs())
     cell = CellSpec("golgi", cell_id, rounds)
     return CellTask(
@@ -281,9 +281,9 @@ def normalized_table_bytes(record) -> bytes:
     return record.compact_table.read_bytes()
 
 
-def different_identity() -> FileIdentity:
+def different_identity() -> ContentIdentity:
     """Return a valid immutable identity unlike a synthetic task input identity."""
-    return FileIdentity.from_path(Path(__file__))
+    return ContentIdentity.from_path(Path(__file__))
 
 
 ANALYSIS_YAML = """\
