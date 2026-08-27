@@ -29,7 +29,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 import psutil
 from cyexm.registration.artifacts import FileIdentity
@@ -45,6 +45,14 @@ _THREAD_ENVIRONMENT = (
     "VECLIB_MAXIMUM_THREADS",
     "NUMEXPR_NUM_THREADS",
     "BLIS_NUM_THREADS",
+)
+_STABLE_CONTENT_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_mode",
+    "st_size",
+    "st_mtime_ns",
+    "st_ctime_ns",
 )
 CYEXM_PIN = "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52"
 
@@ -144,6 +152,23 @@ class ContentIdentity:
         *,
         retain_bytes: bool,
     ) -> tuple[ContentIdentity, bytes | None]:
+        identity, payload, descriptor, _stable_stat = cls._open_from_parent_descriptor(
+            candidate,
+            parent_fd,
+            retain_bytes=retain_bytes,
+        )
+        os.close(descriptor)
+        return identity, payload
+
+    @classmethod
+    def _open_from_parent_descriptor(
+        cls,
+        candidate: Path,
+        parent_fd: int,
+        *,
+        retain_bytes: bool,
+    ) -> tuple[ContentIdentity, bytes | None, int, tuple[int, ...]]:
+        """Open and hash one stable entry, transferring its descriptor on success."""
         descriptor = os.open(
             candidate.name,
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -178,16 +203,9 @@ class ContentIdentity:
             entry_after = os.stat(
                 candidate.name, dir_fd=parent_fd, follow_symlinks=False
             )
-            stable_fields = (
-                "st_dev",
-                "st_ino",
-                "st_mode",
-                "st_size",
-                "st_mtime_ns",
-                "st_ctime_ns",
-            )
             if any(
-                getattr(before, name) != getattr(after, name) for name in stable_fields
+                getattr(before, name) != getattr(after, name)
+                for name in _STABLE_CONTENT_FIELDS
             ) or (after.st_dev, after.st_ino) != (
                 entry_after.st_dev,
                 entry_after.st_ino,
@@ -199,9 +217,16 @@ class ContentIdentity:
                 after.st_mtime_ns,
                 digest.hexdigest(),
             )
-            return identity, None if retained is None else b"".join(retained)
-        finally:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return (
+                identity,
+                None if retained is None else b"".join(retained),
+                descriptor,
+                tuple(int(getattr(after, name)) for name in _STABLE_CONTENT_FIELDS),
+            )
+        except BaseException:
             os.close(descriptor)
+            raise
 
     def matches_path(self) -> bool:
         """Return whether the same path still has this exact content identity."""
@@ -236,6 +261,104 @@ class ContentIdentity:
         }
 
 
+class RetainedContent:
+    """Owned no-follow descriptor for the exact bytes admitted to a producer.
+
+    The caller path is retained only in :attr:`identity` for provenance. Consumers
+    open :attr:`consumer_path`, a process-local descriptor path that cannot be
+    redirected by replacing the caller's directory entry. The task lifecycle owns
+    and closes instances transferred through :class:`ArtifactSnapshot`.
+    """
+
+    __slots__ = ("_descriptor", "_stable_stat", "identity")
+
+    def __init__(
+        self,
+        identity: ContentIdentity,
+        descriptor: int,
+        stable_stat: tuple[int, ...],
+    ) -> None:
+        self.identity = identity
+        self._descriptor = descriptor
+        self._stable_stat = stable_stat
+
+    @classmethod
+    def from_path(cls, path: Path) -> RetainedContent:
+        """Securely hash and retain one canonical regular-file descriptor."""
+        candidate = Path(path)
+        parent = candidate.parent if candidate.parent != Path("") else Path(".")
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            identity, _payload, descriptor, stable_stat = (
+                ContentIdentity._open_from_parent_descriptor(  # noqa: SLF001
+                    candidate,
+                    parent_fd,
+                    retain_bytes=False,
+                )
+            )
+        finally:
+            os.close(parent_fd)
+        return cls(identity, descriptor, stable_stat)
+
+    @property
+    def closed(self) -> bool:
+        """Return whether lifecycle ownership has closed the descriptor."""
+        return self._descriptor < 0
+
+    @property
+    def consumer_path(self) -> Path:
+        """Return the process-local path that reopens exactly this descriptor."""
+        if self.closed:
+            raise ValueError("retained input descriptor is closed")
+        return Path(f"/proc/self/fd/{self._descriptor}")
+
+    def open_binary(self) -> BinaryIO:
+        """Open an independent binary reader for the retained inode."""
+        if self.closed:
+            raise ValueError("retained input descriptor is closed")
+        return self.consumer_path.open("rb")
+
+    def validate(self) -> None:
+        """Require the retained inode and its full content to remain unchanged."""
+        if self.closed:
+            raise ValueError("retained input descriptor is closed")
+        try:
+            before = os.fstat(self._descriptor)
+            digest = hashlib.sha256()
+            os.lseek(self._descriptor, 0, os.SEEK_SET)
+            while True:
+                chunk = os.read(self._descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(self._descriptor)
+            os.lseek(self._descriptor, 0, os.SEEK_SET)
+        except OSError as error:
+            raise ValueError(
+                f"retained input changed during execution: {self.identity.path}"
+            ) from error
+        before_stat = tuple(
+            int(getattr(before, name)) for name in _STABLE_CONTENT_FIELDS
+        )
+        after_stat = tuple(int(getattr(after, name)) for name in _STABLE_CONTENT_FIELDS)
+        if (
+            before_stat != self._stable_stat
+            or after_stat != self._stable_stat
+            or digest.hexdigest() != self.identity.sha256
+        ):
+            raise ValueError(
+                f"retained input changed during execution: {self.identity.path}"
+            )
+
+    def close(self) -> None:
+        """Close the owned descriptor idempotently."""
+        if self.closed:
+            return
+        descriptor = self._descriptor
+        self._descriptor = -1
+        os.close(descriptor)
+
+
 @dataclass(frozen=True, slots=True)
 class TaskOutput:
     """Compact per-cell tables and paths produced by one analyzer."""
@@ -266,6 +389,11 @@ class ArtifactSnapshot:
     scratch_root : pathlib.Path or None, default=None
         Optional external scratch root selected by the snapshotted execution
         profile.
+    owned_inputs : tuple[RetainedContent, ...], default=()
+        Open exact-content descriptors whose process-local ``consumer_path`` values
+        are supplied through ``context``. Ownership transfers to
+        :func:`run_artifact_task`, which validates and closes every descriptor on
+        success, failure, and reuse.
     """
 
     context: object
@@ -273,9 +401,10 @@ class ArtifactSnapshot:
     input_identities: tuple[ContentIdentity, ...]
     native_threads: int = 1
     scratch_root: Path | None = None
+    owned_inputs: tuple[RetainedContent, ...] = ()
 
 
-ArtifactSnapshotter = Callable[[], ArtifactSnapshot]
+ArtifactSnapshotter = Callable[[Path, Path], ArtifactSnapshot]
 ArtifactProducer = Callable[[Path, object], tuple[Path, ...]]
 
 
@@ -295,9 +424,10 @@ class ArtifactTask:
         Stable path-safe task identity within a run.
     software_identity : str
         Frozen software and repository identity used to authorize reuse.
-    snapshot : Callable[[], ArtifactSnapshot]
+    snapshot : Callable[[pathlib.Path, pathlib.Path], ArtifactSnapshot]
         Callback run under the task lock after ``running`` becomes authoritative.
-        It securely discovers, hashes, and parses every producer input.
+        It receives the canonical run and task roots, in that order, and securely
+        discovers, hashes, and parses every producer input.
     producer : Callable[[Path, object], tuple[Path, ...]]
         Function that writes outputs below its unique attempt directory and
         returns every primary output path. Its second argument is exactly the
@@ -326,8 +456,9 @@ class ArtifactTask:
     -----
     ``config_digest``, ``input_identities``, and ``context`` are internal admitted
     state and must be empty on caller-created requests. The snapshot callback runs
-    under the task lock only after a new ``running`` terminal is authoritative.
-    Producers must not retain or read pre-snapshot scientific objects or aliases.
+    under the task lock only after a new ``running`` terminal is authoritative and
+    receives no caller path alias. Producers must not retain or read pre-snapshot
+    scientific objects or aliases.
     """
 
     key: str
@@ -1048,11 +1179,10 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     )
 
 
-def _task_directory(task: CellTask | ArtifactTask, run_dir: Path) -> Path:
+def _task_directory(task: CellTask | ArtifactTask, run_root: Path) -> Path:
     """Return one validated task directory in the shared immutable store."""
     if not _SAFE_COMPONENT.fullmatch(task.key):
         raise ValueError("task key must be a path-safe component")
-    run_root = run_dir.resolve()
     tasks_root = run_root / "tasks"
     tasks_root.mkdir(parents=True, exist_ok=True)
     if tasks_root.is_symlink() or not stat.S_ISDIR(tasks_root.stat().st_mode):
@@ -1090,10 +1220,11 @@ def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
         not isinstance(identity, ContentIdentity) for identity in task.input_identities
     ) or (task.config is None and not task.input_identities):
         raise TypeError("cell task inputs require content-bound identities")
-    task_dir = _task_directory(task, run_dir)
+    run_root = run_dir.resolve()
+    task_dir = _task_directory(task, run_root)
     with (task_dir / ".task.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return _run_task_locked(task, task_dir)
+        return _run_task_locked(task, task_dir, run_root)
 
 
 def run_artifact_task(task: ArtifactTask, run_dir: Path) -> TaskRecord:
@@ -1141,15 +1272,17 @@ def run_artifact_task(task: ArtifactTask, run_dir: Path) -> TaskRecord:
     configure_native_threads(task.native_threads)
     if task.config_digest or task.input_identities or task.context is not None:
         raise TypeError("artifact task identity and context must come from snapshot")
-    task_dir = _task_directory(task, run_dir)
+    run_root = run_dir.resolve()
+    task_dir = _task_directory(task, run_root)
     with (task_dir / ".task.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return _run_task_locked(task, task_dir)
+        return _run_task_locked(task, task_dir, run_root)
 
 
 def _run_task_locked(
     task: CellTask | ArtifactTask,
     task_dir: Path,
+    run_root: Path,
 ) -> TaskRecord:
     """Execute under the kernel lock that serializes reuse and publication."""
     terminal_path = task_dir / "terminal.json"
@@ -1184,9 +1317,16 @@ def _run_task_locked(
     sampler: threading.Thread | None = None
     scratch_dir = attempt_dir / "scratch"
     previous_temp: dict[str, str | None] = {}
+    owned_inputs: tuple[RetainedContent, ...] = ()
     try:
         if isinstance(task, ArtifactTask):
-            admitted = task.snapshot()
+            admitted = task.snapshot(run_root, task_dir)
+            if isinstance(admitted, ArtifactSnapshot):
+                owned_inputs = tuple(
+                    item
+                    for item in admitted.owned_inputs
+                    if isinstance(item, RetainedContent)
+                )
             if (
                 not isinstance(admitted, ArtifactSnapshot)
                 or not admitted.config_digest
@@ -1195,10 +1335,17 @@ def _run_task_locked(
                     isinstance(identity, ContentIdentity)
                     for identity in admitted.input_identities
                 )
+                or len(owned_inputs) != len(admitted.owned_inputs)
+                or any(
+                    item.identity not in admitted.input_identities
+                    for item in owned_inputs
+                )
             ):
                 raise TypeError(
-                    "artifact snapshot requires a digest and content-bound identities"
+                    "artifact snapshot requires a digest and owned content-bound identities"
                 )
+            for item in owned_inputs:
+                item.validate()
             configure_native_threads(admitted.native_threads)
             task = replace(
                 task,
@@ -1248,6 +1395,8 @@ def _run_task_locked(
                     raise ValueError(
                         "one or more immutable task inputs changed before reuse"
                     )
+                for item in owned_inputs:
+                    item.validate()
                 if not running_terminal_identity.matches_path():
                     raise ValueError(
                         "authoritative running terminal changed before reuse"
@@ -1258,10 +1407,14 @@ def _run_task_locked(
             raise ValueError(
                 "one or more immutable task inputs changed before execution"
             )
+        for item in owned_inputs:
+            item.validate()
         if isinstance(task, CellTask):
             output_paths = _produce_cell_outputs(task, attempt_dir)
         else:
             output_paths = task.producer(attempt_dir, task.context)
+        for item in owned_inputs:
+            item.validate()
         if not _current_identities_match(task.input_identities):
             raise ValueError(
                 "one or more immutable task inputs changed during execution"
@@ -1341,6 +1494,13 @@ def _run_task_locked(
                 ).to_dict(),
             }
         )
+        try:
+            for item in owned_inputs:
+                item.validate()
+        except Exception:
+            _remove_pointer(record_path)
+            _remove_pointer(manifest_path)
+            raise
         if not _current_identities_match(task.input_identities):
             _remove_pointer(record_path)
             _remove_pointer(manifest_path)
@@ -1399,6 +1559,8 @@ def _run_task_locked(
             max(samples["scratch"], _directory_size(scratch_dir)),
         )
     finally:
+        for item in owned_inputs:
+            item.close()
         for name, value in previous_temp.items():
             if value is None:
                 os.environ.pop(name, None)
@@ -1450,6 +1612,7 @@ __all__ = [
     "CYEXM_PIN",
     "CellTask",
     "ContentIdentity",
+    "RetainedContent",
     "TaskOutput",
     "TaskRecord",
     "build_tasks",

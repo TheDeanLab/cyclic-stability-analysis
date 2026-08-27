@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import tifffile
 from cyclic_stability.models import NuclearConfig
 from cyclic_stability.nuclear import NuclearComponentQc
-from cyclic_stability.task import ContentIdentity
+from cyclic_stability.task import RetainedContent
+from cyexm.spatial import ImageGeometry
 from scripts import run_analysis
 
 
@@ -18,21 +21,35 @@ def test_validated_registered_dapi_uses_dapi_only_snapshot(
 ) -> None:
     """The entry point must not fall back to whole-workflow target validation."""
     expected = tmp_path / "registered-405-DAPI.tif"
+    expected.write_bytes(b"descriptor-backed-DAPI")
     round_spec = SimpleNamespace(acquisition_round=2)
+    config = SimpleNamespace(voxel_spacing_xyz_um=(0.1, 0.1, 0.3))
     observed: list[object] = []
+    retained_inputs: list[RetainedContent] = []
 
-    def snapshot(value):
-        observed.append(value)
-        return SimpleNamespace(path=expected)
+    def snapshot(value, actual_config):
+        retained = RetainedContent.from_path(expected)
+        retained_inputs.append(retained)
+        observed.append((value, actual_config))
+        return SimpleNamespace(
+            content=retained,
+            close=retained.close,
+        )
 
     monkeypatch.setattr(
         "cyclic_stability.cyexm_artifacts.snapshot_registered_dapi", snapshot
     )
 
-    resolved = run_analysis._validated_registered_dapi(round_spec)
+    monkeypatch.setattr(
+        "cyclic_stability.images.load_volume",
+        lambda source: np.frombuffer(source.read(), dtype=np.uint8),
+    )
 
-    assert observed == [round_spec]
-    assert resolved == expected
+    resolved = run_analysis._validated_registered_dapi(round_spec, config)
+
+    assert observed == [(round_spec, config)]
+    assert bytes(resolved) == b"descriptor-backed-DAPI"
+    assert all(retained.closed for retained in retained_inputs)
 
 
 def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
@@ -105,22 +122,43 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         path = tmp_path / f"round-{number}-405-DAPI.tif"
         path.write_bytes(f"dapi-{number}-v1".encode())
         dapi_paths[number] = path
+    retained_inputs: list[RetainedContent] = []
+
+    def snapshot_registered_dapi(
+        round_spec, actual_config, *, expected_fixed_geometry=None
+    ):
+        assert actual_config is config
+        retained = RetainedContent.from_path(dapi_paths[round_spec.acquisition_round])
+        retained_inputs.append(retained)
+        geometry = ImageGeometry(
+            shape=(3, 3, 3),
+            origin=(0.0, 0.0, 0.0),
+            spacing=config.voxel_spacing_xyz_um,
+            direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        )
+        if expected_fixed_geometry is not None:
+            assert geometry == expected_fixed_geometry
+        return SimpleNamespace(
+            path=Path(retained.identity.path),
+            consumer_path=retained.consumer_path,
+            content=retained,
+            geometry=geometry,
+            identities=(retained.identity,),
+        )
+
     monkeypatch.setattr(
         "cyclic_stability.cyexm_artifacts.snapshot_registered_dapi",
-        lambda round_spec: SimpleNamespace(
-            path=dapi_paths[round_spec.acquisition_round].resolve(),
-            geometry=SimpleNamespace(shape=(3, 3, 3)),
-            identities=(
-                ContentIdentity.from_path(dapi_paths[round_spec.acquisition_round]),
-            ),
-        ),
+        snapshot_registered_dapi,
     )
     monkeypatch.setattr(run_analysis, "_software_identity", lambda: "repository-v1")
     opened: list[str] = []
 
-    def load_volume(path: Path) -> np.ndarray:
-        opened.append(path.name)
-        if "DAPI" not in path.name or "target" in path.name.lower():
+    def load_volume(source) -> np.ndarray:
+        path = Path(source.name)
+        assert path.parent == Path("/proc/self/fd")
+        canonical = Path(os.readlink(path))
+        opened.append(canonical.name)
+        if "DAPI" not in canonical.name or "target" in canonical.name.lower():
             raise AssertionError(f"target-blind inventory opened {path}")
         return np.ones((3, 3, 3), dtype=np.float64)
 
@@ -308,6 +346,162 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
     )
     third_attempt = json.loads((task_dir / "terminal.json").read_text())["attempt_id"]
     assert third_attempt not in {first_attempt, second_attempt}
+    assert retained_inputs
+    assert all(retained.closed for retained in retained_inputs)
+
+
+def test_nuclear_inventory_decode_cannot_publish_transient_replacement_bytes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Replacing and restoring caller DAPI during decode yields attested A or failure."""
+    inputs = []
+    for name in (
+        "analysis.yaml",
+        "correspondence.csv",
+        "qc-decisions.csv",
+        "execution.yaml",
+    ):
+        path = tmp_path / name
+        path.write_text(name, encoding="utf-8")
+        inputs.append(path)
+    round_spec = SimpleNamespace(cohort="lamin", cell_id="Field-A", acquisition_round=2)
+    cell = SimpleNamespace(cohort="lamin", cell_id="Field-A", rounds=(round_spec,))
+    config = SimpleNamespace(
+        cells=(cell,),
+        qc_decisions=(),
+        reference_acquisition_round=2,
+        voxel_spacing_xyz_um=(0.1, 0.1, 0.3),
+        nominal_expansion_factor=4.5,
+        nuclear=NuclearConfig(
+            consensus_smoothing_um=0.5,
+            normal_half_window_um=1.5,
+            normal_step_um=0.05,
+            ridge_min_sbr=3.0,
+            accepted_component_count=(1, 6),
+            nominal_volume_um3=(1.0, 5000.0),
+            minimum_sphericity=0.0,
+            maximum_face_contact_fraction=1.0,
+        ),
+        config_digest="replacement-regression",
+    )
+    profile = SimpleNamespace(mode="sequential", native_threads=1, scratch_root=None)
+    monkeypatch.setattr(
+        "cyclic_stability.config.load_analysis_config_bytes",
+        lambda *_args, **_kwargs: config,
+    )
+    monkeypatch.setattr(
+        "cyclic_stability.config.load_execution_profile_bytes",
+        lambda *_args, **_kwargs: profile,
+    )
+    source = tmp_path / "round-2-405-DAPI.tif"
+    tifffile.imwrite(source, np.full((3, 3, 3), 7, dtype=np.uint16))
+    original_payload = source.read_bytes()
+    original_mtime_ns = source.stat().st_mtime_ns
+    replacement = tmp_path / "replacement-DAPI.tif"
+    tifffile.imwrite(replacement, np.full((3, 3, 3), 99, dtype=np.uint16))
+    retained_inputs: list[RetainedContent] = []
+
+    def snapshot_registered_dapi(
+        _round_spec, actual_config, *, expected_fixed_geometry=None
+    ):
+        assert actual_config is config
+        retained = RetainedContent.from_path(source)
+        retained_inputs.append(retained)
+        geometry = ImageGeometry(
+            shape=(3, 3, 3),
+            origin=(0.0, 0.0, 0.0),
+            spacing=config.voxel_spacing_xyz_um,
+            direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        )
+        assert expected_fixed_geometry is None or geometry == expected_fixed_geometry
+        return SimpleNamespace(
+            path=Path(retained.identity.path),
+            consumer_path=retained.consumer_path,
+            content=retained,
+            geometry=geometry,
+            identities=(retained.identity,),
+        )
+
+    monkeypatch.setattr(
+        "cyclic_stability.cyexm_artifacts.snapshot_registered_dapi",
+        snapshot_registered_dapi,
+    )
+    from cyclic_stability import images
+
+    real_load_volume = images.load_volume
+    decoded: list[int] = []
+
+    def replace_during_decode(source_handle) -> np.ndarray:
+        path = Path(source_handle.name)
+        assert path.parent == Path("/proc/self/fd")
+        os.replace(replacement, source)
+        volume = np.array(real_load_volume(source_handle), copy=True)
+        decoded.append(int(volume[0, 0, 0]))
+        restored = tmp_path / "restored-DAPI.tif"
+        restored.write_bytes(original_payload)
+        os.utime(restored, ns=(restored.stat().st_atime_ns, original_mtime_ns))
+        os.replace(restored, source)
+        return volume
+
+    monkeypatch.setattr(images, "load_volume", replace_during_decode)
+
+    def adjudicate(dapi, *_args):
+        observed = float(next(iter(dapi.values()))[0, 0, 0])
+        return SimpleNamespace(
+            component_qc=(
+                NuclearComponentQc(
+                    "N001",
+                    True,
+                    (),
+                    observed,
+                    observed,
+                    1.0,
+                    (0.0, 0.0, 0.0),
+                    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                ),
+            )
+        )
+
+    monkeypatch.setattr(
+        "cyclic_stability.nuclear.adjudicate_nuclear_components", adjudicate
+    )
+    monkeypatch.setattr(
+        "cyclic_stability.nuclear.realize_nuclear_surfaces",
+        lambda *_args: SimpleNamespace(),
+    )
+    monkeypatch.setattr(run_analysis, "_software_identity", lambda: "repository-v1")
+    run_dir = tmp_path / "inventory-run"
+
+    result = run_analysis.main(
+        [
+            "--analysis-config",
+            str(inputs[0]),
+            "--correspondence",
+            str(inputs[1]),
+            "--qc-decisions",
+            str(inputs[2]),
+            "--execution-profile",
+            str(inputs[3]),
+            "--run-dir",
+            str(run_dir),
+            "--nuclear-inventory-only",
+        ]
+    )
+
+    task_dir = run_dir / "tasks" / "nuclear-inventory"
+    terminal = json.loads((task_dir / "terminal.json").read_text())
+    attempt = task_dir / "attempts" / terminal["attempt_id"]
+    payload = json.loads((attempt / "nuclear-inventory.json").read_text())
+    assert decoded == [7]
+    assert payload["cells"][0]["components"][0]["expanded_volume_um3"] == 7.0
+    assert terminal["status"] in {"complete", "failed"}
+    if terminal["status"] == "complete":
+        assert result == 0
+    else:
+        assert result == 1
+        failure = json.loads((attempt / "failure.json").read_text())
+        assert "retained input changed" in failure["message"]
+    assert all(retained.closed for retained in retained_inputs)
 
 
 def test_nuclear_inventory_reports_out_of_contract_before_target_work(
@@ -341,7 +535,7 @@ def test_nuclear_inventory_reports_out_of_contract_before_target_work(
     monkeypatch.setattr(
         run_analysis,
         "_validated_registered_dapi",
-        lambda _round: tmp_path / "round-2-405-DAPI.tif",
+        lambda _round, _config: np.ones((3, 3, 3), dtype=np.float64),
         raising=False,
     )
     monkeypatch.setattr(
@@ -432,7 +626,7 @@ def test_nuclear_inventory_publishes_component_qc_when_strict_normals_fail(
     monkeypatch.setattr(
         run_analysis,
         "_validated_registered_dapi",
-        lambda _round: tmp_path / "round-2-405-DAPI.tif",
+        lambda _round, _config: np.ones((3, 3, 3), dtype=np.float64),
     )
     monkeypatch.setattr(
         "cyclic_stability.images.load_volume",

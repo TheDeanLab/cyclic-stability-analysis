@@ -30,6 +30,10 @@ import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cyclic_stability.task import RetainedContent
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -43,20 +47,19 @@ class NuclearInventoryRequest:
     correspondence: Path
     qc_decisions: Path
     execution_profile: Path
-    run_dir: Path
-    results_root: Path | None
+    publish_latest: bool
     cohorts: tuple[str, ...]
     cell_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class NuclearInventoryDapi:
-    """One canonical DAPI consumer path in an admitted inventory snapshot."""
+    """One retained byte owner in an admitted producer snapshot."""
 
     cohort: str
     cell_id: str
     acquisition_round: int
-    path: Path
+    content: RetainedContent
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,14 +144,24 @@ def _write_pretty_json(path: Path, payload: dict[str, object]) -> None:
         os.close(directory)
 
 
-def _validated_registered_dapi(round_spec) -> Path:
-    """Resolve one completed registered DAPI artifact without resolving targets."""
+def _validated_registered_dapi(round_spec, config):
+    """Decode one completed DAPI from its owned snapshot without resolving targets."""
     from cyclic_stability.cyexm_artifacts import snapshot_registered_dapi
+    from cyclic_stability.images import load_volume
 
-    return snapshot_registered_dapi(round_spec).path
+    snapshot = snapshot_registered_dapi(round_spec, config)
+    try:
+        with snapshot.content.open_binary() as source:
+            return load_volume(source)
+    finally:
+        snapshot.close()
 
 
-def _snapshot_nuclear_inventory(request: NuclearInventoryRequest):
+def _snapshot_nuclear_inventory(
+    request: NuclearInventoryRequest,
+    run_root: Path,
+    task_root: Path,
+):
     """Discover and parse one coherent DAPI-only inventory after task admission."""
     from cyclic_stability.config import (
         load_analysis_config_bytes,
@@ -161,6 +174,12 @@ def _snapshot_nuclear_inventory(request: NuclearInventoryRequest):
         ContentIdentity,
         configure_native_threads,
     )
+
+    expected_task_root = run_root / "tasks" / "nuclear-inventory"
+    if task_root != expected_task_root:
+        raise ValueError(
+            "inventory snapshot received an inconsistent canonical task root"
+        )
 
     source_paths = (
         request.analysis_config,
@@ -198,58 +217,86 @@ def _snapshot_nuclear_inventory(request: NuclearInventoryRequest):
         raise ValueError("no cells selected for nuclear inventory")
     dapi_inputs: list[NuclearInventoryDapi] = []
     provenance: list[ContentIdentity] = list(source_identities)
-    for cell in cells:
-        cell_snapshots = tuple(
-            snapshot_registered_dapi(round_spec)
-            for round_spec in _inventory_rounds(config, cell)
-        )
-        if not cell_snapshots:
-            raise ValueError(f"{cell.cohort}/{cell.cell_id} has no DAPI inventory")
-        fixed_geometry = cell_snapshots[0].geometry
-        if any(snapshot.geometry != fixed_geometry for snapshot in cell_snapshots[1:]):
-            raise ValueError(
-                f"{cell.cohort}/{cell.cell_id} DAPI artifacts do not share fixed-grid geometry"
+    owned_inputs: list[RetainedContent] = []
+    try:
+        for cell in cells:
+            inventory_rounds = _inventory_rounds(config, cell)
+            if not inventory_rounds:
+                raise ValueError(f"{cell.cohort}/{cell.cell_id} has no DAPI inventory")
+            references = tuple(
+                round_spec
+                for round_spec in inventory_rounds
+                if round_spec.acquisition_round == config.reference_acquisition_round
             )
-        for snapshot, round_spec in zip(
-            cell_snapshots, _inventory_rounds(config, cell), strict=True
-        ):
-            dapi_inputs.append(
-                NuclearInventoryDapi(
-                    cell.cohort,
-                    cell.cell_id,
-                    round_spec.acquisition_round,
-                    snapshot.path,
+            if len(references) != 1:
+                raise ValueError(
+                    f"{cell.cohort}/{cell.cell_id} lacks one configured DAPI reference"
                 )
-            )
-            provenance.extend(snapshot.identities)
-    identities_by_path: dict[Path, ContentIdentity] = {}
-    identities: list[ContentIdentity] = []
-    for identity in provenance:
-        path = Path(identity.path)
-        prior = identities_by_path.get(path)
-        if prior is not None and prior != identity:
-            raise ValueError(f"conflicting DAPI inventory snapshots for {path}")
-        if prior is None:
-            identities_by_path[path] = identity
-            identities.append(identity)
-    initialize_run_from_bytes(
-        request.run_dir,
-        snapshots={
-            "analysis.yaml": source_payloads[0],
-            "correspondence.csv": source_payloads[1],
-            "qc-decisions.csv": source_payloads[2],
-            "execution-profile.yaml": source_payloads[3],
-        },
-        config_digest=config.config_digest,
-        results_root=request.results_root,
-    )
-    return ArtifactSnapshot(
-        context=NuclearInventoryContext(config, cells, tuple(dapi_inputs)),
-        config_digest=config.config_digest,
-        input_identities=tuple(identities),
-        native_threads=profile.native_threads,
-        scratch_root=profile.scratch_root,
-    )
+            reference = snapshot_registered_dapi(references[0], config)
+            owned_inputs.append(reference.content)
+            by_round = {references[0].acquisition_round: reference}
+            for round_spec in inventory_rounds:
+                if round_spec.acquisition_round == config.reference_acquisition_round:
+                    continue
+                snapshot = snapshot_registered_dapi(
+                    round_spec,
+                    config,
+                    expected_fixed_geometry=reference.geometry,
+                )
+                owned_inputs.append(snapshot.content)
+                by_round[round_spec.acquisition_round] = snapshot
+            if any(
+                snapshot.geometry != reference.geometry
+                for snapshot in by_round.values()
+            ):
+                raise ValueError(
+                    f"{cell.cohort}/{cell.cell_id} DAPI artifacts do not share "
+                    "the exact fixed-grid geometry"
+                )
+            for round_spec in inventory_rounds:
+                snapshot = by_round[round_spec.acquisition_round]
+                dapi_inputs.append(
+                    NuclearInventoryDapi(
+                        cell.cohort,
+                        cell.cell_id,
+                        round_spec.acquisition_round,
+                        snapshot.content,
+                    )
+                )
+                provenance.extend(snapshot.identities)
+        identities_by_path: dict[Path, ContentIdentity] = {}
+        identities: list[ContentIdentity] = []
+        for identity in provenance:
+            path = Path(identity.path)
+            prior = identities_by_path.get(path)
+            if prior is not None and prior != identity:
+                raise ValueError(f"conflicting DAPI inventory snapshots for {path}")
+            if prior is None:
+                identities_by_path[path] = identity
+                identities.append(identity)
+        initialize_run_from_bytes(
+            run_root,
+            snapshots={
+                "analysis.yaml": source_payloads[0],
+                "correspondence.csv": source_payloads[1],
+                "qc-decisions.csv": source_payloads[2],
+                "execution-profile.yaml": source_payloads[3],
+            },
+            config_digest=config.config_digest,
+            results_root=run_root.parent if request.publish_latest else None,
+        )
+        return ArtifactSnapshot(
+            context=NuclearInventoryContext(config, cells, tuple(dapi_inputs)),
+            config_digest=config.config_digest,
+            input_identities=tuple(identities),
+            owned_inputs=tuple(owned_inputs),
+            native_threads=profile.native_threads,
+            scratch_root=profile.scratch_root,
+        )
+    except BaseException:
+        for item in owned_inputs:
+            item.close()
+        raise
 
 
 def _publish_nuclear_inventory(
@@ -258,12 +305,12 @@ def _publish_nuclear_inventory(
     """Publish inventory strictly from the admitted immutable producer context."""
     if not isinstance(raw_context, NuclearInventoryContext):
         raise TypeError("nuclear inventory producer requires its admitted context")
-    dapi_paths = {
-        (item.cohort, item.cell_id, item.acquisition_round): item.path
+    dapi_sources = {
+        (item.cohort, item.cell_id, item.acquisition_round): item.content
         for item in raw_context.dapi
     }
     payload = _nuclear_inventory_payload(
-        raw_context.config, raw_context.cells, dapi_paths
+        raw_context.config, raw_context.cells, dapi_sources
     )
     path = attempt_dir / "nuclear-inventory.json"
     _write_pretty_json(path, payload)
@@ -297,7 +344,7 @@ def _inventory_rounds(config, cell) -> tuple[object, ...]:
 def _nuclear_inventory_payload(
     config,
     cells,
-    dapi_paths: dict[tuple[str, str, int], Path] | None = None,
+    dapi_sources: dict[tuple[str, str, int], object] | None = None,
 ) -> dict[str, object]:
     """Build complete DAPI component evidence without opening a target channel."""
     from cyclic_stability.images import load_volume
@@ -308,18 +355,19 @@ def _nuclear_inventory_payload(
 
     minimum_count, maximum_count = config.nuclear.accepted_component_count
     rows: list[dict[str, object]] = []
+
+    def load_dapi(item):
+        if dapi_sources is None:
+            return _validated_registered_dapi(item, config)
+        source = dapi_sources[(item.cohort, item.cell_id, item.acquisition_round)]
+        if not hasattr(source, "open_binary"):
+            return load_volume(source)
+        with source.open_binary() as handle:
+            return load_volume(handle)
+
     for cell in sorted(cells, key=lambda value: (value.cohort, value.cell_id)):
         accepted_rounds = _inventory_rounds(config, cell)
-        dapi = {
-            item.acquisition_round: load_volume(
-                (
-                    dapi_paths[(item.cohort, item.cell_id, item.acquisition_round)]
-                    if dapi_paths is not None
-                    else _validated_registered_dapi(item)
-                )
-            )
-            for item in accepted_rounds
-        }
+        dapi = {item.acquisition_round: load_dapi(item) for item in accepted_rounds}
         adjudication = adjudicate_nuclear_components(
             dapi,
             config.voxel_spacing_xyz_um,
@@ -453,8 +501,7 @@ def main(argv: list[str] | None = None) -> int:
             args.correspondence,
             args.qc_decisions,
             args.execution_profile,
-            run_dir,
-            results_root,
+            results_root is not None,
             cohorts,
             args.cell,
         )
@@ -462,7 +509,13 @@ def main(argv: list[str] | None = None) -> int:
             ArtifactTask(
                 key="nuclear-inventory",
                 software_identity=_software_identity(),
-                snapshot=lambda: _snapshot_nuclear_inventory(request),
+                snapshot=lambda canonical_run, canonical_task: (
+                    _snapshot_nuclear_inventory(
+                        request,
+                        canonical_run,
+                        canonical_task,
+                    )
+                ),
                 producer=_publish_nuclear_inventory,
             ),
             run_dir,

@@ -31,9 +31,13 @@ from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import WorkflowStatus
 from cyexm.workflow.status import inspect_workflow_status
 
-from cyclic_stability.models import CellSpec, RoundSpec
-from cyclic_stability.provenance import ChannelMatch, compare_nd2_export
-from cyclic_stability.task import ContentIdentity
+from cyclic_stability.models import AnalysisConfig, CellSpec, RoundSpec
+from cyclic_stability.provenance import (
+    ChannelMatch,
+    channel_tiff_paths,
+    compare_nd2_export,
+)
+from cyclic_stability.task import ContentIdentity, RetainedContent
 
 type StatusInspector = Callable[[str | Path, str], WorkflowStatus]
 
@@ -83,6 +87,16 @@ class DapiArtifactSnapshot:
     record: CompletionRecord
     geometry: ImageGeometry
     identities: tuple[ContentIdentity, ...]
+    content: RetainedContent
+
+    @property
+    def consumer_path(self) -> Path:
+        """Return the descriptor path for decoding the exact attested DAPI bytes."""
+        return self.content.consumer_path
+
+    def close(self) -> None:
+        """Close the retained DAPI descriptor when ownership was not transferred."""
+        self.content.close()
 
 
 def _completion_record_from_bytes(payload: bytes) -> CompletionRecord:
@@ -234,7 +248,50 @@ def validate_completed_artifact(path: Path) -> CompletionRecord:
     return record
 
 
-def snapshot_registered_dapi(round_spec: RoundSpec) -> DapiArtifactSnapshot:
+def _validated_retained_completion_snapshot(
+    path: Path,
+) -> tuple[CompletionRecord, Path, ContentIdentity, RetainedContent]:
+    """Parse one completion record while retaining its exact artifact descriptor."""
+    retained: RetainedContent | None = None
+    try:
+        retained = RetainedContent.from_path(path)
+        canonical = Path(retained.identity.path)
+        record_path = ArtifactStore().record_path(canonical)
+        record_identity, record_bytes = ContentIdentity.read_bytes(record_path)
+        record = _completion_record_from_bytes(record_bytes)
+        retained.validate()
+        if not record_identity.matches_path():
+            raise ValueError("completion record changed during parsing")
+        identity = FileIdentity(
+            retained.identity.path,
+            retained.identity.st_size,
+            retained.identity.st_mtime_ns,
+        )
+        if identity != record.artifact:
+            raise InputValidationError(f"completion identity mismatch: {canonical}")
+        return record, Path(record_identity.path), record_identity, retained
+    except InputValidationError:
+        if retained is not None:
+            retained.close()
+        raise
+    except (OSError, RuntimeError, TypeError, UnicodeError, ValueError) as error:
+        if retained is not None:
+            retained.close()
+        raise InputValidationError(
+            f"completion record is unreadable: {path}"
+        ) from error
+    except BaseException:
+        if retained is not None:
+            retained.close()
+        raise
+
+
+def snapshot_registered_dapi(
+    round_spec: RoundSpec,
+    config: AnalysisConfig,
+    *,
+    expected_fixed_geometry: ImageGeometry | None = None,
+) -> DapiArtifactSnapshot:
     """Validate only one registered DAPI artifact and its necessary provenance.
 
     This boundary deliberately does not inspect whole-workflow status, tubulin
@@ -247,6 +304,10 @@ def snapshot_registered_dapi(round_spec: RoundSpec) -> DapiArtifactSnapshot:
     ----------
     round_spec : RoundSpec
         One configured acquisition/workflow-round mapping.
+    config : AnalysisConfig
+        Authoritative reference-round and exact voxel-spacing contract.
+    expected_fixed_geometry : cyexm.spatial.ImageGeometry or None, keyword-only
+        Optional reference-round grid that this round must match exactly.
 
     Returns
     -------
@@ -275,92 +336,142 @@ def snapshot_registered_dapi(round_spec: RoundSpec) -> DapiArtifactSnapshot:
     expected = round_layout.channel(
         f"round_{round_spec.acquisition_round}_405_DAPI.tif"
     )
-    record, record_path, record_identity, artifact_identity = (
-        _validated_completion_snapshot(expected)
+    record, record_path, record_identity, retained = (
+        _validated_retained_completion_snapshot(expected)
     )
-    canonical = Path(artifact_identity.path)
-    request = record.request
-    if round_spec.acquisition_round == 2:
-        channel_index = request.parameters.get("channel_index")
-        cropped = request.parameters.get("cropped")
-        reference_parameters_are_exact = (
-            type(channel_index) is int
-            and channel_index >= 0
-            and isinstance(cropped, bool)
-            and dict(request.parameters)
-            == reference_channel_parameters(index=channel_index, cropped=cropped)
-        )
+    try:
+        canonical = Path(retained.identity.path)
+        request = record.request
+        expected_spacing = tuple(config.voxel_spacing_xyz_um)
+        if tuple(request.geometry.spacing) != expected_spacing:
+            raise InputValidationError(
+                "DAPI request pixel spacing does not match analysis configuration"
+            )
         if (
-            request.stage != "reference-channel"
-            or request.method != "uint16-tiff"
-            or request.accuracy != "exact"
-            or len(request.inputs) != 1
-            or not reference_parameters_are_exact
-            or (cropped is True) != (request.upstream is not None)
+            expected_fixed_geometry is not None
+            and request.geometry != expected_fixed_geometry
         ):
             raise InputValidationError(
-                "DAPI completion stage is not an authoritative reference channel"
+                "DAPI request does not match the exact fixed output grid"
             )
-    else:
-        expected_parameters = channel_transform_parameters(
-            pixel_size_xyz=request.geometry.spacing,
-            interpolation="linear",
+        channels = channel_tiff_paths(round_spec)
+        dapi_indices = tuple(
+            index for index, (name, _path) in enumerate(channels) if name == "dapi"
         )
-        if (
-            request.stage != "channel-transform-v1"
-            or request.method != "warp-affine"
-            or request.accuracy != "not-applicable"
-            or len(request.inputs) != 4
-            or request.upstream != request.inputs[3]
-            or dict(request.parameters) != dict(expected_parameters)
-        ):
-            raise InputValidationError(
-                "DAPI completion stage is not an authoritative channel transform"
-            )
-    input_identities: list[ContentIdentity] = []
-    declared_provenance = list(request.inputs)
-    if request.upstream is not None and request.upstream not in declared_provenance:
-        declared_provenance.append(request.upstream)
-    for declared in declared_provenance:
+        if len(dapi_indices) != 1:
+            raise InputValidationError("configured DAPI channel is not unique")
+        dapi_index = dapi_indices[0]
+        expected_source_path = channels[dapi_index][1]
         try:
-            identity = ContentIdentity.from_path(Path(declared.path))
+            expected_source_identity = ContentIdentity.from_path(expected_source_path)
         except (OSError, ValueError) as error:
             raise InputValidationError(
-                "DAPI completion input provenance is unreadable"
+                "DAPI completion source is unreadable"
             ) from error
-        metadata = FileIdentity(identity.path, identity.st_size, identity.st_mtime_ns)
-        if metadata != declared:
-            raise InputValidationError(
-                "DAPI completion input provenance identity mismatch"
+        expected_source = FileIdentity(
+            expected_source_identity.path,
+            expected_source_identity.st_size,
+            expected_source_identity.st_mtime_ns,
+        )
+        if round_spec.acquisition_round == config.reference_acquisition_round:
+            cropped = request.parameters.get("cropped")
+            reference_parameters_are_exact = isinstance(cropped, bool) and dict(
+                request.parameters
+            ) == reference_channel_parameters(index=dapi_index, cropped=cropped)
+            if (
+                request.stage != "reference-channel"
+                or request.method != "uint16-tiff"
+                or request.accuracy != "exact"
+                or len(request.inputs) != 1
+                or request.inputs[0] != expected_source
+                or not reference_parameters_are_exact
+                or (cropped is True) != (request.upstream is not None)
+            ):
+                raise InputValidationError(
+                    "DAPI completion stage, channel, or source is not an "
+                    "authoritative reference channel"
+                )
+        else:
+            expected_parameters = channel_transform_parameters(
+                pixel_size_xyz=config.voxel_spacing_xyz_um,
+                interpolation="linear",
             )
-        input_identities.append(identity)
-    try:
-        with tifffile.TiffFile(canonical) as handle:
+            if (
+                request.stage != "channel-transform-v1"
+                or request.method != "warp-affine"
+                or request.accuracy != "not-applicable"
+                or len(request.inputs) != 4
+                or request.inputs[1] != expected_source
+                or request.upstream != request.inputs[3]
+                or dict(request.parameters) != dict(expected_parameters)
+            ):
+                raise InputValidationError(
+                    "DAPI completion stage, channel, or source is not an "
+                    "authoritative channel transform"
+                )
+        input_identities: list[ContentIdentity] = []
+        declared_provenance = list(request.inputs)
+        if request.upstream is not None and request.upstream not in declared_provenance:
+            declared_provenance.append(request.upstream)
+        for declared in declared_provenance:
+            try:
+                identity = ContentIdentity.from_path(Path(declared.path))
+            except (OSError, ValueError) as error:
+                raise InputValidationError(
+                    "DAPI completion input provenance is unreadable"
+                ) from error
+            metadata = FileIdentity(
+                identity.path, identity.st_size, identity.st_mtime_ns
+            )
+            if metadata != declared:
+                raise InputValidationError(
+                    "DAPI completion input provenance identity mismatch"
+                )
+            input_identities.append(identity)
+        if expected_source_identity not in input_identities:
+            raise InputValidationError(
+                "DAPI completion source identity is not retained"
+            )
+        with retained.open_binary() as source, tifffile.TiffFile(source) as handle:
             if len(handle.series) != 1:
                 raise ValueError("registered DAPI must contain exactly one TIFF series")
             actual_shape = tuple(int(value) for value in handle.series[0].shape)
             actual_dtype = handle.series[0].dtype
-    except (OSError, ValueError, tifffile.TiffFileError) as error:
-        raise InputValidationError("registered DAPI TIFF is unreadable") from error
-    if actual_shape != tuple(request.geometry.shape) or actual_dtype.kind not in "uif":
-        raise InputValidationError(
-            "registered DAPI TIFF does not match authoritative fixed-grid geometry"
+        if (
+            actual_shape != tuple(request.geometry.shape)
+            or actual_dtype.kind not in "uif"
+        ):
+            raise InputValidationError(
+                "registered DAPI TIFF does not match authoritative fixed-grid geometry"
+            )
+        retained.validate()
+        identities = (
+            profile_identity,
+            record_identity,
+            retained.identity,
+            *input_identities,
         )
-    identities = (
-        profile_identity,
-        record_identity,
-        artifact_identity,
-        *input_identities,
-    )
-    if not all(identity.matches_path() for identity in identities):
-        raise InputValidationError("registered DAPI provenance changed during snapshot")
-    return DapiArtifactSnapshot(
-        canonical,
-        record_path,
-        record,
-        request.geometry,
-        identities,
-    )
+        if not all(identity.matches_path() for identity in identities):
+            raise InputValidationError(
+                "registered DAPI provenance changed during snapshot"
+            )
+        return DapiArtifactSnapshot(
+            canonical,
+            record_path,
+            record,
+            request.geometry,
+            identities,
+            retained,
+        )
+    except InputValidationError:
+        retained.close()
+        raise
+    except (OSError, ValueError, tifffile.TiffFileError) as error:
+        retained.close()
+        raise InputValidationError("registered DAPI TIFF is unreadable") from error
+    except BaseException:
+        retained.close()
+        raise
 
 
 def require_complete_workflow(
