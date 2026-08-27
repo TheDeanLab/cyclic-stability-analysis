@@ -11,9 +11,15 @@ from typing import cast
 
 import yaml
 from cyexm.config import execution as cyexm_execution
+from cyexm.config import load_dataset_manifest
 from cyexm.config._validation import require_exact_keys
 from cyexm.config._yaml import _StrictSafeLoader, _yaml_error_detail
-from cyexm.config.models import ExecutionProfile, ExecutorName, ParallelismSpec
+from cyexm.config.models import (
+    DatasetManifest,
+    ExecutionProfile,
+    ExecutorName,
+    ParallelismSpec,
+)
 from cyexm.errors import (
     ConfigurationValidationError,
     InputValidationError,
@@ -97,6 +103,14 @@ class DapiArtifactSnapshot:
     def close(self) -> None:
         """Close the retained DAPI descriptor when ownership was not transferred."""
         self.content.close()
+
+
+@dataclass(frozen=True, slots=True)
+class _ManifestDapiContract:
+    """The exact DAPI channel position and producer source declared by Cy-ExM."""
+
+    channel_index: int
+    producer_source: Path
 
 
 def _completion_record_from_bytes(payload: bytes) -> CompletionRecord:
@@ -214,6 +228,138 @@ def _execution_profile_snapshot(
     return profile, identity
 
 
+def _dataset_manifest_snapshot(
+    path: Path,
+) -> tuple[DatasetManifest, ContentIdentity]:
+    """Hash and parse the same no-follow dataset-manifest descriptor bytes."""
+    retained: RetainedContent | None = None
+    try:
+        retained = RetainedContent.from_path(path)
+        manifest = load_dataset_manifest(retained.consumer_path)
+        retained.validate()
+        if not retained.identity.matches_path():
+            raise ValueError("dataset manifest changed during parsing")
+        identity = retained.identity
+        retained.close()
+        return manifest, identity
+    except (
+        ConfigurationValidationError,
+        ManifestDecodeError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ) as error:
+        if retained is not None:
+            retained.close()
+        raise InputValidationError("dataset manifest is unreadable") from error
+    except BaseException:
+        if retained is not None:
+            retained.close()
+        raise
+
+
+def _manifest_dapi_contract(
+    round_spec: RoundSpec,
+    config: AnalysisConfig,
+    profile: ExecutionProfile,
+    manifest: DatasetManifest,
+) -> _ManifestDapiContract:
+    """Resolve DAPI by the pinned manifest channel order and source semantics."""
+    if manifest.dataset_id != round_spec.workflow_dataset_id:
+        raise InputValidationError(
+            "dataset manifest identity does not match the declared workflow"
+        )
+    if tuple(manifest.voxel_spacing_um) != tuple(config.voxel_spacing_xyz_um):
+        raise InputValidationError(
+            "dataset manifest pixel spacing does not match analysis configuration"
+        )
+
+    is_reference = round_spec.acquisition_round == config.reference_acquisition_round
+    if is_reference:
+        if round_spec.workflow_round != manifest.reference.round:
+            raise InputValidationError(
+                "dataset manifest reference round does not match the declared workflow"
+            )
+        channels = manifest.reference.channels
+    else:
+        round_matches = tuple(
+            item for item in manifest.rounds if item.round == round_spec.workflow_round
+        )
+        if len(round_matches) != 1:
+            raise InputValidationError(
+                "dataset manifest moving round does not match the declared workflow"
+            )
+        channels = round_matches[0].channels
+
+    correspondence_source = dict(channel_tiff_paths(round_spec))["dapi"]
+    expected_file = correspondence_source.name
+    matches = tuple(
+        (index, channel)
+        for index, channel in enumerate(channels)
+        if channel.file.as_posix() == expected_file
+    )
+    if len(matches) != 1:
+        raise InputValidationError(
+            "dataset manifest does not declare exactly one expected DAPI channel"
+        )
+    channel_index, channel = matches[0]
+    if not is_reference and channel.interpolation != "linear":
+        raise InputValidationError(
+            "dataset manifest DAPI channel interpolation is not authoritative"
+        )
+    producer_source = profile.paths.dataset_root.joinpath(*channel.file.parts)
+    return _ManifestDapiContract(channel_index, producer_source)
+
+
+def _retained_tiff_geometry(content: RetainedContent) -> tuple[tuple[int, ...], str]:
+    """Read one scalar TIFF series geometry from the exact retained bytes."""
+    import tifffile
+
+    with content.open_binary() as source, tifffile.TiffFile(source) as handle:
+        if len(handle.series) != 1:
+            raise ValueError("DAPI source must contain exactly one TIFF series")
+        series = handle.series[0]
+        shape = tuple(int(value) for value in series.shape)
+        if len(shape) != 3 or series.dtype.kind not in "uif":
+            raise ValueError("DAPI source must be one scalar three-dimensional TIFF")
+        return shape, str(series.axes)
+
+
+def _validated_dapi_source_copies(
+    producer_path: Path,
+    correspondence_path: Path,
+) -> tuple[ContentIdentity, ContentIdentity]:
+    """Bind the producer source and its correspondence copy by bytes and geometry."""
+    producer: RetainedContent | None = None
+    correspondence: RetainedContent | None = None
+    try:
+        producer = RetainedContent.from_path(producer_path)
+        correspondence = RetainedContent.from_path(correspondence_path)
+        producer_geometry = _retained_tiff_geometry(producer)
+        correspondence_geometry = _retained_tiff_geometry(correspondence)
+        if producer_geometry != correspondence_geometry:
+            raise InputValidationError(
+                "DAPI source TIFF geometries differ; explicit source-copy "
+                "provenance is required"
+            )
+        if producer.identity.sha256 != correspondence.identity.sha256:
+            raise InputValidationError("DAPI source copies differ in content")
+        producer.validate()
+        correspondence.validate()
+        return producer.identity, correspondence.identity
+    except InputValidationError:
+        raise
+    except (OSError, RuntimeError, ValueError) as error:
+        raise InputValidationError("DAPI completion source is unreadable") from error
+    finally:
+        if producer is not None:
+            producer.close()
+        if correspondence is not None:
+            correspondence.close()
+
+
 def _validated_completion_snapshot(
     path: Path,
 ) -> tuple[CompletionRecord, Path, ContentIdentity, ContentIdentity]:
@@ -297,8 +443,9 @@ def snapshot_registered_dapi(
     This boundary deliberately does not inspect whole-workflow status, tubulin
     channel completion, or the target-channel artifact. Moving DAPI must carry the
     exact channel-transform request; reference DAPI must carry the exact reference
-    channel stage. The returned identities include the execution profile, DAPI
-    completion record, DAPI artifact, and every input named by that DAPI request.
+    channel stage. The returned identities include the execution profile, dataset
+    manifest, DAPI completion record, DAPI artifact, every input named by that DAPI
+    request, and the independently declared correspondence source.
 
     Parameters
     ----------
@@ -330,6 +477,11 @@ def snapshot_registered_dapi(
     profile, profile_identity = _execution_profile_snapshot(
         round_spec.execution_profile
     )
+    manifest, manifest_identity = _dataset_manifest_snapshot(
+        round_spec.dataset_manifest
+    )
+    manifest_contract = _manifest_dapi_contract(round_spec, config, profile, manifest)
+    correspondence_source = dict(channel_tiff_paths(round_spec))["dapi"]
     round_layout = WorkflowLayout.for_dataset(
         profile.paths.output_root, round_spec.workflow_dataset_id
     ).round(round_spec.workflow_round)
@@ -343,6 +495,30 @@ def snapshot_registered_dapi(
         canonical = Path(retained.identity.path)
         request = record.request
         expected_spacing = tuple(config.voxel_spacing_xyz_um)
+        is_reference = (
+            round_spec.acquisition_round == config.reference_acquisition_round
+        )
+        source_index = 0 if is_reference else 1
+        if len(request.inputs) <= source_index:
+            raise InputValidationError(
+                "DAPI completion does not declare its authoritative source"
+            )
+        producer_source_identity, correspondence_source_identity = (
+            _validated_dapi_source_copies(
+                Path(request.inputs[source_index].path),
+                correspondence_source,
+            )
+        )
+        try:
+            manifest_source = manifest_contract.producer_source.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise InputValidationError(
+                "dataset manifest DAPI source is unreadable"
+            ) from error
+        if Path(producer_source_identity.path) != manifest_source:
+            raise InputValidationError(
+                "DAPI completion source does not match the dataset manifest"
+            )
         if tuple(request.geometry.spacing) != expected_spacing:
             raise InputValidationError(
                 "DAPI request pixel spacing does not match analysis configuration"
@@ -354,26 +530,13 @@ def snapshot_registered_dapi(
             raise InputValidationError(
                 "DAPI request does not match the exact fixed output grid"
             )
-        channels = channel_tiff_paths(round_spec)
-        dapi_indices = tuple(
-            index for index, (name, _path) in enumerate(channels) if name == "dapi"
-        )
-        if len(dapi_indices) != 1:
-            raise InputValidationError("configured DAPI channel is not unique")
-        dapi_index = dapi_indices[0]
-        expected_source_path = channels[dapi_index][1]
-        try:
-            expected_source_identity = ContentIdentity.from_path(expected_source_path)
-        except (OSError, ValueError) as error:
-            raise InputValidationError(
-                "DAPI completion source is unreadable"
-            ) from error
+        dapi_index = manifest_contract.channel_index
         expected_source = FileIdentity(
-            expected_source_identity.path,
-            expected_source_identity.st_size,
-            expected_source_identity.st_mtime_ns,
+            producer_source_identity.path,
+            producer_source_identity.st_size,
+            producer_source_identity.st_mtime_ns,
         )
-        if round_spec.acquisition_round == config.reference_acquisition_round:
+        if is_reference:
             cropped = request.parameters.get("cropped")
             reference_parameters_are_exact = isinstance(cropped, bool) and dict(
                 request.parameters
@@ -414,12 +577,15 @@ def snapshot_registered_dapi(
         if request.upstream is not None and request.upstream not in declared_provenance:
             declared_provenance.append(request.upstream)
         for declared in declared_provenance:
-            try:
-                identity = ContentIdentity.from_path(Path(declared.path))
-            except (OSError, ValueError) as error:
-                raise InputValidationError(
-                    "DAPI completion input provenance is unreadable"
-                ) from error
+            if declared.path == producer_source_identity.path:
+                identity = producer_source_identity
+            else:
+                try:
+                    identity = ContentIdentity.from_path(Path(declared.path))
+                except (OSError, ValueError) as error:
+                    raise InputValidationError(
+                        "DAPI completion input provenance is unreadable"
+                    ) from error
             metadata = FileIdentity(
                 identity.path, identity.st_size, identity.st_mtime_ns
             )
@@ -428,7 +594,7 @@ def snapshot_registered_dapi(
                     "DAPI completion input provenance identity mismatch"
                 )
             input_identities.append(identity)
-        if expected_source_identity not in input_identities:
+        if producer_source_identity not in input_identities:
             raise InputValidationError(
                 "DAPI completion source identity is not retained"
             )
@@ -447,9 +613,11 @@ def snapshot_registered_dapi(
         retained.validate()
         identities = (
             profile_identity,
+            manifest_identity,
             record_identity,
             retained.identity,
             *input_identities,
+            correspondence_source_identity,
         )
         if not all(identity.matches_path() for identity in identities):
             raise InputValidationError(

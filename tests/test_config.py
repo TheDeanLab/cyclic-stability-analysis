@@ -51,6 +51,28 @@ def test_analysis_config_parses_multinuclear_bounds(
     assert config.nuclear.maximum_face_contact_fraction == 0.10
 
 
+def test_analysis_config_uses_exact_registered_grid_and_digest(
+    config_files: tuple[Path, ...],
+) -> None:
+    """A rounded acquisition nominal must not replace the registered grid."""
+    analysis, correspondence, decisions = config_files
+    config = load_analysis_config(analysis, correspondence, decisions)
+    assert config.voxel_spacing_xyz_um == (0.1083, 0.1083, 0.3)
+
+    legacy = analysis.with_name("legacy-rounded-spacing.yaml")
+    legacy.write_text(
+        analysis.read_text(encoding="utf-8").replace(
+            "[0.1083, 0.1083, 0.300000]",
+            "[0.108333, 0.108333, 0.300000]",
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        load_analysis_config(legacy, correspondence, decisions).config_digest
+        != config.config_digest
+    )
+
+
 def test_analysis_snapshot_parser_consumes_only_supplied_hashed_bytes(
     config_files: tuple[Path, ...],
 ) -> None:

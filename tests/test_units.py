@@ -25,7 +25,7 @@ def test_constant_physical_warp_has_expected_resolution_fraction() -> None:
     """A displacement equal to one lateral reference unit remains in tolerance."""
     warp = np.zeros((5, 6, 7, 3), dtype=np.float64)
     warp[..., 0] = TARGET_RESOLUTION.lateral_expanded_um
-    summary = summarize_warp(warp, (0.108333, 0.108333, 0.3), TARGET_RESOLUTION)
+    summary = summarize_warp(warp, (0.1083, 0.1083, 0.3), TARGET_RESOLUTION)
     assert summary.displacement_p95_um == pytest.approx(
         TARGET_RESOLUTION.lateral_expanded_um
     )

@@ -109,8 +109,10 @@ def _write_registered_dapi(
     moving: bool,
     cropped_reference: bool = False,
     shape: tuple[int, int, int] = (5, 7, 9),
-    source: Path | None = None,
-    reference_channel_index: int = 2,
+    dataset_root: Path | None = None,
+    producer_z_start: int = 0,
+    record_source: Path | None = None,
+    reference_channel_index: int = 1,
     stage: str | None = None,
 ) -> Path:
     """Write one realistic DAPI-only completion chain for inventory tests."""
@@ -119,10 +121,76 @@ def _write_registered_dapi(
     source_root.mkdir(parents=True, exist_ok=True)
     expected_native = dict(channel_tiff_paths(round_spec))["dapi"]
     expected_native.parent.mkdir(parents=True, exist_ok=True)
-    expected_native.write_bytes(b"expected-native-dapi")
-    native = expected_native if source is None else source
+    source_image = np.arange(4 * 6 * 8, dtype=np.uint16).reshape((4, 6, 8))
+    tifffile.imwrite(expected_native, source_image, photometric="minisblack")
+    authoritative_root = (
+        expected_native.parent if dataset_root is None else dataset_root
+    )
+    manifest_native = authoritative_root / expected_native.name
+    manifest_native.parent.mkdir(parents=True, exist_ok=True)
+    if manifest_native != expected_native:
+        if producer_z_start:
+            tifffile.imwrite(
+                manifest_native,
+                source_image[producer_z_start:],
+                photometric="minisblack",
+            )
+        else:
+            manifest_native.write_bytes(expected_native.read_bytes())
+    native = manifest_native if record_source is None else record_source
     native.parent.mkdir(parents=True, exist_ok=True)
-    native.write_bytes(b"native-dapi")
+    if native not in {expected_native, manifest_native}:
+        native.write_bytes(expected_native.read_bytes())
+    output_root = path.parents[4]
+    round_spec.execution_profile.write_text(
+        f"""schema_version: 1
+executor: sequential
+paths:
+  dataset_root: {authoritative_root}
+  output_root: {output_root}
+  worker_local_directory: null
+""",
+        encoding="utf-8",
+    )
+    target = "647_lamin" if round_spec.cohort == "lamin" else "647_golgi"
+    manifest_round = round_spec.workflow_round if moving else 1
+    moving_acquisition = round_spec.acquisition_round if moving else 1
+    round_spec.dataset_manifest.write_text(
+        f"""schema_version: 1
+dataset_id: {round_spec.workflow_dataset_id}
+voxel_spacing_um:
+  x: {spacing[0]}
+  y: {spacing[1]}
+  z: {spacing[2]}
+reference:
+  round: 2
+  registration_channel: round_2_488_tubulin.tif
+  channels:
+    - {{file: round_2_488_tubulin.tif}}
+    - {{file: round_2_405_DAPI.tif}}
+    - {{file: round_2_{target}.tif}}
+registration:
+  crop: false
+  linear:
+    type: TRSAA
+    accuracy: high
+  nonlinear:
+    type: SyNOnly
+    accuracy: high
+    metric: mattes
+rounds:
+  - round: {manifest_round}
+    strategy: serial_chunked
+    registration_channel: round_{moving_acquisition}_488_tubulin.tif
+    chunk_size_zyx: [16, 16, 16]
+    overlap_fraction: 0.15
+    channels:
+      - {{file: round_{moving_acquisition}_488_tubulin.tif, interpolation: linear}}
+      - {{file: round_{moving_acquisition}_405_DAPI.tif, interpolation: linear}}
+      - {{file: round_{moving_acquisition}_{target}.tif, interpolation: linear}}
+""",
+        encoding="utf-8",
+    )
     geometry = ImageGeometry(
         shape=shape,
         origin=(0.0, 0.0, 0.0),
@@ -172,7 +240,7 @@ def _write_registered_dapi(
     ArtifactStore().commit(
         path,
         request,
-        lambda target: tifffile.imwrite(target, image),
+        lambda target: tifffile.imwrite(target, image, photometric="minisblack"),
         lambda target: tifffile.imread(target).shape == shape,
     )
     return path
@@ -197,12 +265,12 @@ paths:
     )
     round_spec = replace(
         _lamin_round(
-            tmp_path, acquisition_round=2, workflow_round=1, complete_moving=False
+            tmp_path, acquisition_round=2, workflow_round=2, complete_moving=False
         ),
         execution_profile=profile,
     )
     dapi = _write_registered_dapi(
-        output_root / "synthetic/rounds/round-001/channels/round_2_405_DAPI.tif",
+        output_root / "synthetic/rounds/round-002/channels/round_2_405_DAPI.tif",
         round_spec=round_spec,
         spacing=analysis_config.voxel_spacing_xyz_um,
         moving=False,
@@ -217,6 +285,9 @@ paths:
         assert any(
             Path(item.path).name == "crop-bounds.json" for item in snapshot.identities
         )
+        assert round_spec.dataset_manifest.resolve() in {
+            Path(item.path) for item in snapshot.identities
+        }
     finally:
         snapshot.close()
 
@@ -297,7 +368,7 @@ def test_dapi_snapshot_rejects_wrong_channel_or_source_with_coherent_geometry(
 ) -> None:
     """A coherent TIFF grid cannot make a non-DAPI producer authoritative."""
     acquisition = 3 if invalid_contract == "moving-source" else 2
-    workflow_round = 3 if acquisition == 3 else 1
+    workflow_round = 3 if acquisition == 3 else 2
     round_spec = _lamin_round(
         tmp_path,
         acquisition_round=acquisition,
@@ -321,11 +392,162 @@ def test_dapi_snapshot_rejects_wrong_channel_or_source_with_coherent_geometry(
         round_spec=round_spec,
         spacing=analysis_config.voxel_spacing_xyz_um,
         moving=invalid_contract == "moving-source",
-        source=wrong_source if invalid_contract == "moving-source" else None,
-        reference_channel_index=1 if invalid_contract == "reference-channel" else 2,
+        record_source=(wrong_source if invalid_contract == "moving-source" else None),
+        reference_channel_index=2 if invalid_contract == "reference-channel" else 1,
     )
 
     with pytest.raises(InputValidationError, match="DAPI completion"):
+        snapshot_registered_dapi(round_spec, analysis_config)
+
+
+def test_dapi_snapshot_accepts_byte_identical_manifest_source_copy(
+    tmp_path: Path,
+    analysis_config,
+) -> None:
+    """A Lamin producer copy may differ in path but not decoded DAPI content."""
+    round_spec = _lamin_round(
+        tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+    )
+    output = (
+        tmp_path
+        / "workflow-root/synthetic/rounds/round-003/channels/round_3_405_DAPI.tif"
+    )
+    producer_root = tmp_path / "registration-copy"
+    _write_registered_dapi(
+        output,
+        round_spec=round_spec,
+        spacing=analysis_config.voxel_spacing_xyz_um,
+        moving=True,
+        dataset_root=producer_root,
+    )
+
+    snapshot = snapshot_registered_dapi(round_spec, analysis_config)
+    try:
+        correspondence = dict(channel_tiff_paths(round_spec))["dapi"].resolve()
+        producer = (producer_root / correspondence.name).resolve()
+        by_path = {Path(item.path): item for item in snapshot.identities}
+        assert correspondence != producer
+        assert by_path[correspondence].sha256 == by_path[producer].sha256
+    finally:
+        snapshot.close()
+
+
+def test_dapi_snapshot_rejects_same_metadata_source_copy_content_mismatch(
+    tmp_path: Path,
+    analysis_config,
+) -> None:
+    """Equal size and restored mtime cannot substitute for exact source bytes."""
+    round_spec = _lamin_round(
+        tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+    )
+    output = (
+        tmp_path
+        / "workflow-root/synthetic/rounds/round-003/channels/round_3_405_DAPI.tif"
+    )
+    producer_root = tmp_path / "registration-copy"
+    _write_registered_dapi(
+        output,
+        round_spec=round_spec,
+        spacing=analysis_config.voxel_spacing_xyz_um,
+        moving=True,
+        dataset_root=producer_root,
+    )
+    correspondence = dict(channel_tiff_paths(round_spec))["dapi"]
+    original = correspondence.read_bytes()
+    original_stat = correspondence.stat()
+    changed = bytearray(original)
+    changed[-1] ^= 1
+    correspondence.write_bytes(changed)
+    os.utime(
+        correspondence,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+    )
+    assert correspondence.stat().st_size == original_stat.st_size
+    assert correspondence.stat().st_mtime_ns == original_stat.st_mtime_ns
+
+    with pytest.raises(InputValidationError, match="source copies differ in content"):
+        snapshot_registered_dapi(round_spec, analysis_config)
+
+
+def test_dapi_snapshot_rejects_source_copy_tiff_geometry_mismatch(
+    tmp_path: Path,
+    analysis_config,
+) -> None:
+    """A producer copy and correspondence source must decode to the same geometry."""
+    round_spec = _lamin_round(
+        tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+    )
+    output = (
+        tmp_path
+        / "workflow-root/synthetic/rounds/round-003/channels/round_3_405_DAPI.tif"
+    )
+    producer_root = tmp_path / "registration-copy"
+    _write_registered_dapi(
+        output,
+        round_spec=round_spec,
+        spacing=analysis_config.voxel_spacing_xyz_um,
+        moving=True,
+        dataset_root=producer_root,
+    )
+    correspondence = dict(channel_tiff_paths(round_spec))["dapi"]
+    tifffile.imwrite(
+        correspondence,
+        np.zeros((3, 5, 7), dtype=np.uint16),
+        photometric="minisblack",
+    )
+
+    with pytest.raises(InputValidationError, match="source TIFF geometries differ"):
+        snapshot_registered_dapi(round_spec, analysis_config)
+
+
+def test_dapi_snapshot_rejects_undeclared_leading_plane_source_crop(
+    tmp_path: Path,
+    analysis_config,
+) -> None:
+    """Empirical correspondence[1:] equality cannot replace declared provenance."""
+    round_spec = _lamin_round(
+        tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+    )
+    output = (
+        tmp_path
+        / "workflow-root/synthetic/rounds/round-003/channels/round_3_405_DAPI.tif"
+    )
+    _write_registered_dapi(
+        output,
+        round_spec=round_spec,
+        spacing=analysis_config.voxel_spacing_xyz_um,
+        moving=True,
+        dataset_root=tmp_path / "registration-copy",
+        producer_z_start=1,
+    )
+
+    with pytest.raises(InputValidationError, match="explicit source-copy provenance"):
+        snapshot_registered_dapi(round_spec, analysis_config)
+
+
+def test_dapi_snapshot_rejects_symlinked_dataset_manifest(
+    tmp_path: Path,
+    analysis_config,
+) -> None:
+    """Manifest parsing must not follow a retargetable caller-path symlink."""
+    round_spec = _lamin_round(
+        tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+    )
+    output = (
+        tmp_path
+        / "workflow-root/synthetic/rounds/round-003/channels/round_3_405_DAPI.tif"
+    )
+    _write_registered_dapi(
+        output,
+        round_spec=round_spec,
+        spacing=analysis_config.voxel_spacing_xyz_um,
+        moving=True,
+    )
+    real_manifest = round_spec.dataset_manifest.with_name("saved-dataset.yaml")
+    round_spec.dataset_manifest.rename(real_manifest)
+    round_spec.dataset_manifest.symlink_to(real_manifest)
+
+    with pytest.raises(InputValidationError, match="dataset manifest is unreadable"):
         snapshot_registered_dapi(round_spec, analysis_config)
 
 

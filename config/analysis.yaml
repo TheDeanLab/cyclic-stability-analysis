@@ -1,6 +1,6 @@
 schema_version: 1
 reference_acquisition_round: 2
-voxel_spacing_xyz_um: [0.108333, 0.108333, 0.300000]
+voxel_spacing_xyz_um: [0.1083, 0.1083, 0.300000]
 nominal_expansion_factor: 4.5
 optics:
   numerical_aperture: 1.4

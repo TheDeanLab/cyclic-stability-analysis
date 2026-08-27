@@ -398,16 +398,16 @@ def _write_target_blind_overlays(
         _source_channel(moving_spec, "488_tubulin")
     )
     reference_dapi_image = backend.load_image(
-        _source_channel(reference_spec, "405_DAPI"), (0.108333, 0.108333, 0.3)
+        _source_channel(reference_spec, "405_DAPI"), (0.1083, 0.1083, 0.3)
     )
     reference_tubulin_image = backend.load_image(
-        _source_channel(reference_spec, "488_tubulin"), (0.108333, 0.108333, 0.3)
+        _source_channel(reference_spec, "488_tubulin"), (0.1083, 0.1083, 0.3)
     )
     moving_dapi_image = backend.load_image(
-        _source_channel(moving_spec, "405_DAPI"), (0.108333, 0.108333, 0.3)
+        _source_channel(moving_spec, "405_DAPI"), (0.1083, 0.1083, 0.3)
     )
     moving_tubulin_image = backend.load_image(
-        _source_channel(moving_spec, "488_tubulin"), (0.108333, 0.108333, 0.3)
+        _source_channel(moving_spec, "488_tubulin"), (0.1083, 0.1083, 0.3)
     )
     moving_dapi_affine = np.asarray(
         backend.to_array(
@@ -578,7 +578,7 @@ def analyze_registration_qc(
     ):
         raise ValueError("cell and artifact acquisition-round inventories disagree")
     resolution = theoretical_resolution(0.640, 1.4, 1.515, 4.5)
-    spacing = (0.108333, 0.108333, 0.3)
+    spacing = (0.1083, 0.1083, 0.3)
     backend = AntsRegistrationBackend(NativeThreadConfig(itk_threads=1, blas_threads=1))
     registration_rows: list[dict[str, object]] = []
     deformation_rows: list[dict[str, object]] = []
