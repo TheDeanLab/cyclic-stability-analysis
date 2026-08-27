@@ -1,8 +1,14 @@
-"""Immutable, restart-safe marker-cell task attempts.
+"""Immutable, restart-safe marker-cell and generic artifact task attempts.
 
 This module deliberately imports no scientific/image library at import time.  A
 worker first applies its native-thread policy and only then imports the cohort
 analyzer that may load NumPy, ANTs, or a BLAS implementation.
+
+Use :func:`run_cell_task` for configured marker analysis and
+:func:`run_artifact_task` with :class:`ArtifactTask` for another file-producing
+operation that needs the same terminal authority. Generic producers do not own
+discovery: their :class:`ArtifactSnapshot` callback must admit every exact input
+and an immutable consumer context after the running terminal is published.
 """
 
 from __future__ import annotations
@@ -78,6 +84,42 @@ class ContentIdentity:
         return identity, payload
 
     @classmethod
+    def read_bytes_many(
+        cls, paths: tuple[Path, ...]
+    ) -> tuple[tuple[ContentIdentity, bytes], ...]:
+        """Snapshot related files while retaining one descriptor per lexical parent.
+
+        A directory alias may be retargeted while files are being read. Grouping
+        siblings behind one already-open directory descriptor guarantees that one
+        call cannot mix entries from two parent generations.
+        """
+        candidates = tuple(Path(path) for path in paths)
+        parents = {
+            candidate.parent if candidate.parent != Path("") else Path(".")
+            for candidate in candidates
+        }
+        descriptors: dict[Path, int] = {}
+        try:
+            for parent in parents:
+                descriptors[parent] = os.open(
+                    parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+                )
+            snapshots: list[tuple[ContentIdentity, bytes]] = []
+            for candidate in candidates:
+                parent = candidate.parent if candidate.parent != Path("") else Path(".")
+                identity, payload = cls._read_from_parent_descriptor(
+                    candidate,
+                    descriptors[parent],
+                    retain_bytes=True,
+                )
+                assert payload is not None
+                snapshots.append((identity, payload))
+            return tuple(snapshots)
+        finally:
+            for descriptor in descriptors.values():
+                os.close(descriptor)
+
+    @classmethod
     def _read(
         cls, path: Path, *, retain_bytes: bool
     ) -> tuple[ContentIdentity, bytes | None]:
@@ -88,67 +130,78 @@ class ContentIdentity:
             os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
         )
         try:
-            descriptor = os.open(
-                candidate.name,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=parent_fd,
+            return cls._read_from_parent_descriptor(
+                candidate, parent_fd, retain_bytes=retain_bytes
             )
-            try:
-                before = os.fstat(descriptor)
-                entry_before = os.stat(
-                    candidate.name, dir_fd=parent_fd, follow_symlinks=False
-                )
-                if (
-                    not stat.S_ISREG(before.st_mode)
-                    or not stat.S_ISREG(entry_before.st_mode)
-                    or (before.st_dev, before.st_ino)
-                    != (entry_before.st_dev, entry_before.st_ino)
-                ):
-                    raise ValueError(f"file is not a stable regular entry: {candidate}")
-                canonical_parent = Path(os.readlink(f"/proc/self/fd/{parent_fd}"))
-                if canonical_parent.name.endswith(" (deleted)"):
-                    raise ValueError(f"file parent changed while opening: {candidate}")
-                resolved = canonical_parent / candidate.name
-                digest = hashlib.sha256()
-                retained: list[bytes] | None = [] if retain_bytes else None
-                while True:
-                    chunk = os.read(descriptor, 1024 * 1024)
-                    if not chunk:
-                        break
-                    digest.update(chunk)
-                    if retained is not None:
-                        retained.append(chunk)
-                after = os.fstat(descriptor)
-                entry_after = os.stat(
-                    candidate.name, dir_fd=parent_fd, follow_symlinks=False
-                )
-                stable_fields = (
-                    "st_dev",
-                    "st_ino",
-                    "st_mode",
-                    "st_size",
-                    "st_mtime_ns",
-                    "st_ctime_ns",
-                )
-                if any(
-                    getattr(before, name) != getattr(after, name)
-                    for name in stable_fields
-                ) or (after.st_dev, after.st_ino) != (
-                    entry_after.st_dev,
-                    entry_after.st_ino,
-                ):
-                    raise ValueError(f"file changed while hashing: {resolved}")
-                identity = cls(
-                    str(resolved),
-                    after.st_size,
-                    after.st_mtime_ns,
-                    digest.hexdigest(),
-                )
-                return identity, None if retained is None else b"".join(retained)
-            finally:
-                os.close(descriptor)
         finally:
             os.close(parent_fd)
+
+    @classmethod
+    def _read_from_parent_descriptor(
+        cls,
+        candidate: Path,
+        parent_fd: int,
+        *,
+        retain_bytes: bool,
+    ) -> tuple[ContentIdentity, bytes | None]:
+        descriptor = os.open(
+            candidate.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            before = os.fstat(descriptor)
+            entry_before = os.stat(
+                candidate.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or not stat.S_ISREG(entry_before.st_mode)
+                or (before.st_dev, before.st_ino)
+                != (entry_before.st_dev, entry_before.st_ino)
+            ):
+                raise ValueError(f"file is not a stable regular entry: {candidate}")
+            canonical_parent = Path(os.readlink(f"/proc/self/fd/{parent_fd}"))
+            if canonical_parent.name.endswith(" (deleted)"):
+                raise ValueError(f"file parent changed while opening: {candidate}")
+            resolved = canonical_parent / candidate.name
+            digest = hashlib.sha256()
+            retained: list[bytes] | None = [] if retain_bytes else None
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                if retained is not None:
+                    retained.append(chunk)
+            after = os.fstat(descriptor)
+            entry_after = os.stat(
+                candidate.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            stable_fields = (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+            if any(
+                getattr(before, name) != getattr(after, name) for name in stable_fields
+            ) or (after.st_dev, after.st_ino) != (
+                entry_after.st_dev,
+                entry_after.st_ino,
+            ):
+                raise ValueError(f"file changed while hashing: {resolved}")
+            identity = cls(
+                str(resolved),
+                after.st_size,
+                after.st_mtime_ns,
+                digest.hexdigest(),
+            )
+            return identity, None if retained is None else b"".join(retained)
+        finally:
+            os.close(descriptor)
 
     def matches_path(self) -> bool:
         """Return whether the same path still has this exact content identity."""
@@ -192,43 +245,101 @@ class TaskOutput:
 
 
 TaskAnalyzer = Callable[["CellTask", Path], TaskOutput]
-ArtifactProducer = Callable[[Path], tuple[Path, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactSnapshot:
+    """One authoritative, under-lock snapshot for a generic artifact attempt.
+
+    Parameters
+    ----------
+    context : object
+        Immutable producer context parsed only from the bytes represented by
+        ``input_identities``. The producer must consume task inputs exclusively
+        through this value.
+    config_digest : str
+        Scientific identity derived from the snapshotted configuration bytes.
+    input_identities : tuple[ContentIdentity, ...]
+        Complete canonical content identities consumed by the producer.
+    native_threads : int, default=1
+        Native thread policy to apply after snapshot admission.
+    scratch_root : pathlib.Path or None, default=None
+        Optional external scratch root selected by the snapshotted execution
+        profile.
+    """
+
+    context: object
+    config_digest: str
+    input_identities: tuple[ContentIdentity, ...]
+    native_threads: int = 1
+    scratch_root: Path | None = None
+
+
+ArtifactSnapshotter = Callable[[], ArtifactSnapshot]
+ArtifactProducer = Callable[[Path, object], tuple[Path, ...]]
 
 
 @dataclass(frozen=True, slots=True)
 class ArtifactTask:
-    """One immutable file-producing task using the shared attempt store.
+    """One immutable file-producing request using the shared attempt store.
+
+    This is the supported generic extension interface for the task lifecycle.
+    :func:`run_artifact_task` owns locking, terminal transitions, reuse, resource
+    accounting, and atomic publication. The supplied snapshot owns input discovery
+    and parsing; the producer owns only output construction from the admitted
+    context.
 
     Parameters
     ----------
     key : str
         Stable path-safe task identity within a run.
-    config_digest : str
-        Exact frozen scientific configuration digest.
-    input_identities : tuple[ContentIdentity, ...]
-        Every immutable input consumed by ``producer``.
     software_identity : str
         Frozen software and repository identity used to authorize reuse.
-    producer : Callable[[Path], tuple[Path, ...]]
+    snapshot : Callable[[], ArtifactSnapshot]
+        Callback run under the task lock after ``running`` becomes authoritative.
+        It securely discovers, hashes, and parses every producer input.
+    producer : Callable[[Path, object], tuple[Path, ...]]
         Function that writes outputs below its unique attempt directory and
-        returns every primary output path. The shared store reopens all files,
+        returns every primary output path. Its second argument is exactly the
+        immutable context returned by ``snapshot``; it must not retain or consume
+        pre-snapshot scientific objects. The shared store reopens all files,
         records their identities, and publishes completion atomically.
     native_threads : int, default=1
         Native thread policy applied before production.
     force : bool, default=False
         If true, bypass an otherwise reusable complete attempt.
-    scratch_root : Path or None, default=None
-        Optional external scratch root, owned per task attempt.
+    config_digest : str, internal
+        Populated only from the admitted snapshot.
+    input_identities : tuple[ContentIdentity, ...], internal
+        Populated only from the admitted snapshot.
+    context : object or None, internal
+        Producer context populated only from the admitted snapshot.
+
+    See Also
+    --------
+    run_artifact_task :
+        Admit and execute this request through the authoritative task lifecycle.
+    ArtifactSnapshot :
+        Carries the exact input identities and producer-only immutable context.
+
+    Notes
+    -----
+    ``config_digest``, ``input_identities``, and ``context`` are internal admitted
+    state and must be empty on caller-created requests. The snapshot callback runs
+    under the task lock only after a new ``running`` terminal is authoritative.
+    Producers must not retain or read pre-snapshot scientific objects or aliases.
     """
 
     key: str
-    config_digest: str
-    input_identities: tuple[ContentIdentity, ...]
     software_identity: str
+    snapshot: ArtifactSnapshotter
     producer: ArtifactProducer
     native_threads: int = 1
     force: bool = False
     scratch_root: Path | None = None
+    config_digest: str = ""
+    input_identities: tuple[ContentIdentity, ...] = ()
+    context: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -986,12 +1097,50 @@ def run_cell_task(task: CellTask, run_dir: Path) -> TaskRecord:
 
 
 def run_artifact_task(task: ArtifactTask, run_dir: Path) -> TaskRecord:
-    """Run or exactly reuse one generic immutable file-producing attempt."""
+    """Run or exactly reuse one generic immutable file-producing attempt.
+
+    This is the canonical entry point for non-cell artifacts that require the same
+    fail-closed terminal and SHA-bound reuse contract as scientific cell tasks. It
+    publishes ``running`` under the task lock, invokes ``task.snapshot``, decides
+    reuse from that current snapshot, and passes only its context to the producer.
+
+    Parameters
+    ----------
+    task : ArtifactTask
+        Unadmitted request. Its internal digest, identity, and context fields must
+        be empty; the snapshot callback supplies them under lock.
+    run_dir : pathlib.Path
+        Run root receiving the task attempt tree. Existing immutable attempts are
+        retained and only the atomic terminal pointer changes authority.
+
+    Returns
+    -------
+    TaskRecord
+        Complete, reused, or failed attempt record. Snapshot and producer failures
+        are represented by a failed record and authoritative failed terminal.
+
+    Raises
+    ------
+    TypeError
+        If the caller attempts to prepopulate admitted identity or context fields.
+    ValueError
+        If the run task tree is unsafe or invalid before an attempt can be admitted.
+
+    See Also
+    --------
+    ArtifactTask :
+        Defines the snapshot and producer responsibilities for this lifecycle.
+    run_cell_task :
+        Executes normal configured marker-cell analysis with strict preflight.
+
+    Notes
+    -----
+    Once a running terminal is published, all snapshot or producer exceptions are
+    persisted as failed terminal state rather than re-exposing prior success.
+    """
     configure_native_threads(task.native_threads)
-    if not task.input_identities or not all(
-        isinstance(identity, ContentIdentity) for identity in task.input_identities
-    ):
-        raise TypeError("artifact task inputs require content-bound identities")
+    if task.config_digest or task.input_identities or task.context is not None:
+        raise TypeError("artifact task identity and context must come from snapshot")
     task_dir = _task_directory(task, run_dir)
     with (task_dir / ".task.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1005,7 +1154,9 @@ def _run_task_locked(
     """Execute under the kernel lock that serializes reuse and publication."""
     terminal_path = task_dir / "terminal.json"
     _remove_pointer(task_dir / "complete.json")
-    requires_current_preflight = isinstance(task, CellTask) and task.config is not None
+    requires_current_preflight = isinstance(task, ArtifactTask) or (
+        isinstance(task, CellTask) and task.config is not None
+    )
     prior_terminal_snapshot: _TerminalSnapshot | None = None
     if requires_current_preflight and not task.force:
         prior_terminal_snapshot = _terminal_snapshot(terminal_path)
@@ -1023,12 +1174,6 @@ def _run_task_locked(
         _json_bytes({"status": "running", "attempt_id": attempt_id}),
     )
     running_terminal_identity = ContentIdentity.from_path(terminal_path)
-    scratch_dir = (
-        (task.scratch_root / task.key / attempt_id)
-        if task.scratch_root is not None
-        else attempt_dir / "scratch"
-    )
-    scratch_dir.mkdir(parents=True, exist_ok=False)
     process = psutil.Process()
     before = process.io_counters()
     started = time.time()
@@ -1036,17 +1181,34 @@ def _run_task_locked(
     peak = process.memory_info().rss
     samples = {"rss": peak, "scratch": 0}
     stop = threading.Event()
-    sampler = threading.Thread(
-        target=_sample_resources,
-        args=(process, scratch_dir, stop, samples),
-        daemon=True,
-    )
-    previous_temp = {name: os.environ.get(name) for name in ("TMPDIR", "TEMP", "TMP")}
-    for name in previous_temp:
-        os.environ[name] = str(scratch_dir)
-    sampler.start()
+    sampler: threading.Thread | None = None
+    scratch_dir = attempt_dir / "scratch"
+    previous_temp: dict[str, str | None] = {}
     try:
-        if isinstance(task, CellTask):
+        if isinstance(task, ArtifactTask):
+            admitted = task.snapshot()
+            if (
+                not isinstance(admitted, ArtifactSnapshot)
+                or not admitted.config_digest
+                or not admitted.input_identities
+                or not all(
+                    isinstance(identity, ContentIdentity)
+                    for identity in admitted.input_identities
+                )
+            ):
+                raise TypeError(
+                    "artifact snapshot requires a digest and content-bound identities"
+                )
+            configure_native_threads(admitted.native_threads)
+            task = replace(
+                task,
+                config_digest=admitted.config_digest,
+                input_identities=admitted.input_identities,
+                context=admitted.context,
+                native_threads=admitted.native_threads,
+                scratch_root=admitted.scratch_root,
+            )
+        elif isinstance(task, CellTask):
             task = _preflight_task(task)
             if not task.input_identities or not all(
                 isinstance(identity, ContentIdentity)
@@ -1054,27 +1216,44 @@ def _run_task_locked(
             ):
                 raise TypeError("cell task inputs require content-bound identities")
             _qc_gate(task)
-            if prior_terminal_snapshot is not None:
-                reusable = _read_reusable(
-                    task,
-                    terminal_path,
-                    terminal_snapshot=prior_terminal_snapshot,
-                    recheck_terminal=False,
-                )
-                if reusable is not None:
-                    stop.set()
-                    sampler.join()
-                    shutil.rmtree(scratch_dir)
-                    if not _current_identities_match(task.input_identities):
-                        raise ValueError(
-                            "one or more immutable task inputs changed before reuse"
-                        )
-                    if not running_terminal_identity.matches_path():
-                        raise ValueError(
-                            "authoritative running terminal changed before reuse"
-                        )
-                    _atomic_bytes(terminal_path, prior_terminal_snapshot.payload)
-                    return reusable
+        scratch_dir = (
+            (task.scratch_root / task.key / attempt_id)
+            if task.scratch_root is not None
+            else attempt_dir / "scratch"
+        )
+        scratch_dir.mkdir(parents=True, exist_ok=False)
+        sampler = threading.Thread(
+            target=_sample_resources,
+            args=(process, scratch_dir, stop, samples),
+            daemon=True,
+        )
+        previous_temp = {
+            name: os.environ.get(name) for name in ("TMPDIR", "TEMP", "TMP")
+        }
+        for name in previous_temp:
+            os.environ[name] = str(scratch_dir)
+        sampler.start()
+        if prior_terminal_snapshot is not None:
+            reusable = _read_reusable(
+                task,
+                terminal_path,
+                terminal_snapshot=prior_terminal_snapshot,
+                recheck_terminal=False,
+            )
+            if reusable is not None:
+                stop.set()
+                sampler.join()
+                shutil.rmtree(scratch_dir)
+                if not _current_identities_match(task.input_identities):
+                    raise ValueError(
+                        "one or more immutable task inputs changed before reuse"
+                    )
+                if not running_terminal_identity.matches_path():
+                    raise ValueError(
+                        "authoritative running terminal changed before reuse"
+                    )
+                _atomic_bytes(terminal_path, prior_terminal_snapshot.payload)
+                return reusable
         if not _current_identities_match(task.input_identities):
             raise ValueError(
                 "one or more immutable task inputs changed before execution"
@@ -1082,7 +1261,7 @@ def _run_task_locked(
         if isinstance(task, CellTask):
             output_paths = _produce_cell_outputs(task, attempt_dir)
         else:
-            output_paths = task.producer(attempt_dir)
+            output_paths = task.producer(attempt_dir, task.context)
         if not _current_identities_match(task.input_identities):
             raise ValueError(
                 "one or more immutable task inputs changed during execution"
@@ -1172,7 +1351,8 @@ def _run_task_locked(
         return record
     except Exception as error:  # noqa: BLE001 - persist analyzer failures, preserve interrupts
         stop.set()
-        sampler.join()
+        if sampler is not None:
+            sampler.join()
         after = process.io_counters()
         peak = max(samples["rss"], process.memory_info().rss)
         failure = {
@@ -1265,6 +1445,7 @@ def build_tasks(
 
 
 __all__ = [
+    "ArtifactSnapshot",
     "ArtifactTask",
     "CYEXM_PIN",
     "CellTask",

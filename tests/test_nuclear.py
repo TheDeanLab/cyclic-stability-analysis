@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +14,7 @@ import tifffile
 from skimage.measure import mesh_surface_area
 from cyclic_stability import nuclear
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
+from cyclic_stability.morphology import threshold_ensemble
 from cyclic_stability.models import (
     AnalysisConfig,
     CellSpec,
@@ -107,6 +109,13 @@ def test_component_adjudication_survives_strict_surface_failure(
         )
 
 
+def test_component_diagnostic_renderer_contract_is_target_blind() -> None:
+    """A target argument would permit cohort signal to contaminate nuclear QC."""
+    assert tuple(
+        inspect.signature(nuclear.write_nuclear_component_diagnostic).parameters
+    ) == ("output_dir", "cell_id", "dapi_rounds", "consensus")
+
+
 def test_component_adjudication_freezes_retained_geometry() -> None:
     """Mutable retained arrays could silently change inventory-to-surface evidence."""
     dapi = separated_nuclei(1, SPACING)
@@ -191,6 +200,29 @@ def test_component_qc_records_exact_rejection_reason(
     assert len(result.nuclei) == 1
     assert len(rejected) == 1
     assert rejected[0].rejection_reasons == (reason,)
+    diagnostic = next(
+        item
+        for item in result.component_diagnostics
+        if item.nucleus_id == rejected[0].nucleus_id
+    )
+    assert diagnostic.accepted is False
+    assert diagnostic.rejection_reasons == (reason,)
+    assert diagnostic.diagnostic_only is True
+    assert {projection.plane for projection in diagnostic.projections} == {
+        "XY",
+        "XZ",
+        "YZ",
+    }
+    assert all(
+        0 < projection.retained_point_count <= 2048
+        and projection.retained_point_count <= projection.source_point_count
+        for projection in diagnostic.projections
+    )
+    assert all(
+        not outline.flags.writeable
+        for projection in diagnostic.projections
+        for outline in projection.outlines_ab_um
+    )
 
 
 def test_component_qc_collects_every_applicable_rejection_reason() -> None:
@@ -568,6 +600,17 @@ def test_per_nucleus_lamin_profiles_and_metrics_isolate_local_ridges(
         "N002",
         "aggregate",
     }
+    assert all(
+        row.sigma_um in config.ensembles.gaussian_sigma_um
+        and row.threshold_sbr in config.ensembles.threshold_sbr
+        and (
+            row.surface_tolerance_resolution_units
+            in config.ensembles.surface_tolerance_resolution_units
+        )
+        == (row.endpoint == "lamin_surface_dice")
+        for row in result.ensemble_rows
+    )
+    assert (tmp_path / "out" / "nuclear-component-inventory.pdf").is_file()
     volume_rows = {
         row.nucleus_id: row.value
         for row in result.ensemble_rows
@@ -581,6 +624,115 @@ def test_per_nucleus_lamin_profiles_and_metrics_isolate_local_ridges(
     )
 
 
+def test_streamed_lamin_members_exactly_match_full_grid_ensemble() -> None:
+    """Bounded streaming must preserve every old full-grid threshold voxel."""
+    rng = np.random.default_rng(48)
+    image = rng.normal(5.0, 1.0, size=(17, 23, 29))
+    z, y, x = np.indices(image.shape)
+    roi = ((z - 8) / 5) ** 2 + ((y - 11) / 7) ** 2 + ((x - 14) / 8) ** 2 <= 1
+    spacing = (0.2, 0.2, 0.5)
+    sigmas = (0.19, 0.31, 0.47)
+    thresholds = (2.5, 3.0, 3.5)
+    legacy = threshold_ensemble(image, roi, sigmas, thresholds, spacing)
+    bounded_roi = nuclear._bounded_nuclear_roi("N001", roi, spacing)
+
+    streamed = nuclear._build_lamin_reference_masks(
+        image,
+        (bounded_roi,),
+        sigmas,
+        thresholds,
+        spacing,
+        nuclear.robust_background(image),
+    )
+
+    assert len(legacy) == len(streamed.members) == 9
+    for old in legacy:
+        current = streamed.members[("N001", old.sigma_um, old.threshold_sbr)]
+        expanded = np.zeros(image.shape, dtype=bool)
+        expanded[current.region_zyx] = current.mask_zyx
+        assert np.array_equal(expanded, old.mask_zyx)
+        assert current.origin_xyz_um == pytest.approx(
+            tuple(
+                int(region.start) * step
+                for region, step in zip(
+                    current.region_zyx,
+                    spacing[::-1],
+                    strict=True,
+                )
+            )[::-1]
+        )
+
+
+def test_streamed_lamin_smooths_once_per_round_and_sigma(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nuclei and thresholds must reuse one full-grid convolution per sigma."""
+    image = np.arange(17 * 23 * 29, dtype=float).reshape((17, 23, 29))
+    first = np.zeros(image.shape, dtype=bool)
+    first[2:8, 3:10, 4:12] = True
+    second = np.zeros(image.shape, dtype=bool)
+    second[9:15, 12:20, 16:25] = True
+    spacing = (0.2, 0.2, 0.5)
+    sigmas = (0.19, 0.31, 0.47)
+    calls: list[tuple[float, ...]] = []
+    real_gaussian_filter = nuclear.gaussian_filter
+
+    def count_gaussian_filter(source, *, sigma):
+        calls.append(tuple(float(value) for value in sigma))
+        return real_gaussian_filter(source, sigma=sigma)
+
+    monkeypatch.setattr(nuclear, "gaussian_filter", count_gaussian_filter)
+    streamed = nuclear._build_lamin_reference_masks(
+        image,
+        (
+            nuclear._bounded_nuclear_roi("N001", first, spacing),
+            nuclear._bounded_nuclear_roi("N002", second, spacing),
+        ),
+        sigmas,
+        (2.5, 3.0, 3.5),
+        spacing,
+        nuclear.robust_background(image),
+    )
+
+    assert len(streamed.members) == 2 * 3 * 3
+    assert calls == [nuclear.gaussian_sigma_zyx(sigma, spacing) for sigma in sigmas]
+
+
+def test_lamin_reference_storage_scales_with_bounded_rois_not_full_grid() -> None:
+    """Production geometry metadata must not allocate legacy full-grid ensembles."""
+    full_shape = (320, 2048, 2048)
+    roi_shape = (72, 192, 192)
+    member_count = 9
+    nucleus_count = 6
+    round_count = 5
+    members = {}
+    for nucleus_index in range(nucleus_count):
+        nucleus_id = f"N{nucleus_index + 1:03d}"
+        region = (
+            slice(20, 20 + roi_shape[0]),
+            slice(100 + nucleus_index * 250, 100 + nucleus_index * 250 + roi_shape[1]),
+            slice(200, 200 + roi_shape[2]),
+        )
+        for member_index in range(member_count):
+            mask = np.zeros(roi_shape, dtype=bool)
+            mask.setflags(write=False)
+            members[(nucleus_id, float(member_index), 3.0)] = nuclear._BoundedLaminMask(
+                nucleus_id,
+                region,
+                (40.0, float(region[1].start) * 0.2, 10.0),
+                mask,
+                float(member_index),
+                3.0,
+            )
+    store = nuclear._LaminReferenceMasks(full_shape, members)
+
+    expected = nucleus_count * member_count * int(np.prod(roi_shape))
+    legacy = int(np.prod(full_shape)) * nucleus_count * round_count * member_count
+    assert store.retained_mask_voxels == expected
+    assert store.retained_mask_voxels < legacy // 100
+    assert all(item.mask_zyx.shape == roi_shape for item in store.members.values())
+
+
 def test_aggregate_collision_uses_exact_sigma_not_display_name() -> None:
     """Rounded display labels must not merge distinct Gaussian scales."""
     sigma_a = 0.12345671
@@ -591,66 +743,73 @@ def test_aggregate_collision_uses_exact_sigma_not_display_name() -> None:
     assert name_a == name_b
     rows = (
         EnsembleRow(
-            "lamin",
-            "Collision",
-            3,
-            "lamin_mask_volume",
-            name_a,
-            sbr,
-            1.0,
-            "um3",
-            "digest",
-            "N001",
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_mask_volume",
+            ensemble_name=name_a,
+            ensemble_value=sbr,
+            sigma_um=sigma_a,
+            threshold_sbr=sbr,
+            surface_tolerance_resolution_units=None,
+            value=1.0,
+            units="um3",
+            source_task_identity="digest",
+            nucleus_id="N001",
         ),
         EnsembleRow(
-            "lamin",
-            "Collision",
-            3,
-            "lamin_mask_volume",
-            name_a,
-            sbr,
-            3.0,
-            "um3",
-            "digest",
-            "N002",
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_mask_volume",
+            ensemble_name=name_a,
+            ensemble_value=sbr,
+            sigma_um=sigma_a,
+            threshold_sbr=sbr,
+            surface_tolerance_resolution_units=None,
+            value=3.0,
+            units="um3",
+            source_task_identity="digest",
+            nucleus_id="N002",
         ),
         EnsembleRow(
-            "lamin",
-            "Collision",
-            3,
-            "lamin_mask_volume",
-            name_b,
-            sbr,
-            10.0,
-            "um3",
-            "digest",
-            "N001",
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_mask_volume",
+            ensemble_name=name_b,
+            ensemble_value=sbr,
+            sigma_um=sigma_b,
+            threshold_sbr=sbr,
+            surface_tolerance_resolution_units=None,
+            value=10.0,
+            units="um3",
+            source_task_identity="digest",
+            nucleus_id="N001",
         ),
         EnsembleRow(
-            "lamin",
-            "Collision",
-            3,
-            "lamin_mask_volume",
-            name_b,
-            sbr,
-            14.0,
-            "um3",
-            "digest",
-            "N002",
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_mask_volume",
+            ensemble_name=name_b,
+            ensemble_value=sbr,
+            sigma_um=sigma_b,
+            threshold_sbr=sbr,
+            surface_tolerance_resolution_units=None,
+            value=14.0,
+            units="um3",
+            source_task_identity="digest",
+            nucleus_id="N002",
         ),
-    )
-    coordinates = (
-        (sigma_a, sbr, None),
-        (sigma_a, sbr, None),
-        (sigma_b, sbr, None),
-        (sigma_b, sbr, None),
     )
 
-    aggregated = _aggregate_ensemble_rows(rows, coordinates)
+    aggregated = _aggregate_ensemble_rows(rows)
 
     assert [row.value for row in aggregated] == [2.0, 12.0]
     assert [row.ensemble_name for row in aggregated] == [name_a, name_b]
     assert [row.ensemble_value for row in aggregated] == [sbr, sbr]
+    assert [row.sigma_um for row in aggregated] == [sigma_a, sigma_b]
 
 
 def test_surface_dice_aggregate_collision_uses_exact_sbr_and_tolerance() -> None:
@@ -664,66 +823,73 @@ def test_surface_dice_aggregate_collision_uses_exact_sbr_and_tolerance() -> None
     assert name_a == name_b
     rows = (
         EnsembleRow(
-            "lamin",
-            "Collision",
-            3,
-            "lamin_surface_dice",
-            name_a,
-            tolerance,
-            0.1,
-            "fraction",
-            "digest",
-            "N001",
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_surface_dice",
+            ensemble_name=name_a,
+            ensemble_value=tolerance,
+            sigma_um=sigma,
+            threshold_sbr=sbr_a,
+            surface_tolerance_resolution_units=tolerance,
+            value=0.1,
+            units="fraction",
+            source_task_identity="digest",
+            nucleus_id="N001",
         ),
         EnsembleRow(
-            "lamin",
-            "Collision",
-            3,
-            "lamin_surface_dice",
-            name_a,
-            tolerance,
-            0.3,
-            "fraction",
-            "digest",
-            "N002",
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_surface_dice",
+            ensemble_name=name_a,
+            ensemble_value=tolerance,
+            sigma_um=sigma,
+            threshold_sbr=sbr_a,
+            surface_tolerance_resolution_units=tolerance,
+            value=0.3,
+            units="fraction",
+            source_task_identity="digest",
+            nucleus_id="N002",
         ),
         EnsembleRow(
-            "lamin",
-            "Collision",
-            3,
-            "lamin_surface_dice",
-            name_b,
-            tolerance,
-            0.6,
-            "fraction",
-            "digest",
-            "N001",
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_surface_dice",
+            ensemble_name=name_b,
+            ensemble_value=tolerance,
+            sigma_um=sigma,
+            threshold_sbr=sbr_b,
+            surface_tolerance_resolution_units=tolerance,
+            value=0.6,
+            units="fraction",
+            source_task_identity="digest",
+            nucleus_id="N001",
         ),
         EnsembleRow(
-            "lamin",
-            "Collision",
-            3,
-            "lamin_surface_dice",
-            name_b,
-            tolerance,
-            1.0,
-            "fraction",
-            "digest",
-            "N002",
+            cohort="lamin",
+            cell_id="Collision",
+            acquisition_round=3,
+            endpoint="lamin_surface_dice",
+            ensemble_name=name_b,
+            ensemble_value=tolerance,
+            sigma_um=sigma,
+            threshold_sbr=sbr_b,
+            surface_tolerance_resolution_units=tolerance,
+            value=1.0,
+            units="fraction",
+            source_task_identity="digest",
+            nucleus_id="N002",
         ),
-    )
-    coordinates = (
-        (sigma, sbr_a, tolerance),
-        (sigma, sbr_a, tolerance),
-        (sigma, sbr_b, tolerance),
-        (sigma, sbr_b, tolerance),
     )
 
-    aggregated = _aggregate_ensemble_rows(rows, coordinates)
+    aggregated = _aggregate_ensemble_rows(rows)
 
     assert [row.value for row in aggregated] == [0.2, 0.8]
     assert [row.ensemble_name for row in aggregated] == [name_a, name_b]
     assert [row.ensemble_value for row in aggregated] == [tolerance, tolerance]
+    assert [row.threshold_sbr for row in aggregated] == [sbr_a, sbr_b]
 
 
 def _fragmented_envelope(isolated_count: int) -> np.ndarray:

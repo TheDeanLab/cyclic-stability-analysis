@@ -407,10 +407,23 @@ def test_lamp_analysis_emits_round_two_and_adjacent_comparisons_for_every_ensemb
         asdict(row)["nucleus_id"] == "aggregate"
         for row in (*result.summary_rows, *result.ensemble_rows)
     )
+    assert all(
+        row.sigma_um in config.lysosome.log_sigma_um
+        and row.threshold_sbr in config.lysosome.detection_sbr
+        and row.surface_tolerance_resolution_units is None
+        for row in result.ensemble_rows
+    )
+    assert (tmp_path / "output" / "nuclear-component-inventory.pdf").is_file()
     assert (tmp_path / "output" / "lamp1-detections.npz").is_file()
     assert (tmp_path / "output" / "lamp1-ensemble.csv").is_file()
     assert (tmp_path / "output" / "objects.csv").is_file()
     assert (tmp_path / "output" / "matches.csv").is_file()
+    with (tmp_path / "output" / "lamp1-ensemble.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        ensemble_csv = list(csv.DictReader(handle))
+    assert ensemble_csv
+    assert all(row["surface_tolerance_resolution_units"] == "" for row in ensemble_csv)
     with (tmp_path / "output" / "objects.csv").open(
         newline="", encoding="utf-8"
     ) as handle:

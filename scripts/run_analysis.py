@@ -27,12 +27,45 @@ import platform
 import subprocess
 import sys
 import uuid
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
+
+
+@dataclass(frozen=True, slots=True)
+class NuclearInventoryRequest:
+    """Raw CLI-owned paths and selectors permitted before artifact admission."""
+
+    analysis_config: Path
+    correspondence: Path
+    qc_decisions: Path
+    execution_profile: Path
+    run_dir: Path
+    results_root: Path | None
+    cohorts: tuple[str, ...]
+    cell_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class NuclearInventoryDapi:
+    """One canonical DAPI consumer path in an admitted inventory snapshot."""
+
+    cohort: str
+    cell_id: str
+    acquisition_round: int
+    path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class NuclearInventoryContext:
+    """Immutable scientific context returned by under-lock inventory snapshotting."""
+
+    config: object
+    cells: tuple[object, ...]
+    dapi: tuple[NuclearInventoryDapi, ...]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -110,23 +143,131 @@ def _write_pretty_json(path: Path, payload: dict[str, object]) -> None:
 
 def _validated_registered_dapi(round_spec) -> Path:
     """Resolve one completed registered DAPI artifact without resolving targets."""
-    from cyexm.workflow.layout import WorkflowLayout
+    from cyclic_stability.cyexm_artifacts import snapshot_registered_dapi
 
-    from cyclic_stability.cyexm_artifacts import (
-        _execution_profile_snapshot,
-        require_complete_workflow,
-        validate_completed_artifact,
+    return snapshot_registered_dapi(round_spec).path
+
+
+def _snapshot_nuclear_inventory(request: NuclearInventoryRequest):
+    """Discover and parse one coherent DAPI-only inventory after task admission."""
+    from cyclic_stability.config import (
+        load_analysis_config_bytes,
+        load_execution_profile_bytes,
+    )
+    from cyclic_stability.cyexm_artifacts import snapshot_registered_dapi
+    from cyclic_stability.runner import initialize_run_from_bytes
+    from cyclic_stability.task import (
+        ArtifactSnapshot,
+        ContentIdentity,
+        configure_native_threads,
     )
 
-    profile, _ = _execution_profile_snapshot(round_spec.execution_profile)
-    require_complete_workflow(round_spec, profile=profile)
-    output_root = profile.paths.output_root
-    round_layout = WorkflowLayout.for_dataset(
-        output_root, round_spec.workflow_dataset_id
-    ).round(round_spec.workflow_round)
-    path = round_layout.channel(f"round_{round_spec.acquisition_round}_405_DAPI.tif")
-    record = validate_completed_artifact(path)
-    return Path(record.artifact.path)
+    source_paths = (
+        request.analysis_config,
+        request.correspondence,
+        request.qc_decisions,
+        request.execution_profile,
+    )
+    source_snapshots = ContentIdentity.read_bytes_many(source_paths)
+    source_identities = tuple(identity for identity, _payload in source_snapshots)
+    source_payloads = tuple(payload for _identity, payload in source_snapshots)
+    canonical_paths = tuple(Path(identity.path) for identity in source_identities)
+    config = load_analysis_config_bytes(
+        source_payloads[0],
+        source_payloads[1],
+        source_payloads[2],
+        analysis_path=canonical_paths[0],
+        correspondence_path=canonical_paths[1],
+        qc_path=canonical_paths[2],
+    )
+    profile = load_execution_profile_bytes(
+        source_payloads[3], source_path=canonical_paths[3]
+    )
+    configure_native_threads(profile.native_threads)
+    cells = tuple(
+        cell
+        for cell in config.cells
+        if (not request.cohorts or cell.cohort in request.cohorts)
+        and (request.cell_id is None or cell.cell_id == request.cell_id)
+    )
+    if request.cell_id is not None and not cells:
+        raise KeyError(
+            "--cell does not match a configured cell in the requested cohort"
+        )
+    if not cells:
+        raise ValueError("no cells selected for nuclear inventory")
+    dapi_inputs: list[NuclearInventoryDapi] = []
+    provenance: list[ContentIdentity] = list(source_identities)
+    for cell in cells:
+        cell_snapshots = tuple(
+            snapshot_registered_dapi(round_spec)
+            for round_spec in _inventory_rounds(config, cell)
+        )
+        if not cell_snapshots:
+            raise ValueError(f"{cell.cohort}/{cell.cell_id} has no DAPI inventory")
+        fixed_geometry = cell_snapshots[0].geometry
+        if any(snapshot.geometry != fixed_geometry for snapshot in cell_snapshots[1:]):
+            raise ValueError(
+                f"{cell.cohort}/{cell.cell_id} DAPI artifacts do not share fixed-grid geometry"
+            )
+        for snapshot, round_spec in zip(
+            cell_snapshots, _inventory_rounds(config, cell), strict=True
+        ):
+            dapi_inputs.append(
+                NuclearInventoryDapi(
+                    cell.cohort,
+                    cell.cell_id,
+                    round_spec.acquisition_round,
+                    snapshot.path,
+                )
+            )
+            provenance.extend(snapshot.identities)
+    identities_by_path: dict[Path, ContentIdentity] = {}
+    identities: list[ContentIdentity] = []
+    for identity in provenance:
+        path = Path(identity.path)
+        prior = identities_by_path.get(path)
+        if prior is not None and prior != identity:
+            raise ValueError(f"conflicting DAPI inventory snapshots for {path}")
+        if prior is None:
+            identities_by_path[path] = identity
+            identities.append(identity)
+    initialize_run_from_bytes(
+        request.run_dir,
+        snapshots={
+            "analysis.yaml": source_payloads[0],
+            "correspondence.csv": source_payloads[1],
+            "qc-decisions.csv": source_payloads[2],
+            "execution-profile.yaml": source_payloads[3],
+        },
+        config_digest=config.config_digest,
+        results_root=request.results_root,
+    )
+    return ArtifactSnapshot(
+        context=NuclearInventoryContext(config, cells, tuple(dapi_inputs)),
+        config_digest=config.config_digest,
+        input_identities=tuple(identities),
+        native_threads=profile.native_threads,
+        scratch_root=profile.scratch_root,
+    )
+
+
+def _publish_nuclear_inventory(
+    attempt_dir: Path, raw_context: object
+) -> tuple[Path, ...]:
+    """Publish inventory strictly from the admitted immutable producer context."""
+    if not isinstance(raw_context, NuclearInventoryContext):
+        raise TypeError("nuclear inventory producer requires its admitted context")
+    dapi_paths = {
+        (item.cohort, item.cell_id, item.acquisition_round): item.path
+        for item in raw_context.dapi
+    }
+    payload = _nuclear_inventory_payload(
+        raw_context.config, raw_context.cells, dapi_paths
+    )
+    path = attempt_dir / "nuclear-inventory.json"
+    _write_pretty_json(path, payload)
+    return (path,)
 
 
 def _inventory_rounds(config, cell) -> tuple[object, ...]:
@@ -201,6 +342,7 @@ def _nuclear_inventory_payload(
             }
         else:
             surface_realization = {"status": "complete"}
+        surface_ready = surface_realization == {"status": "complete"}
         rows.append(
             {
                 "accepted_count": accepted_count,
@@ -210,16 +352,18 @@ def _nuclear_inventory_payload(
                 "cohort": cell.cohort,
                 "components": list(components),
                 "field_id": f"{cell.cohort}/{cell.cell_id}",
+                "ready": count_within_contract and surface_ready,
                 "surface_realization": surface_realization,
+                "surface_ready": surface_ready,
                 "within_accepted_component_contract": count_within_contract,
             }
         )
     return {
         "accepted_component_count_range": [minimum_count, maximum_count],
-        "all_fields_within_contract": all(
-            bool(item["within_accepted_component_contract"])
-            and item["surface_realization"] == {"status": "complete"}
-            for item in rows
+        "all_fields_ready": all(bool(item["ready"]) for item in rows),
+        "all_fields_surface_ready": all(bool(item["surface_ready"]) for item in rows),
+        "all_fields_within_count_contract": all(
+            bool(item["within_accepted_component_contract"]) for item in rows
         ),
         "cells": rows,
     }
@@ -283,102 +427,43 @@ def main(argv: list[str] | None = None) -> int:
         run_cell_task,
     )
 
-    config = load_analysis_config(
-        args.analysis_config, args.correspondence, args.qc_decisions
-    )
-    profile = load_execution_profile(args.execution_profile)
-    configure_native_threads(profile.native_threads)
     cohorts = tuple(args.cohort)
     known_cohorts = {"golgi", "lamin", "lamp1"}
     if any(cohort not in known_cohorts for cohort in cohorts):
         raise ValueError("--cohort must name a configured cohort")
-    if (
-        profile.mode == "slurm"
-        and args.task_index is None
-        and not args.nuclear_inventory_only
-    ):
-        raise ValueError("SLURM execution requires --task-index")
-    selected = None
-    if args.cell is not None:
-        selected = next(
-            (
-                cell
-                for cell in config.cells
-                if cell.cell_id == args.cell and (not cohorts or cell.cohort in cohorts)
-            ),
-            None,
-        )
-    if args.cell is not None and selected is None:
-        raise KeyError(
-            "--cell does not match a configured cell in the requested cohort"
-        )
-    if args.pilot_first_accepted:
-        selected = _pilot_cell(config, cohorts)
     if args.nuclear_inventory_only:
         if args.pilot_first_accepted or args.task_index is not None or args.force_task:
             raise ValueError(
                 "--nuclear-inventory-only cannot be combined with pilot, task-index, "
                 "or force selection"
             )
-        inventory_cells = tuple(
-            cell
-            for cell in config.cells
-            if (not cohorts or cell.cohort in cohorts)
-            and (selected is None or cell == selected)
-        )
-        if not inventory_cells:
-            print("unavailable: no cells selected for nuclear inventory")
-            return 1
         if args.run_dir is not None:
             run_dir = args.run_dir
             results_root = None
         else:
             assert args.results_root is not None
             timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            run_dir = args.results_root / f"{timestamp}-{config.config_digest[:12]}"
+            run_dir = (
+                args.results_root
+                / f"{timestamp}-nuclear-inventory-{uuid.uuid4().hex[:8]}"
+            )
             results_root = args.results_root
-        initialize_run(
+        request = NuclearInventoryRequest(
+            args.analysis_config,
+            args.correspondence,
+            args.qc_decisions,
+            args.execution_profile,
             run_dir,
-            analysis_config=args.analysis_config,
-            correspondence=args.correspondence,
-            qc_decisions=args.qc_decisions,
-            execution_profile=args.execution_profile,
-            config_digest=config.config_digest,
-            results_root=results_root,
+            results_root,
+            cohorts,
+            args.cell,
         )
-        dapi_paths = {
-            (round_spec.cohort, round_spec.cell_id, round_spec.acquisition_round): (
-                _validated_registered_dapi(round_spec)
-            )
-            for cell in inventory_cells
-            for round_spec in _inventory_rounds(config, cell)
-        }
-        input_identities = tuple(
-            ContentIdentity.from_path(path)
-            for path in (
-                args.analysis_config,
-                args.correspondence,
-                args.qc_decisions,
-                args.execution_profile,
-                *(dapi_paths[key] for key in sorted(dapi_paths)),
-            )
-        )
-
-        def publish_inventory(attempt_dir: Path) -> tuple[Path, ...]:
-            payload = _nuclear_inventory_payload(config, inventory_cells, dapi_paths)
-            path = attempt_dir / "nuclear-inventory.json"
-            _write_pretty_json(path, payload)
-            return (path,)
-
         record = run_artifact_task(
             ArtifactTask(
                 key="nuclear-inventory",
-                config_digest=config.config_digest,
-                input_identities=input_identities,
                 software_identity=_software_identity(),
-                producer=publish_inventory,
-                native_threads=profile.native_threads,
-                scratch_root=getattr(profile, "scratch_root", None),
+                snapshot=lambda: _snapshot_nuclear_inventory(request),
+                producer=_publish_nuclear_inventory,
             ),
             run_dir,
         )
@@ -396,9 +481,32 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(path.read_text(encoding="utf-8"))
         print(
             f"{'reused' if record.reused else 'wrote'} target-blind nuclear inventory "
-            f"for {len(inventory_cells)} cells: {path}"
+            f"for {len(payload['cells'])} cells: {path}"
         )
-        return 0 if payload["all_fields_within_contract"] is True else 1
+        return 0 if payload["all_fields_ready"] is True else 1
+    config = load_analysis_config(
+        args.analysis_config, args.correspondence, args.qc_decisions
+    )
+    profile = load_execution_profile(args.execution_profile)
+    configure_native_threads(profile.native_threads)
+    if profile.mode == "slurm" and args.task_index is None:
+        raise ValueError("SLURM execution requires --task-index")
+    selected = None
+    if args.cell is not None:
+        selected = next(
+            (
+                cell
+                for cell in config.cells
+                if cell.cell_id == args.cell and (not cohorts or cell.cohort in cohorts)
+            ),
+            None,
+        )
+    if args.cell is not None and selected is None:
+        raise KeyError(
+            "--cell does not match a configured cell in the requested cohort"
+        )
+    if args.pilot_first_accepted:
+        selected = _pilot_cell(config, cohorts)
     tasks = build_tasks(
         config,
         cohorts,

@@ -617,6 +617,19 @@ def test_ensemble_rows_preserve_all_coordinates_and_endpoints(analysis_config) -
         for sigma in analysis_config.ensembles.gaussian_sigma_um
         for threshold in analysis_config.ensembles.threshold_sbr
     }
+    assert all(
+        row.sigma_um in analysis_config.ensembles.gaussian_sigma_um
+        and row.threshold_sbr in analysis_config.ensembles.threshold_sbr
+        for row in result.ensemble_rows
+    )
+    assert all(
+        (
+            row.surface_tolerance_resolution_units
+            in analysis_config.ensembles.surface_tolerance_resolution_units
+        )
+        == row.endpoint.startswith("surface_dice_")
+        for row in result.ensemble_rows
+    )
 
 
 def test_array_kernel_rejects_missing_round_shape_and_validity_mismatch(
@@ -687,6 +700,56 @@ def test_cell_entry_requires_explicit_common_support_and_publishes_overlays(
             tmp_path / "out",
             {2: np.ones(synthetic_golgi().shape, dtype=bool)},
         )
+
+
+def test_golgi_cell_publishes_target_blind_component_diagnostic(
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Golgi output must include the same renderer fed only registered DAPI."""
+    round_two = next(
+        item for item in analysis_config.cells[0].rounds if item.acquisition_round == 2
+    )
+    cell = CellSpec("golgi", "SyntheticCell", (round_two,))
+    dapi = synthetic_dapi_rounds()[2]
+    target = synthetic_golgi()
+    dapi_path = tmp_path / "dapi.tif"
+    target_path = tmp_path / "target.tif"
+    tifffile.imwrite(dapi_path, dapi)
+    tifffile.imwrite(target_path, target)
+    artifact = RoundArtifacts(
+        2,
+        round_two.workflow_round,
+        tmp_path,
+        dapi_path,
+        tmp_path / "tubulin.tif",
+        target_path,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        (),
+    )
+    monkeypatch.setattr(
+        "cyclic_stability.golgi._artifact_validity_masks",
+        lambda *_args: (
+            {2: np.ones(dapi.shape, dtype=bool)},
+            "synthetic-digest",
+            ("synthetic-validity",),
+        ),
+    )
+
+    result = analyze_golgi_cell(
+        cell,
+        (artifact,),
+        _small_nucleus_config(analysis_config),
+        tmp_path / "out",
+    )
+
+    diagnostic = tmp_path / "out" / "nuclear-component-inventory.pdf"
+    assert diagnostic.is_file()
+    assert diagnostic in result.diagnostics
 
 
 def test_atomic_golgi_diagnostic_publisher_restores_previous_tree_on_failure(

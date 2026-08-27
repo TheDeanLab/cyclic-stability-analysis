@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-from cyclic_stability.runner import initialize_run, run_tasks
+from cyclic_stability.runner import initialize_run, initialize_run_from_bytes, run_tasks
 from synthetic import (
     ANALYSIS_YAML,
     normalized_table_bytes,
@@ -102,6 +103,39 @@ def test_reopen_rejects_a_corrupted_frozen_snapshot(tmp_path: Path) -> None:
     (run_dir / "config" / "analysis.yaml").write_text("corrupt", encoding="utf-8")
     with pytest.raises(ValueError, match="frozen"):
         initialize_run(run_dir, **kwargs)
+
+
+def test_snapshot_run_initialization_accepts_current_artifact_scaffold(
+    tmp_path: Path,
+) -> None:
+    """Under-lock artifact admission creates its task tree before frozen run.json."""
+    run_dir = tmp_path / "run"
+    attempt = run_dir / "tasks/nuclear-inventory/attempts" / ("a" * 32)
+    attempt.mkdir(parents=True)
+    (run_dir / "tasks/nuclear-inventory/.task.lock").touch()
+    (run_dir / "tasks/nuclear-inventory/terminal.json").write_text(
+        json.dumps({"status": "running", "attempt_id": "a" * 32}) + "\n",
+        encoding="utf-8",
+    )
+    payloads = {
+        "analysis.yaml": b"analysis\n",
+        "correspondence.csv": b"correspondence\n",
+        "qc-decisions.csv": b"decisions\n",
+        "execution-profile.yaml": b"execution\n",
+    }
+
+    initialize_run_from_bytes(
+        run_dir,
+        snapshots=payloads,
+        config_digest="snapshot-digest",
+    )
+
+    assert {
+        path.name: path.read_bytes() for path in (run_dir / "config").iterdir()
+    } == payloads
+    record = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert record["config_digest"] == "snapshot-digest"
+    assert record["output_schema_version"] == 2
 
 
 def test_empty_lamp_inventory_is_an_unavailable_success(tmp_path: Path) -> None:

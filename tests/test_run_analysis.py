@@ -7,87 +7,32 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
-from cyclic_stability import cyexm_artifacts
 from cyclic_stability.models import NuclearConfig
 from cyclic_stability.nuclear import NuclearComponentQc
-from cyexm.workflow.models import WorkflowStatus
+from cyclic_stability.task import ContentIdentity
 from scripts import run_analysis
-from synthetic import write_completion_fixture
 
 
-def test_dapi_inventory_profile_rewrite_cannot_select_unvalidated_root(
+def test_validated_registered_dapi_uses_dapi_only_snapshot(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """DAPI status and layout must consume one exact execution-profile snapshot."""
-    profile_path = tmp_path / "execution.yaml"
-    root_a = tmp_path / "workflow-root-a"
-    root_b = tmp_path / "workflow-root-b"
+    """The entry point must not fall back to whole-workflow target validation."""
+    expected = tmp_path / "registered-405-DAPI.tif"
+    round_spec = SimpleNamespace(acquisition_round=2)
+    observed: list[object] = []
 
-    def profile_bytes(output_root: Path) -> bytes:
-        return f"""schema_version: 1
-executor: sequential
-paths:
-  dataset_root: /synthetic/raw
-  output_root: {output_root}
-  worker_local_directory: null
-""".encode()
-
-    profile_path.write_bytes(profile_bytes(root_a))
-    dapi_a = write_completion_fixture(
-        root_a
-        / "synthetic"
-        / "rounds"
-        / "round-001"
-        / "channels"
-        / "round_2_405_DAPI.tif",
-        b"root-a-dapi",
-    )
-    write_completion_fixture(
-        root_b
-        / "synthetic"
-        / "rounds"
-        / "round-001"
-        / "channels"
-        / "round_2_405_DAPI.tif",
-        b"root-b-dapi",
-    )
-    round_spec = SimpleNamespace(
-        acquisition_round=2,
-        execution_profile=profile_path,
-        workflow_dataset_id="synthetic",
-        workflow_round=1,
-    )
-    original_require = cyexm_artifacts.require_complete_workflow
-    inspected_roots: list[Path] = []
-
-    def complete_status(output_root: str | Path, dataset_id: str) -> WorkflowStatus:
-        inspected_roots.append(Path(output_root))
-        return WorkflowStatus(
-            dataset_id=dataset_id,
-            scientific_fingerprint="synthetic",
-            rounds=(),
-            complete=True,
-        )
-
-    def rewrite_after_status(round_value, *args, **kwargs):
-        assert not args
-        result = original_require(
-            round_value,
-            complete_status,
-            profile=kwargs.get("profile"),
-        )
-        profile_path.write_bytes(profile_bytes(root_b))
-        return result
+    def snapshot(value):
+        observed.append(value)
+        return SimpleNamespace(path=expected)
 
     monkeypatch.setattr(
-        cyexm_artifacts, "require_complete_workflow", rewrite_after_status
+        "cyclic_stability.cyexm_artifacts.snapshot_registered_dapi", snapshot
     )
 
     resolved = run_analysis._validated_registered_dapi(round_spec)
 
-    assert inspected_roots == [root_a.resolve()]
-    assert resolved == dapi_a.resolve()
-    assert resolved.read_bytes() == b"root-a-dapi"
+    assert observed == [round_spec]
+    assert resolved == expected
 
 
 def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
@@ -140,12 +85,14 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         ),
         config_digest="inventory-digest",
     )
-    profile = SimpleNamespace(mode="sequential", native_threads=1)
+    profile = SimpleNamespace(mode="sequential", native_threads=1, scratch_root=None)
     monkeypatch.setattr(
-        "cyclic_stability.config.load_analysis_config", lambda *_args: config
+        "cyclic_stability.config.load_analysis_config_bytes",
+        lambda *_args, **_kwargs: config,
     )
     monkeypatch.setattr(
-        "cyclic_stability.config.load_execution_profile", lambda _path: profile
+        "cyclic_stability.config.load_execution_profile_bytes",
+        lambda *_args, **_kwargs: profile,
     )
     monkeypatch.setattr(
         "cyclic_stability.task.build_tasks",
@@ -159,10 +106,14 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         path.write_bytes(f"dapi-{number}-v1".encode())
         dapi_paths[number] = path
     monkeypatch.setattr(
-        run_analysis,
-        "_validated_registered_dapi",
-        lambda round_spec: dapi_paths[round_spec.acquisition_round],
-        raising=False,
+        "cyclic_stability.cyexm_artifacts.snapshot_registered_dapi",
+        lambda round_spec: SimpleNamespace(
+            path=dapi_paths[round_spec.acquisition_round].resolve(),
+            geometry=SimpleNamespace(shape=(3, 3, 3)),
+            identities=(
+                ContentIdentity.from_path(dapi_paths[round_spec.acquisition_round]),
+            ),
+        ),
     )
     monkeypatch.setattr(run_analysis, "_software_identity", lambda: "repository-v1")
     opened: list[str] = []
@@ -239,7 +190,9 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
     inventory = attempt_dir / "nuclear-inventory.json"
     payload = json.loads(inventory.read_text(encoding="utf-8"))
     assert payload["accepted_component_count_range"] == [1, 6]
-    assert payload["all_fields_within_contract"] is True
+    assert payload["all_fields_ready"] is True
+    assert payload["all_fields_surface_ready"] is True
+    assert payload["all_fields_within_count_contract"] is True
     assert payload["cells"] == [
         {
             "accepted_count": 1,
@@ -273,7 +226,9 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
                 },
             ],
             "field_id": "lamin/Field-A",
+            "ready": True,
             "surface_realization": {"status": "complete"},
+            "surface_ready": True,
             "within_accepted_component_contract": True,
         }
     ]
@@ -411,7 +366,9 @@ def test_nuclear_inventory_reports_out_of_contract_before_target_work(
 
     assert payload == {
         "accepted_component_count_range": [1, 6],
-        "all_fields_within_contract": False,
+        "all_fields_ready": False,
+        "all_fields_surface_ready": False,
+        "all_fields_within_count_contract": False,
         "cells": [
             {
                 "accepted_count": 0,
@@ -421,11 +378,13 @@ def test_nuclear_inventory_reports_out_of_contract_before_target_work(
                 "cohort": "lamin",
                 "components": [],
                 "field_id": "lamin/Field-Z",
+                "ready": False,
                 "surface_realization": {
                     "error_type": "ValueError",
                     "message": "accepted nuclear component count 0 is outside range",
                     "status": "failed",
                 },
+                "surface_ready": False,
                 "within_accepted_component_contract": False,
             }
         ],
@@ -497,12 +456,16 @@ def test_nuclear_inventory_publishes_component_qc_when_strict_normals_fail(
 
     payload = run_analysis._nuclear_inventory_payload(config, (cell,))
 
-    assert payload["all_fields_within_contract"] is False
+    assert payload["all_fields_ready"] is False
+    assert payload["all_fields_surface_ready"] is False
+    assert payload["all_fields_within_count_contract"] is True
     row = payload["cells"][0]
     assert row["candidate_count"] == 1
     assert row["accepted_count"] == 1
     assert row["components"][0]["nucleus_id"] == "N001"
     assert row["within_accepted_component_contract"] is True
+    assert row["surface_ready"] is False
+    assert row["ready"] is False
     assert row["surface_realization"] == {
         "error_type": "ValueError",
         "message": "surface normal interpolation is degenerate",
@@ -530,12 +493,14 @@ def test_nuclear_inventory_rejects_empty_selection(
         reference_acquisition_round=2,
         config_digest="empty-inventory",
     )
-    profile = SimpleNamespace(mode="sequential", native_threads=1)
+    profile = SimpleNamespace(mode="sequential", native_threads=1, scratch_root=None)
     monkeypatch.setattr(
-        "cyclic_stability.config.load_analysis_config", lambda *_args: config
+        "cyclic_stability.config.load_analysis_config_bytes",
+        lambda *_args, **_kwargs: config,
     )
     monkeypatch.setattr(
-        "cyclic_stability.config.load_execution_profile", lambda _path: profile
+        "cyclic_stability.config.load_execution_profile_bytes",
+        lambda *_args, **_kwargs: profile,
     )
     monkeypatch.setattr(
         "cyclic_stability.task.build_tasks",
@@ -563,8 +528,17 @@ def test_nuclear_inventory_rejects_empty_selection(
     )
 
     assert result == 1
-    assert (
-        "unavailable: no cells selected for nuclear inventory"
-        in capsys.readouterr().out
+    assert "failed target-blind nuclear inventory" in capsys.readouterr().out
+    terminal = json.loads(
+        (tmp_path / "run/tasks/nuclear-inventory/terminal.json").read_text()
     )
+    failure = json.loads(
+        (
+            tmp_path
+            / "run/tasks/nuclear-inventory/attempts"
+            / terminal["attempt_id"]
+            / "failure.json"
+        ).read_text()
+    )
+    assert failure["message"] == "no cells selected for nuclear inventory"
     assert not (tmp_path / "run" / "nuclear-inventory.json").exists()

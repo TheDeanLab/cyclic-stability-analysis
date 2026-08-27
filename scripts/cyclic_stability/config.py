@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import math
 import re
@@ -171,10 +172,11 @@ def _sequence_numbers(
     return result
 
 
-def _load_yaml(path: Path) -> Mapping[str, Any]:
+def _load_yaml_bytes(payload: bytes, path: Path) -> Mapping[str, Any]:
+    """Parse one analysis YAML from bytes already owned by a caller snapshot."""
     try:
-        value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
+        value = yaml.safe_load(payload.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
         raise ValueError(f"cannot read YAML {path}: {error}") from error
     return _mapping(
         value,
@@ -192,6 +194,14 @@ def _load_yaml(path: Path) -> Mapping[str, Any]:
             "paths",
         },
     )
+
+
+def _load_yaml(path: Path) -> Mapping[str, Any]:
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read YAML {path}: {error}") from error
+    return _load_yaml_bytes(payload, path)
 
 
 def _parse_scientific_config(
@@ -334,17 +344,21 @@ def _parse_scientific_config(
     )
 
 
-def _read_csv(path: Path, columns: tuple[str, ...], label: str) -> list[dict[str, str]]:
+def _read_csv_bytes(
+    payload: bytes,
+    path: Path,
+    columns: tuple[str, ...],
+    label: str,
+) -> list[dict[str, str]]:
+    """Parse one strict CSV from bytes already owned by a caller snapshot."""
     try:
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            if tuple(reader.fieldnames or ()) != columns:
-                raise ValueError(
-                    f"{label} columns must exactly match the frozen schema"
-                )
-            rows = list(reader)
-    except OSError as error:
+        handle = io.StringIO(payload.decode("utf-8"), newline="")
+    except UnicodeDecodeError as error:
         raise ValueError(f"cannot read {label} {path}: {error}") from error
+    reader = csv.DictReader(handle)
+    if tuple(reader.fieldnames or ()) != columns:
+        raise ValueError(f"{label} columns must exactly match the frozen schema")
+    rows = list(reader)
     for line_number, row in enumerate(rows, start=2):
         if None in row or any(value is None for value in row.values()):
             raise ValueError(
@@ -353,6 +367,14 @@ def _read_csv(path: Path, columns: tuple[str, ...], label: str) -> list[dict[str
         if any(not value.strip() for value in row.values()):
             raise ValueError(f"{label} row {line_number} contains an empty value")
     return rows
+
+
+def _read_csv(path: Path, columns: tuple[str, ...], label: str) -> list[dict[str, str]]:
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"cannot read {label} {path}: {error}") from error
+    return _read_csv_bytes(payload, path, columns, label)
 
 
 def _resolve_path(root: Path, relative: str, name: str) -> Path:
@@ -491,10 +513,9 @@ def _validate_cohort_settings(
                     )
 
 
-def _parse_qc_decisions(
-    path: Path, valid_rounds: set[tuple[str, str, int]]
+def _parse_qc_decision_rows(
+    rows: list[dict[str, str]], valid_rounds: set[tuple[str, str, int]]
 ) -> tuple[QcDecision, ...]:
-    rows = _read_csv(path, QC_COLUMNS, "QC decisions")
     decisions: list[QcDecision] = []
     seen: set[tuple[str, str, int]] = set()
     for line_number, row in enumerate(rows, start=2):
@@ -535,6 +556,14 @@ def _parse_qc_decisions(
     return tuple(decisions)
 
 
+def _parse_qc_decisions(
+    path: Path, valid_rounds: set[tuple[str, str, int]]
+) -> tuple[QcDecision, ...]:
+    return _parse_qc_decision_rows(
+        _read_csv(path, QC_COLUMNS, "QC decisions"), valid_rounds
+    )
+
+
 def _digest(
     analysis: Mapping[str, Any],
     correspondence: list[dict[str, str]],
@@ -565,7 +594,47 @@ def load_analysis_config(
     path: Path, correspondence_path: Path, qc_path: Path
 ) -> AnalysisConfig:
     """Load all frozen scientific inputs and reject malformed or incomplete inventories."""
-    data = _load_yaml(path)
+    try:
+        payloads = (
+            path.read_bytes(),
+            correspondence_path.read_bytes(),
+            qc_path.read_bytes(),
+        )
+    except OSError as error:
+        raise ValueError(f"cannot read scientific configuration: {error}") from error
+    return load_analysis_config_bytes(
+        *payloads,
+        analysis_path=path,
+        correspondence_path=correspondence_path,
+        qc_path=qc_path,
+    )
+
+
+def load_analysis_config_bytes(
+    analysis_payload: bytes,
+    correspondence_payload: bytes,
+    qc_payload: bytes,
+    *,
+    analysis_path: Path,
+    correspondence_path: Path,
+    qc_path: Path,
+) -> AnalysisConfig:
+    """Parse exact snapshotted scientific bytes without reopening source paths.
+
+    Parameters
+    ----------
+    analysis_payload, correspondence_payload, qc_payload : bytes
+        Exact bytes already hashed by the caller.
+    analysis_path, correspondence_path, qc_path : pathlib.Path
+        Canonical source names used only for error context and relative semantics.
+
+    Returns
+    -------
+    AnalysisConfig
+        Strict immutable scientific configuration derived solely from the supplied
+        byte strings.
+    """
+    data = _load_yaml_bytes(analysis_payload, analysis_path)
     (
         reference,
         spacing,
@@ -577,8 +646,11 @@ def load_analysis_config(
         lysosome,
         paths,
     ) = _parse_scientific_config(data)
-    correspondence = _read_csv(
-        correspondence_path, CORRESPONDENCE_COLUMNS, "correspondence"
+    correspondence = _read_csv_bytes(
+        correspondence_payload,
+        correspondence_path,
+        CORRESPONDENCE_COLUMNS,
+        "correspondence",
     )
     cells = _parse_rounds(correspondence, paths)
     valid_rounds = {
@@ -586,7 +658,9 @@ def load_analysis_config(
         for cell in cells
         for round_spec in cell.rounds
     }
-    decisions = _parse_qc_decisions(qc_path, valid_rounds)
+    decisions = _parse_qc_decision_rows(
+        _read_csv_bytes(qc_payload, qc_path, QC_COLUMNS, "QC decisions"), valid_rounds
+    )
     return AnalysisConfig(
         reference,
         spacing,
@@ -605,9 +679,35 @@ def load_analysis_config(
 def load_execution_profile(path: Path) -> ExecutionProfile:
     """Load a strict machine-specific profile without changing scientific inputs."""
     try:
-        value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
+        payload = path.read_bytes()
+    except OSError as error:
         raise ValueError(f"cannot read execution profile {path}: {error}") from error
+    return load_execution_profile_bytes(payload, source_path=path)
+
+
+def load_execution_profile_bytes(
+    payload: bytes, *, source_path: Path
+) -> ExecutionProfile:
+    """Parse an execution profile solely from exact bytes already hashed.
+
+    Parameters
+    ----------
+    payload : bytes
+        Exact execution-profile bytes owned by the caller snapshot.
+    source_path : pathlib.Path
+        Canonical source name used for error context.
+
+    Returns
+    -------
+    ExecutionProfile
+        Strict immutable operational configuration.
+    """
+    try:
+        value = yaml.safe_load(payload.decode("utf-8"))
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ValueError(
+            f"cannot read execution profile {source_path}: {error}"
+        ) from error
     base_keys = {"mode", "max_workers", "native_threads", "scratch_root"}
     allowed_keys = base_keys | {"slurm"}
     if not isinstance(value, Mapping):

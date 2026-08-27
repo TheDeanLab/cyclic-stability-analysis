@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 import yaml
-from cyclic_stability.config import load_analysis_config, load_execution_profile
+from cyclic_stability.config import (
+    load_analysis_config,
+    load_analysis_config_bytes,
+    load_execution_profile,
+    load_execution_profile_bytes,
+)
 from cyclic_stability.models import EnsembleRow, MetricRow
 
 
@@ -46,6 +51,52 @@ def test_analysis_config_parses_multinuclear_bounds(
     assert config.nuclear.maximum_face_contact_fraction == 0.10
 
 
+def test_analysis_snapshot_parser_consumes_only_supplied_hashed_bytes(
+    config_files: tuple[Path, ...],
+) -> None:
+    """Reopening mutable paths after hashing could parse a different configuration."""
+    analysis, correspondence, decisions = config_files
+    expected = load_analysis_config(analysis, correspondence, decisions)
+    payloads = tuple(path.read_bytes() for path in config_files)
+    analysis.write_text("not: the snapshotted analysis\n", encoding="utf-8")
+    correspondence.write_text("not,the,snapshotted,correspondence\n", encoding="utf-8")
+    decisions.write_text("not,the,snapshotted,decisions\n", encoding="utf-8")
+
+    parsed = load_analysis_config_bytes(
+        payloads[0],
+        payloads[1],
+        payloads[2],
+        analysis_path=analysis,
+        correspondence_path=correspondence,
+        qc_path=decisions,
+    )
+
+    assert parsed == expected
+
+
+def test_execution_snapshot_parser_consumes_only_supplied_hashed_bytes(
+    tmp_path: Path,
+) -> None:
+    """The admitted execution profile must be parsed from its exact snapshot."""
+    profile = tmp_path / "execution.yaml"
+    profile.write_text(
+        "mode: sequential\nmax_workers: 1\nnative_threads: 2\n"
+        f"scratch_root: {tmp_path / 'scratch-a'}\n",
+        encoding="utf-8",
+    )
+    payload = profile.read_bytes()
+    profile.write_text(
+        "mode: sequential\nmax_workers: 1\nnative_threads: 9\n"
+        f"scratch_root: {tmp_path / 'scratch-b'}\n",
+        encoding="utf-8",
+    )
+
+    parsed = load_execution_profile_bytes(payload, source_path=profile)
+
+    assert parsed.native_threads == 2
+    assert parsed.scratch_root == tmp_path / "scratch-a"
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [
@@ -77,10 +128,24 @@ def test_output_rows_default_to_an_explicit_aggregate_nucleus_id() -> None:
     """Legacy row constructors serialize their unambiguous aggregate analysis unit."""
     metric = MetricRow("golgi", "Cell1", 2, "volume", 1.0, "um3", "all", True, "id")
     ensemble = EnsembleRow(
-        "golgi", "Cell1", 2, "volume", "sigma=1", 1.0, 1.0, "um3", "id"
+        cohort="golgi",
+        cell_id="Cell1",
+        acquisition_round=2,
+        endpoint="volume",
+        ensemble_name="sigma=1;sbr=3",
+        ensemble_value=3.0,
+        sigma_um=1.0,
+        threshold_sbr=3.0,
+        surface_tolerance_resolution_units=None,
+        value=1.0,
+        units="um3",
+        source_task_identity="id",
     )
     assert asdict(metric)["nucleus_id"] == "aggregate"
     assert asdict(ensemble)["nucleus_id"] == "aggregate"
+    assert asdict(ensemble)["sigma_um"] == 1.0
+    assert asdict(ensemble)["threshold_sbr"] == 3.0
+    assert asdict(ensemble)["surface_tolerance_resolution_units"] is None
 
 
 def test_config_rejects_numeric_lamp_identity(

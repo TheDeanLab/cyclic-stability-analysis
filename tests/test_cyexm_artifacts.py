@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
+import tifffile
+from cyclic_stability import cyexm_artifacts
 from cyclic_stability.cyexm_artifacts import (
     StatusInspector,
     resolve_round_artifacts,
+    snapshot_registered_dapi,
     validate_completed_artifact,
 )
 from cyclic_stability.models import RoundSpec
 from cyexm.errors import InputValidationError
-from cyexm.registration._request_policy import channel_transform_parameters
+from cyexm.registration._request_policy import (
+    channel_transform_parameters,
+    reference_channel_parameters,
+)
 from cyexm.registration.artifacts import (
     ArtifactStore,
     CompletionRecord,
@@ -90,6 +98,194 @@ def test_completion_identity_mismatch_is_rejected(completed_artifact: Path) -> N
     completed_artifact.write_bytes(completed_artifact.read_bytes() + b"changed")
     with pytest.raises(InputValidationError, match="completion identity mismatch"):
         validate_completed_artifact(completed_artifact)
+
+
+def _write_registered_dapi(
+    path: Path,
+    *,
+    moving: bool,
+    cropped_reference: bool = False,
+    shape: tuple[int, int, int] = (5, 7, 9),
+) -> Path:
+    """Write one realistic DAPI-only completion chain for inventory tests."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    source_root = path.parents[4] / "dapi-provenance"
+    source_root.mkdir(parents=True, exist_ok=True)
+    native = source_root / f"{path.stem}-native.tif"
+    native.write_bytes(b"native-dapi")
+    geometry = ImageGeometry(
+        shape=shape,
+        origin=(0.0, 0.0, 0.0),
+        spacing=(0.2, 0.2, 0.5),
+        direction=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+    )
+    if moving:
+        fixed = source_root / "fixed-registration-channel.tif"
+        affine = source_root / "linear.mat"
+        warp = source_root / "warp.nii.gz"
+        fixed.write_bytes(b"fixed")
+        affine.write_bytes(b"affine")
+        warp.write_bytes(b"warp")
+        request = StageRequest.for_files(
+            stage="channel-transform-v1",
+            inputs=(fixed, native, affine, warp),
+            geometry=geometry,
+            method="warp-affine",
+            accuracy="not-applicable",
+            native_threads={},
+            upstream=FileIdentity.from_path(warp),
+            parameters=channel_transform_parameters(
+                pixel_size_xyz=geometry.spacing, interpolation="linear"
+            ),
+        )
+    else:
+        crop_bounds = source_root / "crop-bounds.json"
+        if cropped_reference:
+            crop_bounds.write_bytes(b"crop-bounds")
+        request = StageRequest.for_files(
+            stage="reference-channel",
+            inputs=(native,),
+            geometry=geometry,
+            method="uint16-tiff",
+            accuracy="exact",
+            native_threads={},
+            upstream=(
+                FileIdentity.from_path(crop_bounds) if cropped_reference else None
+            ),
+            parameters=reference_channel_parameters(index=0, cropped=cropped_reference),
+        )
+    image = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
+    ArtifactStore().commit(
+        path,
+        request,
+        lambda target: tifffile.imwrite(target, image),
+        lambda target: tifffile.imread(target).shape == shape,
+    )
+    return path
+
+
+def test_dapi_snapshot_accepts_cropped_reference_and_binds_crop_provenance(
+    tmp_path: Path,
+) -> None:
+    """A valid cropped fixed DAPI must retain its authoritative crop upstream."""
+    output_root = tmp_path / "workflow-root"
+    profile = tmp_path / "execution.yaml"
+    profile.write_text(
+        f"""schema_version: 1
+executor: sequential
+paths:
+  dataset_root: /synthetic/raw
+  output_root: {output_root}
+  worker_local_directory: null
+""",
+        encoding="utf-8",
+    )
+    round_spec = replace(
+        _lamin_round(
+            tmp_path, acquisition_round=2, workflow_round=1, complete_moving=False
+        ),
+        execution_profile=profile,
+    )
+    dapi = _write_registered_dapi(
+        output_root / "synthetic/rounds/round-001/channels/round_2_405_DAPI.tif",
+        moving=False,
+        cropped_reference=True,
+    )
+
+    snapshot = snapshot_registered_dapi(round_spec)
+
+    assert snapshot.path == dapi.resolve()
+    assert snapshot.record.request.parameters["cropped"] is True
+    assert snapshot.record.request.upstream is not None
+    assert any(
+        Path(item.path).name == "crop-bounds.json" for item in snapshot.identities
+    )
+
+
+@pytest.mark.parametrize("target_state", ("missing", "invalid"))
+def test_dapi_snapshot_ignores_missing_or_invalid_target_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_state: str,
+) -> None:
+    """DAPI inventory must not inherit target-specific workflow completeness."""
+    output_root = tmp_path / "workflow-root"
+    profile = tmp_path / "execution.yaml"
+    profile.write_text(
+        f"""schema_version: 1
+executor: sequential
+paths:
+  dataset_root: /synthetic/raw
+  output_root: {output_root}
+  worker_local_directory: null
+""",
+        encoding="utf-8",
+    )
+    round_root = output_root / "synthetic" / "rounds" / "round-003"
+    dapi = _write_registered_dapi(
+        round_root / "channels" / "round_3_405_DAPI.tif", moving=True
+    )
+    target = round_root / "channels" / "round_3_647_lamin.tif"
+    if target_state == "invalid":
+        target.write_bytes(b"invalid-target-without-completion")
+    round_spec = RoundSpec(
+        cohort="lamin",
+        cell_id="Cell1",
+        acquisition_round=3,
+        workflow_round=3,
+        nd2_path=tmp_path / "source.nd2",
+        tiff_directory=tmp_path / "raw",
+        z_start_offset=1,
+        target_exposure_ms=200.0,
+        target_laser_percent=40.0,
+        tubulin_exposure_ms=200.0,
+        dapi_exposure_ms=200.0,
+        dataset_manifest=tmp_path / "dataset.yaml",
+        execution_profile=profile,
+        workflow_dataset_id="synthetic",
+        identity_method="exact-pixel-audit",
+    )
+    monkeypatch.setattr(
+        cyexm_artifacts,
+        "inspect_workflow_status",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("DAPI-only inventory consulted whole-workflow status")
+        ),
+    )
+
+    snapshot = snapshot_registered_dapi(round_spec)
+
+    assert snapshot.path == dapi.resolve()
+    assert snapshot.geometry.shape == (5, 7, 9)
+    assert snapshot.record.request.stage == "channel-transform-v1"
+    assert all("647_lamin" not in identity.path for identity in snapshot.identities)
+
+
+def test_dapi_snapshot_rejects_non_authoritative_channel_stage(tmp_path: Path) -> None:
+    """A generic artifact record cannot attest to registered DAPI provenance."""
+    output_root = tmp_path / "workflow-root"
+    profile = tmp_path / "execution.yaml"
+    profile.write_text(
+        f"""schema_version: 1
+executor: sequential
+paths:
+  dataset_root: /synthetic/raw
+  output_root: {output_root}
+  worker_local_directory: null
+""",
+        encoding="utf-8",
+    )
+    dapi = output_root / "synthetic/rounds/round-003/channels/round_3_405_DAPI.tif"
+    write_completion_fixture(dapi, b"not-a-channel-transform")
+    round_spec = replace(
+        _lamin_round(
+            tmp_path, acquisition_round=3, workflow_round=3, complete_moving=False
+        ),
+        execution_profile=profile,
+    )
+
+    with pytest.raises(InputValidationError, match="DAPI completion stage"):
+        snapshot_registered_dapi(round_spec)
 
 
 def test_symlinked_completion_record_is_rejected(completed_artifact: Path) -> None:

@@ -44,6 +44,7 @@ from cyclic_stability.nuclear import (
     _atomic_publish_directory,
     _surface_from_mask,
     consensus_nuclear_surface,
+    write_nuclear_component_diagnostic,
 )
 from cyclic_stability.units import theoretical_resolution
 
@@ -594,17 +595,26 @@ def _ensemble_row(
     value: float,
     units: str,
     config: AnalysisConfig,
+    *,
+    surface_tolerance_resolution_units: float | None = None,
 ) -> EnsembleRow:
     return EnsembleRow(
-        "golgi",
-        "array",
-        round_number,
-        endpoint,
-        f"sigma={sigma_um:g};sbr={threshold_sbr:g}",
-        threshold_sbr,
-        value,
-        units,
-        config.config_digest,
+        cohort="golgi",
+        cell_id="array",
+        acquisition_round=round_number,
+        endpoint=endpoint,
+        ensemble_name=f"sigma={sigma_um:g};sbr={threshold_sbr:g}",
+        ensemble_value=(
+            surface_tolerance_resolution_units
+            if surface_tolerance_resolution_units is not None
+            else threshold_sbr
+        ),
+        sigma_um=sigma_um,
+        threshold_sbr=threshold_sbr,
+        surface_tolerance_resolution_units=surface_tolerance_resolution_units,
+        value=value,
+        units=units,
+        source_task_identity=config.config_digest,
     )
 
 
@@ -612,18 +622,18 @@ def _comparison_values(
     reference_mask: NDArray[np.bool_],
     moving_mask: NDArray[np.bool_],
     config: AnalysisConfig,
-) -> dict[str, float]:
+) -> tuple[tuple[str, float, float | None], ...]:
     """Return reference-round surface measures without favorable empty agreement."""
     if not np.any(reference_mask) or not np.any(moving_mask):
-        return {
-            "jaccard": math.nan,
-            "fixed_to_moving_boundary_distance_p95": math.nan,
-            "moving_to_fixed_boundary_distance_p95": math.nan,
-            **{
-                f"surface_dice_{tolerance:g}": math.nan
+        return (
+            ("jaccard", math.nan, None),
+            ("fixed_to_moving_boundary_distance_p95", math.nan, None),
+            ("moving_to_fixed_boundary_distance_p95", math.nan, None),
+            *(
+                (f"surface_dice_{tolerance:g}", math.nan, tolerance)
                 for tolerance in config.ensembles.surface_tolerance_resolution_units
-            },
-        }
+            ),
+        )
     resolution = theoretical_resolution(
         config.optics.target_wavelength_um,
         config.optics.numerical_aperture,
@@ -637,19 +647,23 @@ def _comparison_values(
         resolution,
         config.ensembles.surface_tolerance_resolution_units,
     )
-    return {
-        "jaccard": metrics.jaccard,
-        "fixed_to_moving_boundary_distance_p95": float(
-            metrics.fixed_to_moving_normalized_distance_p95
+    return (
+        ("jaccard", metrics.jaccard, None),
+        (
+            "fixed_to_moving_boundary_distance_p95",
+            float(metrics.fixed_to_moving_normalized_distance_p95),
+            None,
         ),
-        "moving_to_fixed_boundary_distance_p95": float(
-            metrics.moving_to_fixed_normalized_distance_p95
+        (
+            "moving_to_fixed_boundary_distance_p95",
+            float(metrics.moving_to_fixed_normalized_distance_p95),
+            None,
         ),
-        **{
-            f"surface_dice_{tolerance:g}": value
+        *(
+            (f"surface_dice_{tolerance:g}", value, tolerance)
             for tolerance, value in metrics.surface_dice.items()
-        },
-    }
+        ),
+    )
 
 
 def analyze_golgi_arrays(
@@ -772,11 +786,14 @@ def analyze_golgi_arrays(
                 "nuclear_distance_p75_um": float(np.percentile(distances, 75.0))
                 if distances.size
                 else math.nan,
-                **_comparison_values(
-                    reference_member.mask_zyx, member.mask_zyx, config
-                ),
             }
-            for endpoint, value in values.items():
+            exact_values = [
+                (endpoint, value, None) for endpoint, value in values.items()
+            ]
+            exact_values.extend(
+                _comparison_values(reference_member.mask_zyx, member.mask_zyx, config)
+            )
+            for endpoint, value, tolerance in exact_values:
                 ensemble_rows.append(
                     _ensemble_row(
                         round_number,
@@ -786,6 +803,7 @@ def analyze_golgi_arrays(
                         value,
                         units[endpoint],
                         config,
+                        surface_tolerance_resolution_units=tolerance,
                     )
                 )
                 if math.isfinite(value):
@@ -838,6 +856,7 @@ def _rebind_cell(result: MarkerResult, cell: CellSpec) -> MarkerResult:
 def _write_diagnostics(
     output_dir: Path,
     rounds: Mapping[int, NDArray[np.float64]],
+    dapi_rounds: Mapping[int, NDArray[np.float64]],
     result: MarkerResult,
     consensus: NuclearConsensus,
     roi: NDArray[np.bool_],
@@ -852,6 +871,9 @@ def _write_diagnostics(
         import matplotlib.pyplot as plt
 
         staging_root = staged
+        component_diagnostic = write_nuclear_component_diagnostic(
+            staged, result.cell_id, dapi_rounds, consensus
+        )
         overlay = staged / "golgi-registered-overlays.npz"
         np.savez_compressed(
             overlay,
@@ -913,7 +935,7 @@ def _write_diagnostics(
             figure.savefig(path, dpi=200)
             plt.close(figure)
             figure_paths.append(path)
-        staged_paths = (overlay, curves, *figure_paths)
+        staged_paths = (component_diagnostic, overlay, curves, *figure_paths)
 
     _atomic_publish_directory(output_dir, populate)
     assert staging_root is not None
@@ -969,7 +991,7 @@ def analyze_golgi_cell(
         for round_number, image in golgi.items()
     }
     diagnostics = _write_diagnostics(
-        output_dir, golgi, result, consensus, roi, threshold_masks
+        output_dir, golgi, dapi, result, consensus, roi, threshold_masks
     )
     return replace(
         result,

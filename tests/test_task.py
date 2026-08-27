@@ -34,6 +34,34 @@ from cyexm.spatial import ImageGeometry
 from synthetic import cell_task, different_identity
 
 
+def _artifact_task(
+    source: Path,
+    producer,
+    *,
+    config_digest: str = "config-v1",
+    software_identity: str = "repository-v1",
+) -> task_module.ArtifactTask:
+    """Adapt concise lifecycle fixtures to the mandatory snapshot contract."""
+
+    def snapshot():
+        identity = task_module.ContentIdentity.from_path(source)
+        return task_module.ArtifactSnapshot(
+            context=Path(identity.path),
+            config_digest=config_digest,
+            input_identities=(identity,),
+        )
+
+    def admitted_producer(output_dir: Path, _context: object) -> tuple[Path, ...]:
+        return producer(output_dir)
+
+    return task_module.ArtifactTask(
+        key="nuclear-inventory",
+        software_identity=software_identity,
+        snapshot=snapshot,
+        producer=admitted_producer,
+    )
+
+
 def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
     analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -429,24 +457,15 @@ def test_artifact_task_changed_input_or_repository_preserves_prior_evidence(
         output.write_text('{\n    "status": "complete"\n}\n', encoding="utf-8")
         return (output,)
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=publish,
-    )
+    task = _artifact_task(source, publish)
     first = task_module.run_artifact_task(task, tmp_path / "run")
     reopened = task_module.run_artifact_task(task, tmp_path / "run")
     assert reopened.attempt_id == first.attempt_id
     assert reopened.reused is True
 
     source.write_bytes(b"dapi-v2")
-    changed_input = replace(
-        task, input_identities=(task_module.ContentIdentity.from_path(source),)
-    )
-    second = task_module.run_artifact_task(changed_input, tmp_path / "run")
-    changed_repository = replace(changed_input, software_identity="repository-v2")
+    second = task_module.run_artifact_task(task, tmp_path / "run")
+    changed_repository = replace(task, software_identity="repository-v2")
     third = task_module.run_artifact_task(changed_repository, tmp_path / "run")
 
     assert len({first.attempt_id, second.attempt_id, third.attempt_id}) == 3
@@ -482,13 +501,7 @@ def test_artifact_task_failure_has_failed_terminal_pointer(
     def fail(_output_dir: Path) -> tuple[Path, ...]:
         raise ValueError("synthetic inventory failure")
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=fail,
-    )
+    task = _artifact_task(source, fail)
     record = task_module.run_artifact_task(task, tmp_path / "run")
 
     assert record.status == "failed"
@@ -499,9 +512,9 @@ def test_artifact_task_failure_has_failed_terminal_pointer(
     assert failure["message"] == "synthetic inventory failure"
     assert failure["attempt_id"] == record.attempt_id
     assert failure["key"] == task.key
-    assert failure["config_digest"] == task.config_digest
+    assert failure["config_digest"] == "config-v1"
     assert failure["input_identities"] == [
-        dict(item.to_dict()) for item in task.input_identities
+        dict(task_module.ContentIdentity.from_path(source).to_dict())
     ]
     assert failure["software_identity"] == task.software_identity
     terminal = json.loads(
@@ -510,6 +523,228 @@ def test_artifact_task_failure_has_failed_terminal_pointer(
     assert terminal["status"] == "failed"
     assert terminal["attempt_id"] == record.attempt_id
     assert not (tmp_path / "run" / "tasks" / task.key / "complete.json").exists()
+
+
+def test_artifact_snapshot_runs_under_lock_after_running_authority(
+    tmp_path: Path,
+) -> None:
+    """Moving snapshot work before admission would expose stale success authority."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi-snapshot")
+    observed: list[object] = []
+    run_dir = tmp_path / "run"
+
+    def snapshot():
+        terminal = run_dir / "tasks" / "nuclear-inventory" / "terminal.json"
+        observed.append(json.loads(terminal.read_text(encoding="utf-8"))["status"])
+        identity, payload = task_module.ContentIdentity.read_bytes(source)
+        return task_module.ArtifactSnapshot(
+            context=payload,
+            config_digest="config-from-snapshot",
+            input_identities=(identity,),
+        )
+
+    def publish(output_dir: Path, context: object) -> tuple[Path, ...]:
+        observed.append(context)
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text(json.dumps({"payload": bytes(context).decode()}))
+        return (output,)
+
+    record = task_module.run_artifact_task(
+        task_module.ArtifactTask(
+            key="nuclear-inventory",
+            software_identity="repository-v1",
+            snapshot=snapshot,
+            producer=publish,
+        ),
+        run_dir,
+    )
+
+    assert record.status == "complete"
+    assert record.config_digest == "config-from-snapshot"
+    assert observed == ["running", b"dapi-snapshot"]
+
+
+def test_artifact_snapshot_input_rewrite_during_parse_fails_before_producer(
+    tmp_path: Path,
+) -> None:
+    """Parsed bytes whose authoritative entry changed must never reach production."""
+    source = tmp_path / "analysis.yaml"
+    source.write_text("version: one\n", encoding="utf-8")
+    producer_called = False
+
+    def snapshot():
+        identity, payload = task_module.ContentIdentity.read_bytes(source)
+        parsed = payload.decode("utf-8").strip()
+        source.write_text("version: two\n", encoding="utf-8")
+        return task_module.ArtifactSnapshot(
+            context=parsed,
+            config_digest="digest-one",
+            input_identities=(identity,),
+        )
+
+    def publish(_output_dir: Path, _context: object) -> tuple[Path, ...]:
+        nonlocal producer_called
+        producer_called = True
+        raise AssertionError("producer must not run from a stale snapshot")
+
+    record = task_module.run_artifact_task(
+        task_module.ArtifactTask(
+            key="nuclear-inventory",
+            software_identity="repository-v1",
+            snapshot=snapshot,
+            producer=publish,
+        ),
+        tmp_path / "run",
+    )
+
+    assert record.status == "failed"
+    assert producer_called is False
+    failure = json.loads((record.attempt_dir / "failure.json").read_text())
+    assert failure["message"] == (
+        "one or more immutable task inputs changed before execution"
+    )
+
+
+def test_artifact_snapshot_canonical_context_survives_parent_alias_retarget(
+    tmp_path: Path,
+) -> None:
+    """A producer must consume the canonical snapshot path, never a retargeted alias."""
+    root_a = tmp_path / "root-a"
+    root_b = tmp_path / "root-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    (root_a / "input.txt").write_text("root-a", encoding="utf-8")
+    (root_b / "input.txt").write_text("root-b", encoding="utf-8")
+    alias = tmp_path / "current"
+    alias.symlink_to(root_a, target_is_directory=True)
+
+    def snapshot():
+        identity, payload = task_module.ContentIdentity.read_bytes(alias / "input.txt")
+        alias.unlink()
+        alias.symlink_to(root_b, target_is_directory=True)
+        return task_module.ArtifactSnapshot(
+            context=(Path(identity.path), payload),
+            config_digest="canonical-a",
+            input_identities=(identity,),
+        )
+
+    def publish(output_dir: Path, context: object) -> tuple[Path, ...]:
+        canonical, payload = context
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text(
+            json.dumps(
+                {
+                    "canonical": str(canonical),
+                    "snapshotted": payload.decode(),
+                    "consumed": canonical.read_text(encoding="utf-8"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return (output,)
+
+    record = task_module.run_artifact_task(
+        task_module.ArtifactTask(
+            key="nuclear-inventory",
+            software_identity="repository-v1",
+            snapshot=snapshot,
+            producer=publish,
+        ),
+        tmp_path / "run",
+    )
+
+    assert record.status == "complete"
+    payload = json.loads(Path(record.output_identities[0].path).read_text())
+    assert payload == {
+        "canonical": str((root_a / "input.txt").resolve()),
+        "snapshotted": "root-a",
+        "consumed": "root-a",
+    }
+
+
+def test_group_snapshot_keeps_one_parent_directory_when_alias_retargets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Related configuration files must not be mixed across alias generations."""
+    root_a = tmp_path / "root-a"
+    root_b = tmp_path / "root-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    for root, marker in ((root_a, "A"), (root_b, "B")):
+        (root / "analysis.yaml").write_text(marker, encoding="utf-8")
+        (root / "correspondence.csv").write_text(marker, encoding="utf-8")
+    alias = tmp_path / "current"
+    alias.symlink_to(root_a, target_is_directory=True)
+    original_read = os.read
+    retargeted = False
+
+    def retarget_after_first_payload(descriptor: int, size: int) -> bytes:
+        nonlocal retargeted
+        payload = original_read(descriptor, size)
+        if not retargeted and payload == b"A":
+            alias.unlink()
+            alias.symlink_to(root_b, target_is_directory=True)
+            retargeted = True
+        return payload
+
+    monkeypatch.setattr(os, "read", retarget_after_first_payload)
+
+    snapshots = task_module.ContentIdentity.read_bytes_many(
+        (alias / "analysis.yaml", alias / "correspondence.csv")
+    )
+
+    assert retargeted is True
+    assert [payload for _identity, payload in snapshots] == [b"A", b"A"]
+    assert {Path(identity.path).parent for identity, _payload in snapshots} == {
+        root_a.resolve()
+    }
+
+
+def test_artifact_discovery_failure_supersedes_prior_success(
+    tmp_path: Path,
+) -> None:
+    """Every invocation must rediscover inputs before considering prior reuse."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi")
+    discovery_available = True
+    producer_calls = 0
+
+    def snapshot():
+        if not discovery_available:
+            raise ValueError("synthetic DAPI discovery failure")
+        return task_module.ArtifactSnapshot(
+            context="discovered",
+            config_digest="config-v1",
+            input_identities=(task_module.ContentIdentity.from_path(source),),
+        )
+
+    def publish(output_dir: Path, context: object) -> tuple[Path, ...]:
+        nonlocal producer_calls
+        producer_calls += 1
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text(json.dumps({"context": context}), encoding="utf-8")
+        return (output,)
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        software_identity="repository-v1",
+        snapshot=snapshot,
+        producer=publish,
+    )
+    first = task_module.run_artifact_task(task, tmp_path / "run")
+    discovery_available = False
+    failed = task_module.run_artifact_task(task, tmp_path / "run")
+
+    assert first.status == "complete"
+    assert failed.status == "failed"
+    assert failed.attempt_id != first.attempt_id
+    assert producer_calls == 1
+    terminal = json.loads(
+        (tmp_path / "run/tasks/nuclear-inventory/terminal.json").read_text()
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_id"] == failed.attempt_id
 
 
 def test_producer_input_mutation_never_publishes_completion(tmp_path: Path) -> None:
@@ -525,13 +760,7 @@ def test_producer_input_mutation_never_publishes_completion(tmp_path: Path) -> N
         os.utime(source, ns=(source.stat().st_atime_ns, original_mtime))
         return (output,)
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=mutate_input,
-    )
+    task = _artifact_task(source, mutate_input)
 
     failed = task_module.run_artifact_task(task, tmp_path / "run")
 
@@ -597,13 +826,7 @@ def test_late_input_mutation_is_rejected_at_final_success_boundary(
             task_module, "_record_payload", construct_record_then_mutate
         )
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=publish,
-    )
+    task = _artifact_task(source, publish)
 
     failed = task_module.run_artifact_task(task, tmp_path / "run")
 
@@ -983,7 +1206,7 @@ def test_production_task_rejects_same_metadata_consumed_provenance_tampering(
     assert str(native_source.resolve()) in bound_paths
 
 
-def test_artifact_task_rejects_same_metadata_dapi_tampering(tmp_path: Path) -> None:
+def test_artifact_task_invalidates_same_metadata_dapi_reuse(tmp_path: Path) -> None:
     """Metadata-only input checks would authorize stale DAPI evidence."""
     source = tmp_path / "registered-dapi.tif"
     source.write_bytes(b"dapi-v1")
@@ -994,25 +1217,20 @@ def test_artifact_task_rejects_same_metadata_dapi_tampering(tmp_path: Path) -> N
         output.write_text('{"value":"a"}\n', encoding="utf-8")
         return (output,)
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=publish,
-    )
+    task = _artifact_task(source, publish)
     first = task_module.run_artifact_task(task, tmp_path / "run")
     source.write_bytes(b"dapi-v2")
     os.utime(source, ns=(source.stat().st_atime_ns, original_mtime))
 
     after_tamper = task_module.run_artifact_task(task, tmp_path / "run")
 
-    assert after_tamper.status == "failed"
+    assert after_tamper.status == "complete"
+    assert after_tamper.reused is False
     assert after_tamper.attempt_id != first.attempt_id
     terminal = json.loads(
         (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
     )
-    assert terminal["status"] == "failed"
+    assert terminal["status"] == "complete"
     assert terminal["attempt_id"] == after_tamper.attempt_id
     assert (first.attempt_dir / "record.json").is_file()
 
@@ -1030,13 +1248,7 @@ def test_artifact_task_rejects_same_metadata_published_byte_tampering(
         output.write_text('{"value":"a"}\n', encoding="utf-8")
         return (output,)
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=publish,
-    )
+    task = _artifact_task(source, publish)
     first = task_module.run_artifact_task(task, tmp_path / "run")
     paths = {
         "output": first.attempt_dir / "nuclear-inventory.json",
@@ -1079,13 +1291,7 @@ def test_task_record_replacement_during_parse_invalidates_reuse(
         output.write_text('{"value":"a"}\n', encoding="utf-8")
         return (output,)
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=publish,
-    )
+    task = _artifact_task(source, publish)
     first = task_module.run_artifact_task(task, tmp_path / "run")
     record_path = first.attempt_dir / "record.json"
     replacement = tmp_path / "replacement-record.json"
@@ -1127,13 +1333,7 @@ def test_terminal_replacement_during_decode_invalidates_direct_reuse(
         output.write_text('{"value":"a"}\n', encoding="utf-8")
         return (output,)
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=publish,
-    )
+    task = _artifact_task(source, publish)
     first = task_module.run_artifact_task(task, tmp_path / "run")
     terminal = tmp_path / "run" / "tasks" / task.key / "terminal.json"
     replacement = tmp_path / "failed-terminal.json"
@@ -1295,24 +1495,14 @@ def test_changed_input_failure_supersedes_prior_success_terminal(
         output.write_text('{"value":"a"}\n', encoding="utf-8")
         return (output,)
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=publish,
-    )
+    task = _artifact_task(source, publish)
     first = task_module.run_artifact_task(task, tmp_path / "run")
     source.write_bytes(b"dapi-v2")
 
     def fail(_output_dir: Path) -> tuple[Path, ...]:
         raise ValueError("synthetic changed-input failure")
 
-    changed = replace(
-        task,
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        producer=fail,
-    )
+    changed = _artifact_task(source, fail)
     failed = task_module.run_artifact_task(changed, tmp_path / "run")
 
     assert failed.status == "failed"
@@ -1337,13 +1527,7 @@ def test_cleanup_failure_publishes_only_failed_terminal(
         output.write_text('{"value":"a"}\n', encoding="utf-8")
         return (output,)
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=publish,
-    )
+    task = _artifact_task(source, publish)
 
     def fail_cleanup(_path: Path) -> None:
         raise OSError("synthetic scratch cleanup failure")
@@ -1375,13 +1559,7 @@ def test_admitted_attempt_cannot_expose_prior_success_when_failure_publication_f
         output.write_text('{"value":"a"}\n', encoding="utf-8")
         return (output,)
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=publish,
-    )
+    task = _artifact_task(source, publish)
     first = task_module.run_artifact_task(task, tmp_path / "run")
 
     def fail(_output_dir: Path) -> tuple[Path, ...]:
@@ -1399,7 +1577,7 @@ def test_admitted_attempt_cannot_expose_prior_success_when_failure_publication_f
         original_atomic(path, payload)
 
     monkeypatch.setattr(task_module, "_atomic_bytes", fail_publication)
-    changed = replace(task, config_digest="config-v2", producer=fail)
+    changed = _artifact_task(source, fail, config_digest="config-v2")
     with pytest.raises(OSError, match="publication failure"):
         task_module.run_artifact_task(changed, tmp_path / "run")
 
@@ -1423,13 +1601,7 @@ def test_terminal_authority_retires_coexisting_legacy_complete_pointer(
         output.write_text('{"value":"a"}\n', encoding="utf-8")
         return (output,)
 
-    task = task_module.ArtifactTask(
-        key="nuclear-inventory",
-        config_digest="config-v1",
-        input_identities=(task_module.ContentIdentity.from_path(source),),
-        software_identity="repository-v1",
-        producer=publish,
-    )
+    task = _artifact_task(source, publish)
     first = task_module.run_artifact_task(task, tmp_path / "run")
     task_dir = tmp_path / "run" / "tasks" / task.key
     legacy = task_dir / "complete.json"

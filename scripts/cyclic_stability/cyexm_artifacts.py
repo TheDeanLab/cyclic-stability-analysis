@@ -26,6 +26,7 @@ from cyexm.registration.artifacts import (
     StageRequest,
 )
 from cyexm.registration.whole_image import RegistrationPaths
+from cyexm.spatial import ImageGeometry
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import WorkflowStatus
 from cyexm.workflow.status import inspect_workflow_status
@@ -71,6 +72,17 @@ class CellValidationReport:
     cell_id: str
     source_matches: tuple[ChannelMatch, ...]
     rounds: tuple[RoundArtifacts, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DapiArtifactSnapshot:
+    """Exact DAPI-only artifact, completion, geometry, and provenance snapshot."""
+
+    path: Path
+    record_path: Path
+    record: CompletionRecord
+    geometry: ImageGeometry
+    identities: tuple[ContentIdentity, ...]
 
 
 def _completion_record_from_bytes(payload: bytes) -> CompletionRecord:
@@ -220,6 +232,135 @@ def validate_completed_artifact(path: Path) -> CompletionRecord:
     """Validate an artifact against the immutable identity in its completion record."""
     record, _, _, _ = _validated_completion_snapshot(path)
     return record
+
+
+def snapshot_registered_dapi(round_spec: RoundSpec) -> DapiArtifactSnapshot:
+    """Validate only one registered DAPI artifact and its necessary provenance.
+
+    This boundary deliberately does not inspect whole-workflow status, tubulin
+    channel completion, or the target-channel artifact. Moving DAPI must carry the
+    exact channel-transform request; reference DAPI must carry the exact reference
+    channel stage. The returned identities include the execution profile, DAPI
+    completion record, DAPI artifact, and every input named by that DAPI request.
+
+    Parameters
+    ----------
+    round_spec : RoundSpec
+        One configured acquisition/workflow-round mapping.
+
+    Returns
+    -------
+    DapiArtifactSnapshot
+        Canonical DAPI path, parsed authoritative record, fixed-grid geometry, and
+        complete content identities needed by DAPI-only inventory.
+
+    Raises
+    ------
+    InputValidationError
+        If the DAPI artifact, completion stage, request inputs, or TIFF geometry is
+        inconsistent. Target-channel state is never consulted.
+    """
+    import tifffile
+    from cyexm.registration._request_policy import (
+        channel_transform_parameters,
+        reference_channel_parameters,
+    )
+
+    profile, profile_identity = _execution_profile_snapshot(
+        round_spec.execution_profile
+    )
+    round_layout = WorkflowLayout.for_dataset(
+        profile.paths.output_root, round_spec.workflow_dataset_id
+    ).round(round_spec.workflow_round)
+    expected = round_layout.channel(
+        f"round_{round_spec.acquisition_round}_405_DAPI.tif"
+    )
+    record, record_path, record_identity, artifact_identity = (
+        _validated_completion_snapshot(expected)
+    )
+    canonical = Path(artifact_identity.path)
+    request = record.request
+    if round_spec.acquisition_round == 2:
+        channel_index = request.parameters.get("channel_index")
+        cropped = request.parameters.get("cropped")
+        reference_parameters_are_exact = (
+            type(channel_index) is int
+            and channel_index >= 0
+            and isinstance(cropped, bool)
+            and dict(request.parameters)
+            == reference_channel_parameters(index=channel_index, cropped=cropped)
+        )
+        if (
+            request.stage != "reference-channel"
+            or request.method != "uint16-tiff"
+            or request.accuracy != "exact"
+            or len(request.inputs) != 1
+            or not reference_parameters_are_exact
+            or (cropped is True) != (request.upstream is not None)
+        ):
+            raise InputValidationError(
+                "DAPI completion stage is not an authoritative reference channel"
+            )
+    else:
+        expected_parameters = channel_transform_parameters(
+            pixel_size_xyz=request.geometry.spacing,
+            interpolation="linear",
+        )
+        if (
+            request.stage != "channel-transform-v1"
+            or request.method != "warp-affine"
+            or request.accuracy != "not-applicable"
+            or len(request.inputs) != 4
+            or request.upstream != request.inputs[3]
+            or dict(request.parameters) != dict(expected_parameters)
+        ):
+            raise InputValidationError(
+                "DAPI completion stage is not an authoritative channel transform"
+            )
+    input_identities: list[ContentIdentity] = []
+    declared_provenance = list(request.inputs)
+    if request.upstream is not None and request.upstream not in declared_provenance:
+        declared_provenance.append(request.upstream)
+    for declared in declared_provenance:
+        try:
+            identity = ContentIdentity.from_path(Path(declared.path))
+        except (OSError, ValueError) as error:
+            raise InputValidationError(
+                "DAPI completion input provenance is unreadable"
+            ) from error
+        metadata = FileIdentity(identity.path, identity.st_size, identity.st_mtime_ns)
+        if metadata != declared:
+            raise InputValidationError(
+                "DAPI completion input provenance identity mismatch"
+            )
+        input_identities.append(identity)
+    try:
+        with tifffile.TiffFile(canonical) as handle:
+            if len(handle.series) != 1:
+                raise ValueError("registered DAPI must contain exactly one TIFF series")
+            actual_shape = tuple(int(value) for value in handle.series[0].shape)
+            actual_dtype = handle.series[0].dtype
+    except (OSError, ValueError, tifffile.TiffFileError) as error:
+        raise InputValidationError("registered DAPI TIFF is unreadable") from error
+    if actual_shape != tuple(request.geometry.shape) or actual_dtype.kind not in "uif":
+        raise InputValidationError(
+            "registered DAPI TIFF does not match authoritative fixed-grid geometry"
+        )
+    identities = (
+        profile_identity,
+        record_identity,
+        artifact_identity,
+        *input_identities,
+    )
+    if not all(identity.matches_path() for identity in identities):
+        raise InputValidationError("registered DAPI provenance changed during snapshot")
+    return DapiArtifactSnapshot(
+        canonical,
+        record_path,
+        record,
+        request.geometry,
+        identities,
+    )
 
 
 def require_complete_workflow(
@@ -380,10 +521,12 @@ def validate_cell_inputs(cell: CellSpec) -> CellValidationReport:
 
 __all__ = [
     "CellValidationReport",
+    "DapiArtifactSnapshot",
     "RoundArtifacts",
     "StatusInspector",
     "require_complete_workflow",
     "resolve_round_artifacts",
+    "snapshot_registered_dapi",
     "validate_cell_inputs",
     "validate_completed_artifact",
 ]

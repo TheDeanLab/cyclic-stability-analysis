@@ -142,6 +142,9 @@ class EnsembleRow:
     endpoint: str
     ensemble_name: str
     ensemble_value: float
+    sigma_um: float
+    threshold_sbr: float
+    surface_tolerance_resolution_units: float | None
     value: float | str
     units: str
     source_task_identity: str

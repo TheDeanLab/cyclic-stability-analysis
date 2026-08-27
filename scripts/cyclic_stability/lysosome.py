@@ -39,6 +39,7 @@ from cyclic_stability.nuclear import (
     _accepted_rounds,
     _atomic_publish_directory,
     consensus_nuclear_surface,
+    write_nuclear_component_diagnostic,
 )
 from cyclic_stability.units import ResolutionReference, theoretical_resolution
 
@@ -575,15 +576,18 @@ def _rows_for_detections(
     }
     return tuple(
         EnsembleRow(
-            cell.cohort,
-            cell.cell_id,
-            round_number,
-            endpoint,
-            name,
-            detections.detection_sbr,
-            value,
-            units,
-            config.config_digest,
+            cohort=cell.cohort,
+            cell_id=cell.cell_id,
+            acquisition_round=round_number,
+            endpoint=endpoint,
+            ensemble_name=name,
+            ensemble_value=detections.detection_sbr,
+            sigma_um=detections.sigma_um,
+            threshold_sbr=detections.detection_sbr,
+            surface_tolerance_resolution_units=None,
+            value=value,
+            units=units,
+            source_task_identity=config.config_digest,
         )
         for endpoint, (value, units) in values.items()
     )
@@ -720,6 +724,9 @@ def analyze_lamp1_cell(
     def populate(staged: Path) -> None:
         nonlocal staged_paths, staging_root
         staging_root = staged
+        component_diagnostic = write_nuclear_component_diagnostic(
+            staged, cell.cell_id, dapi, consensus
+        )
         diagnostic = staged / "lamp1-detections.npz"
         np.savez_compressed(
             diagnostic,
@@ -834,7 +841,13 @@ def analyze_lamp1_cell(
                             "aggregate",
                         )
                     )
-        staged_paths = (diagnostic, table, objects_table, matches_table)
+        staged_paths = (
+            component_diagnostic,
+            diagnostic,
+            table,
+            objects_table,
+            matches_table,
+        )
 
     _atomic_publish_directory(output_dir, populate)
     assert staging_root is not None
