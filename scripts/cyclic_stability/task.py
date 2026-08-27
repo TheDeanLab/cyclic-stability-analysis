@@ -43,15 +43,6 @@ _THREAD_ENVIRONMENT = (
 CYEXM_PIN = "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52"
 
 
-def _sha256_path(path: Path) -> str:
-    """Return the SHA-256 of one regular file without following a new path."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 @dataclass(frozen=True, slots=True)
 class ContentIdentity:
     """Exact file metadata plus authoritative SHA-256 content identity.
@@ -75,14 +66,96 @@ class ContentIdentity:
 
     @classmethod
     def from_path(cls, path: Path) -> ContentIdentity:
-        """Snapshot stable metadata and complete file content."""
-        before = FileIdentity.from_path(path)
-        resolved = Path(before.path)
-        digest = _sha256_path(resolved)
-        after = FileIdentity.from_path(resolved)
-        if after != before:
-            raise ValueError(f"file changed while hashing: {resolved}")
-        return cls(before.path, before.st_size, before.st_mtime_ns, digest)
+        """Snapshot stable metadata and content through a no-follow descriptor."""
+        identity, _ = cls._read(path, retain_bytes=False)
+        return identity
+
+    @classmethod
+    def read_bytes(cls, path: Path) -> tuple[ContentIdentity, bytes]:
+        """Return one stable identity and the exact bytes hashed for that identity."""
+        identity, payload = cls._read(path, retain_bytes=True)
+        assert payload is not None
+        return identity, payload
+
+    @classmethod
+    def _read(
+        cls, path: Path, *, retain_bytes: bool
+    ) -> tuple[ContentIdentity, bytes | None]:
+        candidate = Path(path)
+        parent = candidate.parent if candidate.parent != Path("") else Path(".")
+        parent_fd = os.open(
+            parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+        )
+        try:
+            descriptor = os.open(
+                candidate.name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            try:
+                before = os.fstat(descriptor)
+                entry_before = os.stat(
+                    candidate.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISREG(before.st_mode)
+                    or not stat.S_ISREG(entry_before.st_mode)
+                    or (before.st_dev, before.st_ino)
+                    != (entry_before.st_dev, entry_before.st_ino)
+                ):
+                    raise ValueError(f"file is not a stable regular entry: {candidate}")
+                canonical_parent = Path(os.readlink(f"/proc/self/fd/{parent_fd}"))
+                if canonical_parent.name.endswith(" (deleted)"):
+                    raise ValueError(f"file parent changed while opening: {candidate}")
+                resolved = canonical_parent / candidate.name
+                digest = hashlib.sha256()
+                retained: list[bytes] | None = [] if retain_bytes else None
+                while True:
+                    chunk = os.read(descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    if retained is not None:
+                        retained.append(chunk)
+                after = os.fstat(descriptor)
+                entry_after = os.stat(
+                    candidate.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                stable_fields = (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_size",
+                    "st_mtime_ns",
+                    "st_ctime_ns",
+                )
+                if any(
+                    getattr(before, name) != getattr(after, name)
+                    for name in stable_fields
+                ) or (after.st_dev, after.st_ino) != (
+                    entry_after.st_dev,
+                    entry_after.st_ino,
+                ):
+                    raise ValueError(f"file changed while hashing: {resolved}")
+                identity = cls(
+                    str(resolved),
+                    after.st_size,
+                    after.st_mtime_ns,
+                    digest.hexdigest(),
+                )
+                return identity, None if retained is None else b"".join(retained)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(parent_fd)
+
+    def matches_path(self) -> bool:
+        """Return whether the same path still has this exact content identity."""
+        try:
+            return type(self).from_path(Path(self.path)) == self
+        except (OSError, ValueError):
+            return False
 
     @classmethod
     def from_dict(
@@ -358,40 +431,28 @@ def _record_from_payload(payload: Mapping[str, object]) -> TaskRecord:
 
 
 def _current_identities_match(values: tuple[ContentIdentity, ...]) -> bool:
-    try:
-        return all(
-            ContentIdentity.from_path(Path(value.path)) == value for value in values
-        )
-    except (OSError, ValueError):
-        return False
+    return all(value.matches_path() for value in values)
 
 
 def _reusable_input_identities(
     task: CellTask | ArtifactTask, record: TaskRecord
 ) -> tuple[ContentIdentity, ...] | None:
     """Return the exact identities that authorize reuse for this task invocation."""
-    if (
-        isinstance(task, CellTask)
-        and task.config is not None
-        and task.preflight is None
-    ):
-        prefix_count = len(task.input_identities)
-        if (
-            len(record.input_identities) <= prefix_count
-            or record.input_identities[:prefix_count] != task.input_identities
-        ):
-            return None
-        return record.input_identities
     if record.input_identities != task.input_identities:
         return None
     return task.input_identities
 
 
-def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord | None:
+def _read_reusable(
+    task: CellTask | ArtifactTask,
+    terminal: Path,
+    *,
+    terminal_payload: bytes | None = None,
+) -> TaskRecord | None:
     try:
-        if terminal.is_symlink() or not stat.S_ISREG(terminal.stat().st_mode):
-            return None
-        pointer = json.loads(terminal.read_text(encoding="utf-8"))
+        if terminal_payload is None:
+            _, terminal_payload = ContentIdentity.read_bytes(terminal)
+        pointer = json.loads(terminal_payload.decode("utf-8"))
         if (
             set(pointer)
             != {
@@ -413,18 +474,19 @@ def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord 
         ):
             return None
         attempts_root = (terminal.parent / "attempts").resolve(strict=True)
-        attempt_dir = (attempts_root / attempt_id).resolve(strict=True)
+        attempt_entry = attempts_root / attempt_id
+        if attempt_entry.is_symlink() or not stat.S_ISDIR(attempt_entry.stat().st_mode):
+            return None
+        attempt_dir = attempt_entry.resolve(strict=True)
         if attempt_dir.parent != attempts_root:
             return None
         record_path = attempt_dir / "record.json"
-        if record_path.is_symlink() or not stat.S_ISREG(record_path.stat().st_mode):
-            return None
-        record = _record_from_payload(
-            json.loads(record_path.read_text(encoding="utf-8"))
-        )
+        actual_record_identity, record_bytes = ContentIdentity.read_bytes(record_path)
+        record = _record_from_payload(json.loads(record_bytes.decode("utf-8")))
         manifest_path = attempt_dir / "output-manifest.json"
-        if manifest_path.is_symlink() or not stat.S_ISREG(manifest_path.stat().st_mode):
-            return None
+        actual_manifest_identity, manifest_bytes = ContentIdentity.read_bytes(
+            manifest_path
+        )
         record_identity = ContentIdentity.from_dict(
             pointer["record_identity"], name="terminal record identity"
         )
@@ -432,11 +494,11 @@ def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord 
             pointer["output_manifest_identity"], name="terminal manifest identity"
         )
         if (
-            ContentIdentity.from_path(record_path) != record_identity
-            or ContentIdentity.from_path(manifest_path) != manifest_identity
+            actual_record_identity != record_identity
+            or actual_manifest_identity != manifest_identity
         ):
             return None
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
         if set(manifest) != {"outputs"} or not isinstance(manifest["outputs"], list):
             return None
         expected: list[ContentIdentity] = []
@@ -447,7 +509,10 @@ def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord 
             relative = entry["relative"]
             if not isinstance(relative, str) or Path(relative).is_absolute():
                 return None
-            path = (attempt_dir / relative).resolve(strict=True)
+            entry_path = attempt_dir / relative
+            if entry_path.is_symlink():
+                return None
+            path = entry_path.resolve(strict=True)
             if (
                 attempt_dir not in path.parents
                 or path.is_symlink()
@@ -483,6 +548,8 @@ def _read_reusable(task: CellTask | ArtifactTask, terminal: Path) -> TaskRecord 
         or record.software_identity != task.software_identity
         or reusable_inputs is None
         or record.attempt_dir.resolve(strict=True) != attempt_dir
+        or not actual_record_identity.matches_path()
+        or not actual_manifest_identity.matches_path()
         or not record.output_identities
         or any(
             path.is_symlink()
@@ -577,7 +644,7 @@ def _qc_gate(task: CellTask) -> None:
 
 
 def _preflight_task(task: CellTask) -> CellTask:
-    """Validate selected source/Cy-ExM evidence once before reuse or target analysis."""
+    """Validate current source/Cy-ExM evidence before reuse or target analysis."""
     if task.config is None:
         return task
     _qc_gate(task)
@@ -587,10 +654,36 @@ def _preflight_task(task: CellTask) -> CellTask:
     report = validate_cell_inputs(task.cell)
     paths: list[Path] = []
     identities: list[ContentIdentity] = []
+    decisions = {
+        (item.cohort, item.cell_id, item.acquisition_round): item.decision
+        for item in task.config.qc_decisions
+    }
+    native_rounds = (
+        {
+            round_spec.acquisition_round
+            for round_spec in task.cell.rounds
+            if round_spec.acquisition_round == task.config.reference_acquisition_round
+            or decisions[
+                (
+                    round_spec.cohort,
+                    round_spec.cell_id,
+                    round_spec.acquisition_round,
+                )
+            ]
+            == "accept"
+        }
+        if task.cell.cohort in {"golgi", "lamp1"}
+        else set()
+    )
     for round_spec, artifacts in zip(task.cell.rounds, report.rounds, strict=True):
-        if len(artifacts.completion_record_paths) != len(artifacts.completion_records):
+        if len(artifacts.completion_record_paths) != len(
+            artifacts.completion_records
+        ) or len(artifacts.completion_record_identities) != len(
+            artifacts.completion_records
+        ):
             raise ValueError("validated artifact record paths are incomplete")
         paths.append(round_spec.nd2_path)
+        paths.append(round_spec.execution_profile)
         paths.extend(path for _, path in channel_tiff_paths(round_spec))
         paths.extend(
             path
@@ -607,17 +700,41 @@ def _preflight_task(task: CellTask) -> CellTask:
             )
             if path is not None
         )
-        paths.extend(artifacts.completion_record_paths)
-        if artifacts.native_target is not None:
-            paths.append(artifacts.native_target)
+        for record_path, identity in zip(
+            artifacts.completion_record_paths,
+            artifacts.completion_record_identities,
+            strict=True,
+        ):
+            if not isinstance(identity, ContentIdentity) or record_path.resolve(
+                strict=True
+            ) != Path(identity.path):
+                raise ValueError("validated artifact record identity is inconsistent")
+            identities.append(identity)
+        if (
+            round_spec.acquisition_round in native_rounds
+            and artifacts.native_target is not None
+        ):
+            identity = artifacts.native_target_identity
+            if not isinstance(
+                identity, ContentIdentity
+            ) or artifacts.native_target.resolve(strict=True) != Path(identity.path):
+                raise ValueError("validated native target identity is inconsistent")
+            identities.append(identity)
     seen: set[Path] = set()
+    unique_identities: list[ContentIdentity] = []
+    for identity in identities:
+        identity_path = Path(identity.path)
+        if identity_path in seen:
+            continue
+        seen.add(identity_path)
+        unique_identities.append(identity)
     for path in paths:
         resolved = path.resolve(strict=True)
         if resolved in seen:
             continue
         seen.add(resolved)
-        identities.append(ContentIdentity.from_path(resolved))
-    snapshot = PreflightSnapshot(report.rounds, tuple(identities))
+        unique_identities.append(ContentIdentity.from_path(resolved))
+    snapshot = PreflightSnapshot(report.rounds, tuple(unique_identities))
     return replace(
         task,
         input_identities=(*task.input_identities, *snapshot.input_identities),
@@ -767,9 +884,17 @@ def _run_task_locked(
     """Execute under the kernel lock that serializes reuse and publication."""
     terminal_path = task_dir / "terminal.json"
     _remove_pointer(task_dir / "complete.json")
-    reusable = None if task.force else _read_reusable(task, terminal_path)
-    if reusable is not None:
-        return reusable
+    requires_current_preflight = isinstance(task, CellTask) and task.config is not None
+    prior_terminal_payload: bytes | None = None
+    if requires_current_preflight and not task.force:
+        try:
+            _, prior_terminal_payload = ContentIdentity.read_bytes(terminal_path)
+        except (OSError, ValueError):
+            pass
+    elif not task.force:
+        reusable = _read_reusable(task, terminal_path)
+        if reusable is not None:
+            return reusable
     _remove_pointer(terminal_path)
     attempt_id = uuid.uuid4().hex
     attempt_dir = task_dir / "attempts" / attempt_id
@@ -810,6 +935,22 @@ def _run_task_locked(
             ):
                 raise TypeError("cell task inputs require content-bound identities")
             _qc_gate(task)
+            if prior_terminal_payload is not None:
+                reusable = _read_reusable(
+                    task,
+                    terminal_path,
+                    terminal_payload=prior_terminal_payload,
+                )
+                if reusable is not None:
+                    stop.set()
+                    sampler.join()
+                    shutil.rmtree(scratch_dir)
+                    if not _current_identities_match(task.input_identities):
+                        raise ValueError(
+                            "one or more immutable task inputs changed before reuse"
+                        )
+                    _atomic_bytes(terminal_path, prior_terminal_payload)
+                    return reusable
         if not _current_identities_match(task.input_identities):
             raise ValueError(
                 "one or more immutable task inputs changed before execution"
@@ -885,21 +1026,25 @@ def _run_task_locked(
         _atomic_bytes(manifest_path, _json_bytes(manifest))
         record_path = attempt_dir / "record.json"
         _atomic_bytes(record_path, _json_bytes(_record_payload(record)))
-        _atomic_bytes(
-            terminal_path,
-            _json_bytes(
-                {
-                    "status": "complete",
-                    "attempt_id": attempt_id,
-                    "record": "record.json",
-                    "record_identity": ContentIdentity.from_path(record_path).to_dict(),
-                    "output_manifest": "output-manifest.json",
-                    "output_manifest_identity": ContentIdentity.from_path(
-                        manifest_path
-                    ).to_dict(),
-                }
-            ),
+        terminal_payload = _json_bytes(
+            {
+                "status": "complete",
+                "attempt_id": attempt_id,
+                "record": "record.json",
+                "record_identity": ContentIdentity.from_path(record_path).to_dict(),
+                "output_manifest": "output-manifest.json",
+                "output_manifest_identity": ContentIdentity.from_path(
+                    manifest_path
+                ).to_dict(),
+            }
         )
+        if not _current_identities_match(task.input_identities):
+            _remove_pointer(record_path)
+            _remove_pointer(manifest_path)
+            raise ValueError(
+                "one or more immutable task inputs changed before completion publication"
+            )
+        _atomic_bytes(terminal_path, terminal_payload)
         return record
     except Exception as error:  # noqa: BLE001 - persist analyzer failures, preserve interrupts
         stop.set()

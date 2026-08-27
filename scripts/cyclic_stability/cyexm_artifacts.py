@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from cyexm.config.execution import load_execution_profile
 from cyexm.errors import InputValidationError
-from cyexm.registration.artifacts import ArtifactStore, CompletionRecord, FileIdentity
+from cyexm.registration.artifacts import (
+    ArtifactStore,
+    CompletionRecord,
+    FileIdentity,
+    StageRequest,
+)
 from cyexm.registration.whole_image import RegistrationPaths
 from cyexm.workflow.layout import WorkflowLayout
 from cyexm.workflow.models import WorkflowStatus
@@ -16,6 +22,7 @@ from cyexm.workflow.status import inspect_workflow_status
 
 from cyclic_stability.models import CellSpec, RoundSpec
 from cyclic_stability.provenance import ChannelMatch, compare_nd2_export
+from cyclic_stability.task import ContentIdentity
 
 type StatusInspector = Callable[[str | Path, str], WorkflowStatus]
 
@@ -40,6 +47,8 @@ class RoundArtifacts:
     native_target: Path | None = None
     moving_crop: Path | None = None
     completion_record_paths: tuple[Path, ...] = ()
+    completion_record_identities: tuple[ContentIdentity, ...] = ()
+    native_target_identity: ContentIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,14 +61,42 @@ class CellValidationReport:
     rounds: tuple[RoundArtifacts, ...]
 
 
-def validate_completed_artifact(path: Path) -> CompletionRecord:
-    """Validate an artifact against the immutable identity in its completion record."""
+def _completion_record_from_bytes(payload: bytes) -> CompletionRecord:
+    """Parse the exact completion-record bytes already hashed by the caller."""
+    decoded = json.loads(payload.decode("utf-8"))
+    if not isinstance(decoded, Mapping) or set(decoded) != {
+        "schema_version",
+        "request",
+        "artifact",
+    }:
+        raise ValueError("completion record has invalid fields")
+    schema_version = decoded["schema_version"]
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+        raise TypeError("completion record schema_version must be an integer")
+    request = decoded["request"]
+    artifact = decoded["artifact"]
+    if not isinstance(request, Mapping) or not isinstance(artifact, Mapping):
+        raise TypeError("completion record request and artifact must be mappings")
+    return CompletionRecord(
+        schema_version=schema_version,
+        request=StageRequest.from_dict(request),
+        artifact=FileIdentity.from_dict(artifact, name="artifact identity"),
+    )
+
+
+def _validated_completion_snapshot(
+    path: Path,
+) -> tuple[CompletionRecord, Path, ContentIdentity]:
+    """Return one parsed record and identity from the same no-follow snapshot."""
     store = ArtifactStore()
     record_path = store.record_path(path)
     if not path.is_file() or not record_path.is_file():
         raise InputValidationError(f"artifact or completion record missing: {path}")
     try:
-        record = CompletionRecord.read(record_path)
+        record_identity, record_bytes = ContentIdentity.read_bytes(record_path)
+        record = _completion_record_from_bytes(record_bytes)
+        if not record_identity.matches_path():
+            raise ValueError("completion record changed during parsing")
         identity = FileIdentity.from_path(path)
     except (OSError, RuntimeError, TypeError, UnicodeError, ValueError) as error:
         raise InputValidationError(
@@ -67,6 +104,12 @@ def validate_completed_artifact(path: Path) -> CompletionRecord:
         ) from error
     if identity != record.artifact:
         raise InputValidationError(f"completion identity mismatch: {path}")
+    return record, Path(record_identity.path), record_identity
+
+
+def validate_completed_artifact(path: Path) -> CompletionRecord:
+    """Validate an artifact against the immutable identity in its completion record."""
+    record, _, _ = _validated_completion_snapshot(path)
     return record
 
 
@@ -138,20 +181,32 @@ def resolve_round_artifacts(
                 chunk_manifest,
             )
         )
-    store = ArtifactStore()
-    record_paths = tuple(store.record_path(path) for path in required)
-    records = tuple(validate_completed_artifact(path) for path in required)
+    validated = tuple(_validated_completion_snapshot(path) for path in required)
+    records = tuple(item[0] for item in validated)
+    record_paths = tuple(item[1] for item in validated)
+    record_identities = tuple(item[2] for item in validated)
     target_record = records[2]
+    native_target_identity: ContentIdentity | None = None
     if (
         target_record.request.stage == "channel-transform-v1"
         and len(target_record.request.inputs) == 4
     ):
         candidate = Path(target_record.request.inputs[1].path)
-        if (
-            candidate.is_file()
-            and FileIdentity.from_path(candidate) == target_record.request.inputs[1]
-        ):
-            native_target = candidate
+        try:
+            candidate_identity = ContentIdentity.from_path(candidate)
+        except (OSError, ValueError):
+            pass
+        else:
+            metadata = FileIdentity(
+                candidate_identity.path,
+                candidate_identity.st_size,
+                candidate_identity.st_mtime_ns,
+            )
+            if metadata == target_record.request.inputs[1]:
+                native_target = Path(candidate_identity.path)
+                native_target_identity = candidate_identity
+    if not all(identity.matches_path() for identity in record_identities):
+        raise InputValidationError(f"completion record is unreadable: {channels[2]}")
     return RoundArtifacts(
         acquisition_round=acquisition,
         workflow_round=round_spec.workflow_round,
@@ -171,6 +226,8 @@ def resolve_round_artifacts(
         # registration crop is not a transform input and must never be inferred.
         moving_crop=None,
         completion_record_paths=record_paths,
+        completion_record_identities=record_identities,
+        native_target_identity=native_target_identity,
     )
 
 

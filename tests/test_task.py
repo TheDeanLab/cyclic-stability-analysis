@@ -12,7 +12,7 @@ from types import MappingProxyType, SimpleNamespace
 import numpy as np
 import pytest
 from cyclic_stability import task as task_module
-from cyclic_stability.models import MarkerResult, QcDecision
+from cyclic_stability.models import CellSpec, MarkerResult, QcDecision
 from cyclic_stability.nuclear import NuclearComponentQc
 from cyclic_stability.signal import SignalRow
 from cyclic_stability.task import (
@@ -217,6 +217,78 @@ def test_production_preflight_failure_supersedes_prior_success_terminal(
     assert (first.attempt_dir / "record.json").is_file()
 
 
+def test_production_reuse_recomputes_current_preflight_under_running_authority(
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persisted preflight snapshot must not select stale production artifacts."""
+    decisions = tuple(
+        QcDecision(
+            "golgi",
+            "Cell1",
+            number,
+            "accept",
+            ("target-blind",),
+            "reviewer",
+            "2026-08-27T00:00:00Z",
+        )
+        for number in (1, 3, 4, 5)
+    )
+    base = cell_task(tmp_path)
+    analyzer_calls = 0
+
+    def analyze(value: CellTask, output_dir: Path):
+        nonlocal analyzer_calls
+        analyzer_calls += 1
+        return base.analyzer(value, output_dir)
+
+    task = replace(
+        base,
+        config=replace(analysis_config, qc_decisions=decisions),
+        analyzer=analyze,
+    )
+    discovered = {
+        "selected": tmp_path / "discovery" / "profile-a" / "registered-target.tif"
+    }
+    discovered["selected"].parent.mkdir(parents=True)
+    discovered["selected"].write_bytes(b"selected-a")
+    replacement = tmp_path / "discovery" / "profile-b" / "registered-target.tif"
+    replacement.parent.mkdir(parents=True)
+    replacement.write_bytes(b"selected-b")
+    task_dir = tmp_path / "tasks" / task.key
+    terminal_statuses: list[str] = []
+    preflight_calls = 0
+
+    def preflight(value: CellTask) -> CellTask:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        terminal_statuses.append(
+            str(json.loads((task_dir / "terminal.json").read_text())["status"])
+        )
+        identity = task_module.ContentIdentity.from_path(discovered["selected"])
+        snapshot = PreflightSnapshot((), (identity,))
+        return replace(
+            value,
+            input_identities=(*value.input_identities, identity),
+            preflight=snapshot,
+        )
+
+    monkeypatch.setattr(task_module, "_preflight_task", preflight)
+
+    first = run_cell_task(task, tmp_path)
+    discovered["selected"] = replacement
+    second = run_cell_task(task, tmp_path)
+    third = run_cell_task(task, tmp_path)
+
+    assert first.status == second.status == third.status == "complete"
+    assert second.attempt_id != first.attempt_id
+    assert second.reused is False
+    assert third.attempt_id == second.attempt_id
+    assert third.reused is True
+    assert preflight_calls == 3
+    assert analyzer_calls == 2
+    assert terminal_statuses == ["running", "running", "running"]
+
+
 def test_artifact_task_changed_input_or_repository_preserves_prior_evidence(
     tmp_path: Path,
 ) -> None:
@@ -351,6 +423,74 @@ def test_producer_input_mutation_never_publishes_completion(tmp_path: Path) -> N
     assert not (tmp_path / "run" / "tasks" / task.key / "complete.json").exists()
 
 
+@pytest.mark.parametrize("mutation_stage", ("output-validation", "record-construction"))
+def test_late_input_mutation_is_rejected_at_final_success_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation_stage: str,
+) -> None:
+    """Fallible success preparation must finish before the last input revalidation."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"input-v1")
+    original_mtime = source.stat().st_mtime_ns
+
+    def publish(output_dir: Path) -> tuple[Path, ...]:
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text('{"value":"complete"}\n', encoding="utf-8")
+        return (output,)
+
+    mutated = False
+
+    def mutate_input() -> None:
+        nonlocal mutated
+        if mutated:
+            return
+        mutated = True
+        source.write_bytes(b"input-v2")
+        os.utime(source, ns=(source.stat().st_atime_ns, original_mtime))
+
+    if mutation_stage == "output-validation":
+        original_validate = task_module._validate_output
+
+        def validate_then_mutate(path: Path) -> None:
+            original_validate(path)
+            mutate_input()
+
+        monkeypatch.setattr(task_module, "_validate_output", validate_then_mutate)
+    else:
+        original_record_payload = task_module._record_payload
+
+        def construct_record_then_mutate(record):
+            payload = original_record_payload(record)
+            mutate_input()
+            return payload
+
+        monkeypatch.setattr(
+            task_module, "_record_payload", construct_record_then_mutate
+        )
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(task_module.ContentIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=publish,
+    )
+
+    failed = task_module.run_artifact_task(task, tmp_path / "run")
+
+    assert failed.status == "failed"
+    terminal = json.loads(
+        (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
+    )
+    assert terminal["status"] == "failed"
+    assert terminal["attempt_id"] == failed.attempt_id
+    failure = json.loads((failed.attempt_dir / "failure.json").read_text())
+    assert "immutable task inputs changed" in failure["message"]
+    assert not (failed.attempt_dir / "record.json").exists()
+    assert not (failed.attempt_dir / "output-manifest.json").exists()
+
+
 def _production_provenance_task(
     analysis_config,
     tmp_path: Path,
@@ -362,8 +502,10 @@ def _production_provenance_task(
     base = cell_task(tmp_path)
     round_spec = base.cell.rounds[2]
     root = tmp_path / "production-provenance"
+    execution_profile = root / "execution.yaml"
+    execution_profile.parent.mkdir(parents=True)
+    execution_profile.write_text("executor: synthetic\n", encoding="utf-8")
     nd2 = root / "source.nd2"
-    nd2.parent.mkdir(parents=True)
     nd2.write_bytes(b"nd2")
     raw_paths = tuple(
         (name, root / "raw" / f"round-3-{name}.tif")
@@ -429,12 +571,23 @@ def _production_provenance_task(
         chunk_manifest=None,
         completion_records=(completion_record,),
         completion_record_paths=(completion_record_path,),
+        completion_record_identities=(
+            task_module.ContentIdentity.from_path(completion_record_path),
+        ),
         native_target=Path(completion_record.request.inputs[1].path),
+        native_target_identity=task_module.ContentIdentity.from_path(native_source),
         moving_crop=None,
     )
     cell = replace(
         base.cell,
-        rounds=(replace(round_spec, nd2_path=nd2, tiff_directory=root / "raw"),),
+        rounds=(
+            replace(
+                round_spec,
+                nd2_path=nd2,
+                tiff_directory=root / "raw",
+                execution_profile=execution_profile,
+            ),
+        ),
     )
     config = replace(
         analysis_config,
@@ -450,10 +603,27 @@ def _production_provenance_task(
             ),
         ),
     )
+
+    def validate_current_provenance(_cell):
+        current_record = CompletionRecord.read(completion_record_path)
+        current_native = Path(current_record.request.inputs[1].path)
+        current_artifact = SimpleNamespace(
+            **{
+                **vars(artifact),
+                "completion_records": (current_record,),
+                "completion_record_identities": (
+                    task_module.ContentIdentity.from_path(completion_record_path),
+                ),
+                "native_target": current_native,
+                "native_target_identity": task_module.ContentIdentity.from_path(
+                    current_native
+                ),
+            }
+        )
+        return SimpleNamespace(rounds=(current_artifact,))
+
     monkeypatch.setattr(
-        cyexm_artifacts,
-        "validate_cell_inputs",
-        lambda _cell: SimpleNamespace(rounds=(artifact,)),
+        cyexm_artifacts, "validate_cell_inputs", validate_current_provenance
     )
     monkeypatch.setattr(provenance, "channel_tiff_paths", lambda _round: raw_paths)
     return (
@@ -461,6 +631,178 @@ def _production_provenance_task(
         completion_record_path,
         native_source,
     )
+
+
+@pytest.mark.parametrize(
+    ("cohort", "expected_native_rounds"),
+    (("golgi", {1, 2}), ("lamp1", {1, 2}), ("lamin", set())),
+)
+def test_preflight_binds_only_native_targets_consumed_by_each_cohort(
+    analysis_config,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cohort: str,
+    expected_native_rounds: set[int],
+) -> None:
+    """Native targets are authoritative only where the selected analyzer consumes them."""
+    from cyclic_stability import cyexm_artifacts, provenance
+
+    base = cell_task(tmp_path)
+    rounds = []
+    artifacts = []
+    raw_paths: dict[int, tuple[tuple[str, Path], ...]] = {}
+    native_paths: dict[int, Path] = {}
+    registered_targets: dict[int, Path] = {}
+    completion_paths: dict[int, Path] = {}
+    execution_profiles: dict[int, Path] = {}
+    for number in (1, 2, 3):
+        round_root = tmp_path / "preflight" / cohort / f"round-{number}"
+        nd2 = round_root / "source.nd2"
+        nd2.parent.mkdir(parents=True, exist_ok=True)
+        nd2.write_bytes(f"nd2-{number}".encode())
+        raw_paths[number] = tuple(
+            (name, round_root / "raw" / f"{name}.tif")
+            for name in ("target", "tubulin", "dapi")
+        )
+        for _name, path in raw_paths[number]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(f"raw-{number}-{path.name}".encode())
+        profile = round_root / "execution.yaml"
+        profile.write_text(f"round: {number}\n", encoding="utf-8")
+        execution_profiles[number] = profile
+        round_spec = replace(
+            base.cell.rounds[number - 1],
+            cohort=cohort,
+            acquisition_round=number,
+            workflow_round=number,
+            nd2_path=nd2,
+            tiff_directory=round_root / "raw",
+            execution_profile=profile,
+        )
+        rounds.append(round_spec)
+        registered_dapi = round_root / "registered-dapi.tif"
+        registered_tubulin = round_root / "registered-tubulin.tif"
+        registered_target = round_root / "registered-target.tif"
+        completion_record = round_root / "registered-target.tif.complete.json"
+        native_target = round_root / "native-target.tif"
+        for path in (
+            registered_dapi,
+            registered_tubulin,
+            registered_target,
+            completion_record,
+            native_target,
+        ):
+            path.write_bytes(f"{number}-{path.name}".encode())
+        native_paths[number] = native_target
+        registered_targets[number] = registered_target
+        completion_paths[number] = completion_record
+        artifacts.append(
+            SimpleNamespace(
+                registered_dapi=registered_dapi,
+                registered_tubulin=registered_tubulin,
+                registered_target=registered_target,
+                affine=None,
+                warp=None,
+                pre_metrics=None,
+                linear_metrics=None,
+                nonlinear_metrics=None,
+                chunk_manifest=None,
+                completion_records=(SimpleNamespace(),),
+                completion_record_paths=(completion_record,),
+                completion_record_identities=(
+                    task_module.ContentIdentity.from_path(completion_record),
+                ),
+                native_target=native_target,
+                native_target_identity=task_module.ContentIdentity.from_path(
+                    native_target
+                ),
+                moving_crop=None,
+            )
+        )
+    cell = CellSpec(cohort, "Cell1", tuple(rounds))
+    config = replace(
+        analysis_config,
+        cells=(cell,),
+        qc_decisions=(
+            QcDecision(
+                cohort,
+                "Cell1",
+                1,
+                "accept",
+                ("target-blind",),
+                "reviewer",
+                "2026-08-27T00:00:00Z",
+            ),
+            QcDecision(
+                cohort,
+                "Cell1",
+                3,
+                "exclude",
+                ("target-blind",),
+                "reviewer",
+                "2026-08-27T00:00:00Z",
+            ),
+        ),
+    )
+
+    def validate_current_native_sources(_cell):
+        return SimpleNamespace(
+            rounds=tuple(
+                SimpleNamespace(
+                    **{
+                        **vars(artifact),
+                        "native_target_identity": task_module.ContentIdentity.from_path(
+                            artifact.native_target
+                        ),
+                    }
+                )
+                for artifact in artifacts
+            )
+        )
+
+    monkeypatch.setattr(
+        cyexm_artifacts, "validate_cell_inputs", validate_current_native_sources
+    )
+    monkeypatch.setattr(
+        provenance,
+        "channel_tiff_paths",
+        lambda round_spec: raw_paths[round_spec.acquisition_round],
+    )
+
+    task = replace(base, cell=cell, config=config, input_identities=())
+    preflighted = task_module._preflight_task(task)
+
+    bound = {Path(identity.path) for identity in preflighted.input_identities}
+    assert {native_paths[number].resolve() for number in expected_native_rounds} == {
+        path.resolve() for path in bound if path.name == "native-target.tif"
+    }
+    for number in (1, 2):
+        assert registered_targets[number].resolve() in bound
+        assert completion_paths[number].resolve() in bound
+    assert {path.resolve() for path in execution_profiles.values()}.issubset(bound)
+    for number, path in native_paths.items():
+        payload = path.read_bytes()
+        original_mtime = path.stat().st_mtime_ns
+        replacement = (b"X" if payload[:1] != b"X" else b"Y") + payload[1:]
+        path.write_bytes(replacement)
+        os.utime(path, ns=(path.stat().st_atime_ns, original_mtime))
+
+        changed = task_module._preflight_task(task)
+
+        assert (changed.input_identities != preflighted.input_identities) is (
+            number in expected_native_rounds
+        )
+        path.write_bytes(payload)
+        os.utime(path, ns=(path.stat().st_atime_ns, original_mtime))
+    profile = execution_profiles[1]
+    profile_payload = profile.read_bytes()
+    profile_mtime = profile.stat().st_mtime_ns
+    profile.write_bytes(profile_payload.replace(b"1", b"9", 1))
+    os.utime(profile, ns=(profile.stat().st_atime_ns, profile_mtime))
+
+    changed_profile = task_module._preflight_task(task)
+
+    assert changed_profile.input_identities != preflighted.input_identities
 
 
 @pytest.mark.parametrize("tampered_input", ("completion-record", "native-source"))
@@ -585,6 +927,54 @@ def test_artifact_task_rejects_same_metadata_published_byte_tampering(
     assert after_tamper.status == "complete"
     assert after_tamper.reused is False
     assert after_tamper.attempt_id != first.attempt_id
+
+
+def test_task_record_replacement_during_parse_invalidates_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One task record snapshot must remain the same directory entry after parsing."""
+    source = tmp_path / "registered-dapi.tif"
+    source.write_bytes(b"dapi-v1")
+
+    def publish(output_dir: Path) -> tuple[Path, ...]:
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text('{"value":"a"}\n', encoding="utf-8")
+        return (output,)
+
+    task = task_module.ArtifactTask(
+        key="nuclear-inventory",
+        config_digest="config-v1",
+        input_identities=(task_module.ContentIdentity.from_path(source),),
+        software_identity="repository-v1",
+        producer=publish,
+    )
+    first = task_module.run_artifact_task(task, tmp_path / "run")
+    record_path = first.attempt_dir / "record.json"
+    replacement = tmp_path / "replacement-record.json"
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    payload["peak_rss_bytes"] += 1
+    replacement.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    original_decoder = task_module._record_from_payload
+    replaced = False
+
+    def replace_after_read(value):
+        nonlocal replaced
+        if not replaced and value["attempt_id"] == first.attempt_id:
+            replaced = True
+            os.replace(replacement, record_path)
+        return original_decoder(value)
+
+    monkeypatch.setattr(task_module, "_record_from_payload", replace_after_read)
+
+    reopened = task_module.run_artifact_task(task, tmp_path / "run")
+
+    assert replaced is True
+    assert reopened.status == "complete"
+    assert reopened.reused is False
+    assert reopened.attempt_id != first.attempt_id
 
 
 def test_changed_input_failure_supersedes_prior_success_terminal(
