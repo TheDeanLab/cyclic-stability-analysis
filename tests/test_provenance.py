@@ -9,7 +9,11 @@ import numpy as np
 import pytest
 import tifffile
 from cyclic_stability.models import RoundSpec
-from cyclic_stability.provenance import PlaneReader, compare_nd2_export
+from cyclic_stability.provenance import (
+    PlaneReader,
+    channel_tiff_paths,
+    compare_nd2_export,
+)
 
 
 @dataclass(frozen=True)
@@ -140,3 +144,28 @@ def test_three_plane_stacks_are_audited_at_first_middle_and_last(
     reader = _CountingMismatchReader([])
     matches = compare_nd2_export(fake_round, reader=reader)
     assert [match.plane_indices for match in matches] == [(0, 1, 2)] * 3
+
+
+def test_lamp1_uses_the_exported_uppercase_target_basename(
+    fake_round: RoundSpec,
+) -> None:
+    """Production LAMP1 exports retain the marker's uppercase basename."""
+    lamp_round = RoundSpec(
+        cohort="lamp1",
+        cell_id="LAMP1-verified-alpha",
+        acquisition_round=fake_round.acquisition_round,
+        workflow_round=fake_round.workflow_round,
+        nd2_path=fake_round.nd2_path,
+        tiff_directory=fake_round.tiff_directory,
+        z_start_offset=fake_round.z_start_offset,
+        target_exposure_ms=fake_round.target_exposure_ms,
+        target_laser_percent=fake_round.target_laser_percent,
+        tubulin_exposure_ms=fake_round.tubulin_exposure_ms,
+        dapi_exposure_ms=fake_round.dapi_exposure_ms,
+        dataset_manifest=fake_round.dataset_manifest,
+        execution_profile=fake_round.execution_profile,
+        workflow_dataset_id=fake_round.workflow_dataset_id,
+        identity_method="image-verified",
+    )
+    paths = dict(channel_tiff_paths(lamp_round))
+    assert paths["target"].name == "round_2_647_LAMP1.tif"

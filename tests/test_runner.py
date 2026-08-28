@@ -36,6 +36,20 @@ def test_runner_records_operational_resource_fields(tmp_path: Path) -> None:
     assert all(item.process_read_bytes >= 0 for item in record.tasks)
 
 
+def test_runner_reports_task_start_and_completion(tmp_path: Path, capsys) -> None:
+    """Long-running runs expose task-level progress on stderr."""
+    run_tasks(
+        synthetic_tasks(tmp_path),
+        profile("sequential"),
+        tmp_path / "run",
+        progress_interval_s=0,
+    )
+    output = capsys.readouterr().err
+    assert "progress: starting" in output
+    assert "progress: completed" in output
+    assert "1/" in output
+
+
 def test_cli_rejects_run_directory_and_results_root_together(tmp_path: Path) -> None:
     result = subprocess.run(
         [

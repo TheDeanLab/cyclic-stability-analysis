@@ -748,7 +748,7 @@ def require_complete_workflow(
 
 
 def _target_name(round_spec: RoundSpec) -> str:
-    return {"golgi": "647_golgi", "lamin": "647_lamin", "lamp1": "647_lamp1"}[
+    return {"golgi": "647_golgi", "lamin": "647_lamin", "lamp1": "647_LAMP1"}[
         round_spec.cohort
     ]
 

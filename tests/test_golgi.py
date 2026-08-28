@@ -130,10 +130,11 @@ class _ValidityBackend:
 def _producer_artifacts(tmp_path: Path, analysis_config):
     """Create one completion-record-compatible moving target transform."""
     fixed = tmp_path / "fixed-native.tif"
+    dapi = tmp_path / "reference-dapi.tif"
     source = tmp_path / "source-native.tif"
     affine = tmp_path / "affine.mat"
     warp = tmp_path / "warp.nii.gz"
-    for path in (fixed, source, affine, warp):
+    for path in (fixed, dapi, source, affine, warp):
         path.write_bytes(path.name.encode())
     reference_target = tmp_path / "reference-target.tif"
     output = tmp_path / "registered-target.tif"
@@ -162,6 +163,7 @@ def _producer_artifacts(tmp_path: Path, analysis_config):
         2,
         1,
         tmp_path,
+        dapi,
         fixed,
         reference_target,
         reference_target,

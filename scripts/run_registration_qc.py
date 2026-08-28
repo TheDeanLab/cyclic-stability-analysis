@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
-#   "cy-exm[workflow] @ git+https://github.com/TheDeanLab/Cy-ExM.git@c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52",
+#   "cy-exm[workflow] @ git+https://github.com/TheDeanLab/Cy-ExM.git@f6e0de36cd7f6b5e85f093884c2cf224225f4ec2",
 #   "nd2==0.11.3",
 #   "numpy>=1.26,<3",
 #   "scipy>=1.12,<2",
@@ -63,6 +63,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--correspondence", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--max-workers", type=int, default=1)
+    parser.add_argument(
+        "--cohort", action="append", default=[], help="limit QC to these cohorts"
+    )
+    parser.add_argument("--cell", help="limit QC to one configured cell")
     return parser
 
 
@@ -79,9 +83,18 @@ def main(argv: list[str] | None = None) -> int:
 
     decisions = args.analysis_config.parent / "qc-decisions.csv"
     config = load_analysis_config(args.analysis_config, args.correspondence, decisions)
+    selected_cells = tuple(
+        cell
+        for cell in config.cells
+        if (not args.cohort or cell.cohort in args.cohort)
+        and (args.cell is None or cell.cell_id == args.cell)
+    )
+    if not selected_cells:
+        print("unavailable: no configured cells match the selection", file=sys.stderr)
+        return 1
     validated = tuple(
         (cell, tuple(resolve_round_artifacts(round_spec) for round_spec in cell.rounds))
-        for cell in config.cells
+        for cell in selected_cells
     )
     jobs = tuple(
         (
@@ -91,7 +104,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         for cell, artifacts in validated
     )
+    print(
+        f"progress: queued registration QC for {len(jobs)} cells with "
+        f"{args.max_workers} worker(s)",
+        file=sys.stderr,
+        flush=True,
+    )
     results = _ordered_process_map(_run_qc_job, jobs, max_workers=args.max_workers)
+    print(
+        "progress: registration QC cell analyses completed", file=sys.stderr, flush=True
+    )
     registration_rows = tuple(
         row for result in results for row in result.registration_rows
     )

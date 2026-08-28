@@ -434,6 +434,7 @@ def _parse_rounds(
             raise ValueError(f"invalid identity_method {identity_method!r}")
         if not row["workflow_dataset_id"]:
             raise ValueError("workflow_dataset_id must be non-empty")
+        tiff_root = resubmission_root if cohort == "lamp1" else nd2_root
         auxiliary_lasers[key] = (
             _csv_number(row["tubulin_laser_percent"], "tubulin_laser_percent"),
             _csv_number(row["dapi_laser_percent"], "dapi_laser_percent"),
@@ -445,7 +446,7 @@ def _parse_rounds(
             workflow_round=workflow_round,
             nd2_path=_resolve_path(nd2_root, row["nd2_relative"], "nd2_relative"),
             tiff_directory=_resolve_path(
-                nd2_root, row["tiff_directory_relative"], "tiff_directory_relative"
+                tiff_root, row["tiff_directory_relative"], "tiff_directory_relative"
             ),
             z_start_offset=_nonnegative_int(row["z_start_offset"], "z_start_offset"),
             producer_source_z_start_offset=_producer_source_z_start_offset(
@@ -504,7 +505,8 @@ def _validate_cohort_settings(
     auxiliary_lasers: Mapping[tuple[str, str, int], tuple[float, float]],
 ) -> None:
     for cohort in COHORTS:
-        by_round: dict[int, tuple[float, float, float, float, float, float]] = {}
+        by_round: dict[int, tuple[float, float, float, float, float]] = {}
+        tubulin_by_round: dict[int, list[RoundSpec]] = {}
         for (row_cohort, _), rounds in cells.items():
             if row_cohort != cohort:
                 continue
@@ -512,7 +514,6 @@ def _validate_cohort_settings(
                 settings = (
                     round_spec.target_exposure_ms,
                     round_spec.target_laser_percent,
-                    round_spec.tubulin_exposure_ms,
                     round_spec.dapi_exposure_ms,
                     *auxiliary_lasers[
                         (
@@ -527,6 +528,27 @@ def _validate_cohort_settings(
                     raise ValueError(
                         f"inconsistent settings within {cohort} acquisition round {round_spec.acquisition_round}"
                     )
+                tubulin_by_round.setdefault(round_spec.acquisition_round, []).append(
+                    round_spec
+                )
+        for acquisition_round, round_specs in tubulin_by_round.items():
+            exposures = {item.tubulin_exposure_ms for item in round_specs}
+            if len(exposures) == 1:
+                continue
+            documented_exception = (
+                cohort == "lamp1"
+                and acquisition_round == 2
+                and exposures == {200.0, 300.0}
+                and sum(item.tubulin_exposure_ms == 300.0 for item in round_specs) == 1
+                and next(
+                    item for item in round_specs if item.tubulin_exposure_ms == 300.0
+                ).nd2_path.name
+                == "DAPI_tubulin_lamp_001.nd2"
+            )
+            if not documented_exception:
+                raise ValueError(
+                    f"inconsistent settings within {cohort} acquisition round {acquisition_round}"
+                )
 
 
 def _parse_qc_decision_rows(

@@ -54,7 +54,7 @@ _STABLE_CONTENT_FIELDS = (
     "st_mtime_ns",
     "st_ctime_ns",
 )
-CYEXM_PIN = "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52"
+CYEXM_PIN = "f6e0de36cd7f6b5e85f093884c2cf224225f4ec2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,7 +290,7 @@ class RetainedContent:
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             identity, _payload, descriptor, stable_stat = (
-                ContentIdentity._open_from_parent_descriptor(  # noqa: SLF001
+                ContentIdentity._open_from_parent_descriptor(
                     candidate,
                     parent_fd,
                     retain_bytes=False,
@@ -1607,9 +1607,9 @@ def build_tasks(
 
 
 __all__ = [
+    "CYEXM_PIN",
     "ArtifactSnapshot",
     "ArtifactTask",
-    "CYEXM_PIN",
     "CellTask",
     "ContentIdentity",
     "RetainedContent",

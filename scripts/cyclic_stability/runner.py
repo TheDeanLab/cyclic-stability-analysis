@@ -8,9 +8,12 @@ import hashlib
 import json
 import multiprocessing
 import os
+import sys
+import threading
+import time
 import uuid
-from concurrent.futures import ProcessPoolExecutor
 from collections.abc import Mapping
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -73,7 +76,11 @@ def _write_compact(records: tuple[TaskRecord, ...], run_dir: Path) -> Path:
 
 
 def run_tasks(
-    tasks: tuple[CellTask, ...], profile: ExecutionProfile, run_dir: Path
+    tasks: tuple[CellTask, ...],
+    profile: ExecutionProfile,
+    run_dir: Path,
+    *,
+    progress_interval_s: float = 30.0,
 ) -> RunRecord:
     """Run tasks sequentially or in one bounded spawned process pool.
 
@@ -84,6 +91,8 @@ def run_tasks(
         raise ValueError(
             "SLURM mode is an index-only CLI operation; it does not submit jobs"
         )
+    if progress_interval_s < 0:
+        raise ValueError("progress_interval_s must be non-negative")
     configured = tuple(
         replace(
             task,
@@ -92,19 +101,104 @@ def run_tasks(
         )
         for task in tasks
     )
+    total = len(configured)
+
+    def announce(message: str) -> None:
+        print(
+            f"[{datetime.now(UTC).isoformat(timespec='seconds')}] {message}",
+            file=sys.stderr,
+            flush=True,
+        )
+
     if profile.mode == "sequential":
-        records = tuple(_worker(task, run_dir) for task in configured)
+        completed: list[TaskRecord] = []
+        started = time.monotonic()
+        for index, task in enumerate(configured, 1):
+            announce(f"progress: starting {index}/{total} {task.key}")
+            stop_heartbeat = threading.Event()
+            heartbeat = threading.Thread(
+                target=_heartbeat,
+                args=(
+                    stop_heartbeat,
+                    announce,
+                    lambda task_key=task.key: f"progress: heartbeat running={task_key}",
+                ),
+                kwargs={"interval_s": progress_interval_s},
+                daemon=True,
+            )
+            if progress_interval_s:
+                heartbeat.start()
+            try:
+                record = _worker(task, run_dir)
+            except Exception as error:
+                stop_heartbeat.set()
+                announce(f"progress: failed {index}/{total} {task.key}: {error}")
+                raise
+            stop_heartbeat.set()
+            completed.append(record)
+            announce(
+                f"progress: completed {index}/{total} {task.key} "
+                f"status={record.status} elapsed={time.monotonic() - started:.1f}s"
+            )
+        records = tuple(completed)
     else:
         with ProcessPoolExecutor(
             max_workers=profile.max_workers,
             mp_context=multiprocessing.get_context("spawn"),
         ) as executor:
-            futures = {
-                task.key: executor.submit(_worker, task, run_dir) for task in configured
-            }
-            records = tuple(futures[key].result() for key in sorted(futures))
+            futures = {}
+            for index, task in enumerate(configured, 1):
+                announce(f"progress: queued {index}/{total} {task.key}")
+                futures[executor.submit(_worker, task, run_dir)] = task
+            pending = set(futures)
+            completed_records: dict[str, TaskRecord] = {}
+            last_report = time.monotonic()
+            while pending:
+                done, pending = wait(
+                    pending,
+                    timeout=progress_interval_s or None,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    announce(
+                        f"progress: heartbeat completed={len(completed_records)}/{total}"
+                    )
+                    last_report = time.monotonic()
+                    continue
+                for future in done:
+                    task = futures[future]
+                    try:
+                        record = future.result()
+                    except Exception as error:
+                        announce(f"progress: failed {task.key}: {error}")
+                        raise
+                    completed_records[task.key] = record
+                    announce(
+                        f"progress: completed {len(completed_records)}/{total} {task.key} "
+                        f"status={record.status}"
+                    )
+                if (
+                    progress_interval_s
+                    and time.monotonic() - last_report >= progress_interval_s
+                ):
+                    announce(
+                        f"progress: heartbeat completed={len(completed_records)}/{total}"
+                    )
+                    last_report = time.monotonic()
+            records = tuple(completed_records[key] for key in sorted(completed_records))
     records = tuple(sorted(records, key=lambda record: record.key))
     return RunRecord(records, _write_compact(records, run_dir))
+
+
+def _heartbeat(
+    stop: threading.Event,
+    announce,
+    message,
+    interval_s: float = 30.0,
+) -> None:
+    """Emit periodic progress without sharing state with scientific workers."""
+    while not stop.wait(interval_s):
+        announce(message())
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -205,7 +299,7 @@ def initialize_run_from_bytes(
                 or existing.get("config_digest") != config_digest
                 or existing.get("config_sha256") != digests
                 or existing.get("cyexm_commit")
-                != "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52"
+                != "f6e0de36cd7f6b5e85f093884c2cf224225f4ec2"
                 or existing.get("output_schema_version") != OUTPUT_SCHEMA_VERSION
                 or any(
                     not (config_dir / name).is_file()
@@ -237,7 +331,7 @@ def initialize_run_from_bytes(
                     {
                         "config_digest": config_digest,
                         "config_sha256": digests,
-                        "cyexm_commit": "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52",
+                        "cyexm_commit": "f6e0de36cd7f6b5e85f093884c2cf224225f4ec2",
                         "initialized_at": datetime.now(UTC).isoformat(),
                         "output_schema_version": OUTPUT_SCHEMA_VERSION,
                     },

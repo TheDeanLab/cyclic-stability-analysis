@@ -251,13 +251,19 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
     )
     for row in _csv_rows(qc_root / "qc" / "deformation.csv", _DEFORMATION_COLUMNS):
         deformation_by_case[_case_key(row)].append(row)
-    if (
-        set(decision_rows) != _EXPECTED_CASE_KEYS
-        or set(registration_rows) != _EXPECTED_CASE_KEYS
-    ):
+    decision_keys = set(decision_rows)
+    registration_keys = set(registration_rows)
+    if decision_keys != registration_keys or not decision_keys:
+        raise ValueError(
+            "decision and registration QC tables must contain the same cases"
+        )
+    cohorts = {key.cohort for key in decision_keys}
+    if cohorts <= {"golgi", "lamin"} and decision_keys != _EXPECTED_CASE_KEYS:
         raise ValueError(
             "QC inventory must contain the expected ten-cell moving-round key set"
         )
+    if not cohorts <= {"golgi", "lamin", "lamp1"}:
+        raise ValueError("QC inventory contains an unsupported cohort")
 
     revisions: dict[CaseKey, CaseRevision] = {}
     visual_count = 0
@@ -324,8 +330,11 @@ def read_revision_cases(qc_root: Path) -> dict[CaseKey, CaseRevision]:
         )
     if deformation_by_case:
         raise ValueError("deformation table contains unknown QC cases")
-    if visual_count != 39:
-        raise ValueError("QC inventory must contain exactly 39 visual cases")
+    expected_visual = 39 if cohorts <= {"golgi", "lamin"} else len(decision_keys)
+    if visual_count != expected_visual:
+        raise ValueError(
+            f"QC inventory must contain exactly {expected_visual} visual cases"
+        )
     return revisions
 
 

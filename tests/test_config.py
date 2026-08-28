@@ -314,6 +314,46 @@ def test_config_preserves_image_verified_biological_lamp_identifiers(
     assert {cell.cell_id for cell in config.cells if cell.cohort == "lamp1"} == set(
         lamp_cells
     )
+    assert config.cell("lamp1", "LAMP1-verified-alpha").rounds[
+        0
+    ].tiff_directory == Path(
+        "/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/"
+        "Resubmission/Lysosomes/LAMP1-verified-alpha"
+    )
+
+
+def test_config_accepts_documented_lamp1_round_two_tubulin_exposure_exception(
+    config_files: tuple[Path, ...],
+) -> None:
+    """The single audited 300 ms registration-channel exposure stays explicit."""
+    analysis, correspondence, decisions = config_files
+    valid = correspondence.with_name("lamp-round2-exposure-exception.csv")
+    lamp_cells = (
+        "LAMP1-verified-alpha",
+        "LAMP1-verified-beta",
+        "LAMP1-verified-gamma",
+        "LAMP1-verified-delta",
+        "LAMP1-verified-epsilon",
+    )
+    rows = "".join(_lamp_rows(cell_id) for cell_id in lamp_cells)
+    rows = rows.replace(
+        "round2/DAPI_tubulin_lamp1_001.nd2,Lysosomes/LAMP1-verified-alpha,"
+        "0,647_lamp1,200,50,200,50,200,75,",
+        "round2/DAPI_tubulin_lamp_001.nd2,Lysosomes/LAMP1-verified-alpha,"
+        "0,647_lamp1,200,50,300,50,200,75,",
+        1,
+    )
+    valid.write_text(
+        correspondence.read_text(encoding="utf-8") + rows,
+        encoding="utf-8",
+    )
+    config = load_analysis_config(analysis, valid, decisions)
+    alpha_round_two = next(
+        item
+        for item in config.cell("lamp1", "LAMP1-verified-alpha").rounds
+        if item.acquisition_round == 2
+    )
+    assert alpha_round_two.tubulin_exposure_ms == 300.0
 
 
 def test_config_rejects_boolean_physical_values(config_files: tuple[Path, ...]) -> None:

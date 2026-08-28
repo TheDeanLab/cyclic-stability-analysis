@@ -597,6 +597,8 @@ def _surface_normals_and_curvature(
     mask: NDArray[np.bool_],
     vertices_xyz_um: NDArray[np.float64],
     spacing_xyz_um: tuple[float, float, float],
+    *,
+    allow_degenerate: bool = False,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """Sample outward physical normals and matching signed-distance curvature.
 
@@ -640,14 +642,17 @@ def _surface_normals_and_curvature(
         [map_coordinates(outward[..., axis], sample_zyx, order=1) for axis in range(3)]
     ).T
     lengths = np.linalg.norm(sampled_outward, axis=1)
-    if not np.all(np.isfinite(lengths)) or np.any(lengths <= 0.0):
+    valid = np.isfinite(lengths) & (lengths > 0.0)
+    if not np.all(valid) and not allow_degenerate:
         raise ValueError("surface normal interpolation is degenerate")
-    normals = sampled_outward / lengths[:, None]
+    normals = np.full_like(sampled_outward, np.nan)
+    normals[valid] = sampled_outward[valid] / lengths[valid, None]
     foreground_zyx = np.argwhere(mask)
     if foreground_zyx.size == 0:
         raise ValueError("surface mask has no foreground centroid")
     centroid = foreground_zyx.mean(axis=0)[::-1] * np.array((sx, sy, sz))
     curvature = map_coordinates(divergence, sample_zyx, order=1)
+    curvature[~valid] = np.nan
     if not np.all(np.isfinite(curvature)):
         raise ValueError("surface curvature interpolation is non-finite")
     return normals, centroid, curvature
@@ -900,8 +905,23 @@ def realize_nuclear_surfaces(
         if geometry is None:
             raise RuntimeError("accepted DAPI component has no bounded geometry")
         normals, local_centroid, curvature = _surface_normals_and_curvature(
-            geometry.mask_zyx, geometry.vertices_xyz_um, spacing
+            geometry.mask_zyx,
+            geometry.vertices_xyz_um,
+            spacing,
+            allow_degenerate=True,
         )
+        valid_vertices = np.all(np.isfinite(normals), axis=1) & np.isfinite(curvature)
+        valid_faces = np.all(valid_vertices[geometry.faces], axis=1)
+        if not np.any(valid_faces):
+            raise ValueError("surface has no valid normal-supported faces")
+        faces = geometry.faces[valid_faces]
+        used = np.unique(faces)
+        remap = np.full(normals.shape[0], -1, dtype=np.intp)
+        remap[used] = np.arange(used.size, dtype=np.intp)
+        faces = remap[faces]
+        vertices_local = geometry.vertices_xyz_um[used]
+        normals = normals[used]
+        curvature = curvature[used]
         z_region, y_region, x_region = geometry.region_zyx
         origin_xyz_um = np.array(
             (
@@ -910,14 +930,14 @@ def realize_nuclear_surfaces(
                 int(z_region.start) * sz,
             )
         )
-        vertices = geometry.vertices_xyz_um + origin_xyz_um
+        vertices = vertices_local + origin_xyz_um
         centroid = local_centroid + origin_xyz_um
         component_mask = np.zeros(full_shape_zyx, dtype=bool)
         component_mask[geometry.region_zyx] = geometry.mask_zyx
         for array in (
             component_mask,
             vertices,
-            geometry.faces,
+            faces,
             normals,
             centroid,
             curvature,
@@ -2084,8 +2104,8 @@ __all__ = [
     "NuclearComponentQc",
     "NuclearConsensus",
     "NuclearSurface",
-    "analyze_lamin_cell",
     "adjudicate_nuclear_components",
+    "analyze_lamin_cell",
     "consensus_nuclear_surface",
     "lamin_normal_profiles",
     "realize_nuclear_surfaces",

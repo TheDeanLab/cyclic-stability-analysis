@@ -11,7 +11,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, cast
 
-_COHORTS = frozenset({"golgi", "lamin"})
+_COHORTS = frozenset({"golgi", "lamin", "lamp1"})
 _ROUNDS = frozenset({1, 3, 4, 5})
 _CHANNELS = frozenset({"dapi", "tubulin"})
 _STAGES = frozenset({"pre", "affine", "nonlinear"})
@@ -120,13 +120,13 @@ def _validate_overlay_product(
 class CaseKey:
     """One biological cohort, cell, and moving acquisition round."""
 
-    cohort: Literal["golgi", "lamin"]
+    cohort: Literal["golgi", "lamin", "lamp1"]
     cell_id: str
     acquisition_round: Literal[1, 3, 4, 5]
 
     def __post_init__(self) -> None:
         if self.cohort not in _COHORTS:
-            raise ValueError("cohort must be golgi or lamin")
+            raise ValueError("cohort must be golgi, lamin, or lamp1")
         _string(self.cell_id, "cell_id")
         if self.acquisition_round not in _ROUNDS:
             raise ValueError("acquisition_round must be one of 1, 3, 4, or 5")

@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12,<3.13"
 # dependencies = [
-#   "cy-exm[workflow] @ git+https://github.com/TheDeanLab/Cy-ExM.git@c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52",
+#   "cy-exm[workflow] @ git+https://github.com/TheDeanLab/Cy-ExM.git@f6e0de36cd7f6b5e85f093884c2cf224225f4ec2",
 #   "nd2==0.11.3",
 #   "PyYAML>=6,<7",
 #   "psutil>=5.9,<8",
@@ -87,6 +87,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-index", type=int)
     parser.add_argument("--force-task", action="store_true")
     parser.add_argument("--nuclear-inventory-only", action="store_true")
+    parser.add_argument(
+        "--progress-interval-s",
+        type=float,
+        default=30.0,
+        help="seconds between running-task heartbeat messages (default: 30)",
+    )
     return parser
 
 
@@ -450,7 +456,7 @@ def _software_identity() -> str:
         {
             "analysis_commit": commit,
             "analysis_tree_sha256": tree.hexdigest(),
-            "cyexm_commit": "c8b6a9f4a2f5f5fab3296fdc81190a7324da2a52",
+            "cyexm_commit": "f6e0de36cd7f6b5e85f093884c2cf224225f4ec2",
             "python": platform.python_version(),
             "dependencies": versions,
         },
@@ -504,6 +510,11 @@ def main(argv: list[str] | None = None) -> int:
             results_root is not None,
             cohorts,
             args.cell,
+        )
+        print(
+            f"progress: starting target-blind nuclear inventory ({len(cohorts) or 'all'} cohorts)",
+            file=sys.stderr,
+            flush=True,
         )
         record = run_artifact_task(
             ArtifactTask(
@@ -636,7 +647,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"{record.status}: {record.key}")
         return 0 if record.status == "complete" else 1
-    record = run_tasks(tasks, profile, run_dir)
+    record = run_tasks(
+        tasks, profile, run_dir, progress_interval_s=args.progress_interval_s
+    )
     failures = sum(item.status != "complete" for item in record.tasks)
     print(
         f"ran {len(record.tasks)} tasks; failed={failures}; compact={record.compact_table}"

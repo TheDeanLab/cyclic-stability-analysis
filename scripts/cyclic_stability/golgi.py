@@ -514,7 +514,7 @@ def _artifact_validity_masks(
         if (
             source_identity != FileIdentity.from_path(source)
             or fixed_identity
-            != FileIdentity.from_path(reference_artifact.registered_dapi)
+            != FileIdentity.from_path(reference_artifact.registered_tubulin)
             or affine_identity != FileIdentity.from_path(artifact.affine)
             or warp_identity != FileIdentity.from_path(artifact.warp)
             or request.upstream != warp_identity
@@ -951,8 +951,10 @@ def analyze_golgi_cell(
     """Load validated registered Golgi inputs and publish one cell's diagnostics.
 
     The entry point reconstructs target-independent support from each audited native
-    target input and its persisted affine-before-warp chain using nearest-neighbor
-    interpolation. It never accepts caller-supplied target-support masks.
+    target input and its persisted affine-before-warp chain. The scalar Golgi
+    channel is required to have the producer's linear interpolation request;
+    nearest-neighbor is used only when replaying binary validity support. It
+    never accepts caller-supplied target-support masks.
     """
     if cell.cohort != "golgi":
         raise ValueError("Golgi analysis requires a golgi CellSpec")

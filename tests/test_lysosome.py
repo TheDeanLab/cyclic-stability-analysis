@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import json
 import math
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -31,6 +30,7 @@ from cyclic_stability.models import CellSpec, QcDecision, RoundSpec
 from cyclic_stability.morphology import gaussian_sigma_zyx
 from cyclic_stability.nuclear import consensus_nuclear_surface
 from cyclic_stability.units import ResolutionReference
+from cyexm.errors import InputValidationError
 from synthetic import (
     RESOLUTION,
     SPACING,
@@ -520,11 +520,11 @@ def test_excluded_lamp_round_never_opens_its_target(
     assert "synthetic-validity" in result.input_identities
 
 
-def test_real_lamp_gate_returns_machine_readable_unavailable(
+def test_real_lamp_gate_requires_a_cell_after_verified_inventory_is_admitted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No image-verified mappings is an unavailable gate, not a failed biological result."""
+    """The production inventory is now schedulable and therefore requires a cell."""
     import sys
 
     scripts = Path(__file__).parents[1] / "scripts"
@@ -549,8 +549,6 @@ def test_real_lamp_gate_returns_machine_readable_unavailable(
             str(run_dir),
         ],
     )
-    assert main() == 0
-    payload = json.loads((run_dir / "validation" / "inputs.json").read_text())
-    assert payload["status"] == "unavailable"
-    assert payload["reason"] == "no image-verified LAMP1 cell mappings"
-    assert payload["scheduled_cell_count"] == 0
+    with pytest.raises(InputValidationError, match="--cell is required"):
+        main()
+    assert not (run_dir / "validation" / "inputs.json").exists()

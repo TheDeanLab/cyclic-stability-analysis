@@ -1002,6 +1002,27 @@ def test_native_source_retarget_during_snapshot_is_not_selected(
     assert artifacts.native_target_identity is None
 
 
+def test_lamp1_resolves_the_exported_uppercase_target_basename(
+    golgi_round_two: RoundSpec, complete_status_inspector: StatusInspector
+) -> None:
+    """The registered LAMP1 artifact keeps the manifest's uppercase basename."""
+    channels = (
+        golgi_round_two.execution_profile.parent
+        / "workflow-root/synthetic/rounds/round-001/channels"
+    )
+    write_completion_fixture(
+        channels / "round_2_647_LAMP1.tif", b"round_2_647_LAMP1.tif"
+    )
+    lamp_round = replace(
+        golgi_round_two,
+        cohort="lamp1",
+        cell_id="LAMP1-verified-alpha",
+        identity_method="image-verified",
+    )
+    artifacts = resolve_round_artifacts(lamp_round, complete_status_inspector)
+    assert artifacts.registered_target.name == "round_2_647_LAMP1.tif"
+
+
 def _lamin_round(
     tmp_path: Path,
     *,

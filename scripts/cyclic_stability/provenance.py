@@ -68,7 +68,7 @@ class _ProductionPlaneReader:
 
 
 def _target_basename(round_spec: RoundSpec) -> str:
-    target = {"golgi": "647_golgi", "lamin": "647_lamin", "lamp1": "647_lamp1"}
+    target = {"golgi": "647_golgi", "lamin": "647_lamin", "lamp1": "647_LAMP1"}
     return target[round_spec.cohort]
 
 
