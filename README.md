@@ -178,15 +178,17 @@ records a reason. A missing, duplicate, or changed match stops that task. The
 excluded object remains in nuclear QC and diagnostic evidence; ordinal IDs are
 not used to select exclusions because watershed splitting can renumber nuclei.
 
-Run all five fields with the original frozen correspondence and registration QC,
-a new result root, and the bounded local execution profile:
+Run all five fields with the revised correspondence and original registration QC,
+a new result root, and the bounded local execution profile. The revised CSV changes
+only Lamin ND2 paths to their current `raw_data/roundN` locations; all 25 files
+were verified against their original SHA-256 identities:
 
 ```bash
 export UV_CACHE_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/.cache
 export UV_PYTHON_INSTALL_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/python
 uv run --script scripts/run_analysis.py \
   --analysis-config config/analysis-lamin-watershed.yaml \
-  --correspondence results/full-lamin-20260827/20260829T004550Z-d44d439cb118/config/correspondence.csv \
+  --correspondence config/correspondence-lamin-watershed.csv \
   --qc-decisions results/full-lamin-20260827/20260829T004550Z-d44d439cb118/config/qc-decisions.csv \
   --execution-profile config/execution-local.yaml \
   --results-root results/full-lamin-watershed-20260921 --cohort lamin
