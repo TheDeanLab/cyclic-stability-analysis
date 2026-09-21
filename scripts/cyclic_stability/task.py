@@ -1110,7 +1110,7 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     _qc_gate(task)  # Must precede any analyzer import or target-volume opening.
     if task.config is None:
         raise ValueError("production marker analysis requires an AnalysisConfig")
-    from cyclic_stability.golgi import analyze_golgi_cell
+    from cyclic_stability.golgi import analyze_golgi_cell, segment_golgi_3d
     from cyclic_stability.images import load_volume
     from cyclic_stability.lysosome import analyze_lamp1_cell
     from cyclic_stability.morphology import threshold_ensemble
@@ -1149,12 +1149,16 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
         raw_dapi = load_volume(paths["dapi"])
         raw_target = load_volume(paths["target"])
         roi = raw_structure_roi(round_spec.cohort, raw_dapi, task.config)
-        members = threshold_ensemble(
-            raw_target,
-            roi,
-            task.config.ensembles.gaussian_sigma_um,
-            task.config.ensembles.threshold_sbr,
-            task.config.voxel_spacing_xyz_um,
+        members = (
+            (segment_golgi_3d(raw_target, roi, task.config).member,)
+            if round_spec.cohort == "golgi"
+            else threshold_ensemble(
+                raw_target,
+                roi,
+                task.config.ensembles.gaussian_sigma_um,
+                task.config.ensembles.threshold_sbr,
+                task.config.voxel_spacing_xyz_um,
+            )
         )
         signal_rows.extend(
             {

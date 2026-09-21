@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
+from cyclic_stability import golgi
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.golgi import (
     ENSEMBLE_ENDPOINTS,
@@ -192,6 +193,79 @@ def _producer_artifacts(tmp_path: Path, analysis_config):
         native_target=source,
     )
     return reference, moving, fixed, source, affine, warp, request
+
+
+def test_conservative_3d_segmentation_uses_local_background_and_physical_cleanup(
+    analysis_config,
+) -> None:
+    """A global raw threshold or 2-D cleanup would retain background and speckle."""
+    shape = (21, 64, 64)
+    z, y, x = np.indices(shape, dtype=np.float32)
+    image = 20.0 + 0.08 * x + 0.05 * np.sin(y / 3.0) + 0.03 * np.cos(z)
+    image[7:14, 25:39, 25:39] += 30.0
+    image[2, 2, 2] += 100.0
+    support = np.ones(shape, dtype=bool)
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=(0.5, 0.5, 0.5),
+        golgi=replace(
+            analysis_config.golgi,
+            feature_sigma_um=0.5,
+            background_sigma_um=4.0,
+            hysteresis_low_sbr=4.0,
+            hysteresis_high_sbr=10.0,
+            minimum_component_volume_um3=10.0,
+        ),
+    )
+
+    result = golgi.segment_golgi_3d(image, support, config)
+
+    assert result.member.mask_zyx[10, 32, 32]
+    assert not result.member.mask_zyx[2, 2, 2]
+    assert not result.member.mask_zyx.flags.writeable
+    assert result.member.sigma_um == 0.5
+    assert result.member.threshold_sbr == 4.0
+    assert result.low_threshold == pytest.approx(
+        result.center + 4.0 * result.noise_scale
+    )
+    assert result.high_threshold == pytest.approx(
+        result.center + 10.0 * result.noise_scale
+    )
+
+
+def test_conservative_3d_segmentation_cannot_leave_accepted_mip_gate(
+    analysis_config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-plane 3-D texture must not escape the visually accepted XY policy."""
+    shape = (9, 32, 32)
+    rng = np.random.default_rng(17)
+    image = rng.normal(20.0, 0.2, size=shape)
+    image[2:7, 8:16, 8:16] += 30.0
+    image[2:7, 20:28, 20:28] += 30.0
+    support = np.ones(shape, dtype=bool)
+    gate = np.zeros(shape[1:], dtype=bool)
+    gate[6:18, 6:18] = True
+    monkeypatch.setattr(
+        golgi,
+        "_mip_golgi_lateral_mask",
+        lambda *_args: (gate, 0.0, 1.0, 4.0, 10.0),
+    )
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=(0.5, 0.5, 0.5),
+        golgi=replace(
+            analysis_config.golgi,
+            minimum_component_volume_um3=1.0,
+        ),
+    )
+
+    result = golgi.segment_golgi_3d(image, support, config)
+
+    assert result.member.mask_zyx[:, 8:16, 8:16].any()
+    assert not result.member.mask_zyx[:, 20:28, 20:28].any()
+    assert not np.any(result.member.mask_zyx & ~gate[None, :, :])
+    assert result.projection_low_threshold == 4.0
+    assert result.projection_high_threshold == 10.0
 
 
 def test_gradient_similarity_is_robust_to_global_intensity_scaling(
@@ -442,10 +516,10 @@ def test_array_kernel_requires_explicit_validity_contract(analysis_config) -> No
         analyze_golgi_arrays(rounds, synthetic_dapi_rounds(), analysis_config)
 
 
-def test_fragmentation_change_is_reported_for_every_frozen_member(
+def test_fragmentation_is_reported_once_for_conservative_3d_policy(
     analysis_config,
 ) -> None:
-    """Selecting one favorable scale or discarding small objects hides fragmentation."""
+    """Reverting to the old threshold grid would no longer test the reviewed mask."""
     result = analyze_golgi_arrays(
         {2: synthetic_golgi(components=1), 3: synthetic_golgi(components=4)},
         synthetic_dapi_rounds(),
@@ -457,16 +531,14 @@ def test_fragmentation_change_is_reported_for_every_frozen_member(
         for row in result.ensemble_rows
         if row.acquisition_round == 3 and row.endpoint == "component_count"
     ]
-    assert len(counts) == len(analysis_config.ensembles.gaussian_sigma_um) * len(
-        analysis_config.ensembles.threshold_sbr
-    )
-    assert np.median(counts) > 1
+    assert len(counts) == 1
+    assert counts[0] >= 1
 
 
-def test_perinuclear_roi_is_fixed_outside_consensus_and_limited_to_18_um(
+def test_golgi_roi_includes_nuclear_context_and_is_limited_to_18_um(
     analysis_config,
 ) -> None:
-    """A target-derived or round-specific ROI would make morphology non-comparable."""
+    """Hard nuclear exclusion loses reviewed Golgi where DAPI boundaries overlap it."""
     dapi = synthetic_dapi_rounds()
     config = _small_nucleus_config(analysis_config)
     surface = consensus_nuclear_surface(
@@ -484,8 +556,9 @@ def test_perinuclear_roi_is_fixed_outside_consensus_and_limited_to_18_um(
         ~surface.mask_zyx,
         sampling=config.voxel_spacing_xyz_um[::-1],
     )
-    assert not np.any(roi & surface.mask_zyx)
+    assert np.all(roi[surface.mask_zyx])
     assert float(distances[roi].max()) <= 18.0
+    assert np.array_equal(roi, (distances <= 18.0))
     assert np.array_equal(roi, _perinuclear_roi(surface.mask_zyx, validity, config))
 
 
@@ -558,7 +631,11 @@ def test_all_empty_members_keep_every_predeclared_summary_endpoint(
     """Dropping all-NaN endpoints creates a data-dependent outcome schema."""
     empty_config = replace(
         _small_nucleus_config(analysis_config),
-        ensembles=replace(analysis_config.ensembles, threshold_sbr=(1e9,)),
+        golgi=replace(
+            analysis_config.golgi,
+            hysteresis_low_sbr=1e9,
+            hysteresis_high_sbr=2e9,
+        ),
     )
     result = analyze_golgi_arrays(
         {2: synthetic_golgi(), 3: synthetic_golgi()},
@@ -595,17 +672,17 @@ def test_diagonal_positive_voxels_remain_one_26_connected_component() -> None:
     assert _mask_geometry(mask, (0.1, 0.1, 0.3))["component_count"] == 1.0
 
 
-def test_ensemble_rows_preserve_all_coordinates_and_endpoints(analysis_config) -> None:
-    """Collapsing sigma or threshold coordinates prevents sensitivity-curve review."""
+def test_golgi_rows_name_the_complete_conservative_segmentation_policy(
+    analysis_config,
+) -> None:
+    """Recording only the low threshold cannot reproduce a hysteresis mask."""
     result = analyze_golgi_arrays(
         {2: synthetic_golgi(), 3: synthetic_golgi()},
         synthetic_dapi_rounds(),
         _small_nucleus_config(analysis_config),
         validity_masks=_full_support({2: synthetic_golgi(), 3: synthetic_golgi()}),
     )
-    members = len(analysis_config.ensembles.gaussian_sigma_um) * len(
-        analysis_config.ensembles.threshold_sbr
-    )
+    members = 1
     assert len(result.ensemble_rows) == 2 * members * (
         len(ENSEMBLE_ENDPOINTS)
         + len(analysis_config.ensembles.surface_tolerance_resolution_units)
@@ -614,14 +691,10 @@ def test_ensemble_rows_preserve_all_coordinates_and_endpoints(analysis_config) -
         row.ensemble_name
         for row in result.ensemble_rows
         if row.endpoint == "volume_um3"
-    } == {
-        f"sigma={sigma:g};sbr={threshold:g}"
-        for sigma in analysis_config.ensembles.gaussian_sigma_um
-        for threshold in analysis_config.ensembles.threshold_sbr
-    }
+    } == {"mip-guided-dog=0.5/4;hysteresis=4/10;minimum-volume-um3=0.1126"}
     assert all(
-        row.sigma_um in analysis_config.ensembles.gaussian_sigma_um
-        and row.threshold_sbr in analysis_config.ensembles.threshold_sbr
+        row.sigma_um == analysis_config.golgi.feature_sigma_um
+        and row.threshold_sbr == analysis_config.golgi.hysteresis_low_sbr
         for row in result.ensemble_rows
     )
     assert all(
@@ -752,6 +825,33 @@ def test_golgi_cell_publishes_target_blind_component_diagnostic(
     diagnostic = tmp_path / "out" / "nuclear-component-inventory.pdf"
     assert diagnostic.is_file()
     assert diagnostic in result.diagnostics
+    segmentation_qc = tmp_path / "out" / "golgi-segmentation-qc.csv"
+    segmentation_manifest = tmp_path / "out" / "golgi-segmentation-manifest.json"
+    overlay = tmp_path / "out" / "golgi-registered-overlays.npz"
+    assert segmentation_qc.is_file()
+    assert segmentation_qc in result.diagnostics
+    manifest = json.loads(segmentation_manifest.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
+    assert manifest["segmentation_algorithm"] == (
+        "conservative-mip-guided-physical-3d-dog-hysteresis"
+    )
+    assert manifest["diagnostic_intensity_storage"] == (
+        "per-round-xy-maximum-projection"
+    )
+    assert manifest["nuclear_mask_policy"] == "context-only-not-hard-exclusion"
+    assert manifest["nuclear_watershed_seed_prominence_um"] == 6.0
+    assert manifest["review_display"] == {
+        "xy_plane_1based": 36,
+        "xy_method": "raw-plane",
+        "orthogonal_plane_background_percentile": 10.0,
+        "orthogonal_projection_percentile": 95.0,
+        "coordinate_policy": "shared-physical-pixel-centers-row-zero-at-top",
+    }
+    with np.load(overlay, allow_pickle=False) as arrays:
+        assert "consensus_nuclear_labels_zyx" in arrays
+        assert "round_2_conservative_golgi_mask_zyx" in arrays
+        assert "round_2_target_mip_yx" in arrays
+        assert "round_2_target_zyx" not in arrays
 
 
 def test_atomic_golgi_diagnostic_publisher_restores_previous_tree_on_failure(
@@ -813,12 +913,12 @@ def test_target_distance_characterizes_anisotropic_voxel_center_coordinates() ->
 def test_golgi_union_roi_and_distances_consume_every_accepted_nucleus(
     analysis_config,
 ) -> None:
-    """Using only the first nucleus would leak the second into the Golgi ROI."""
+    """Every nuclear overlap remains reviewable and distances use all surfaces."""
     consensus, config = _two_nucleus_consensus(analysis_config)
     validity = {2: np.ones(consensus.mask_zyx.shape, dtype=bool)}
     roi = _perinuclear_roi(consensus.mask_zyx, validity, config)
-    assert not np.any(roi & consensus.nuclei[0].mask_zyx)
-    assert not np.any(roi & consensus.nuclei[1].mask_zyx)
+    assert np.all(roi[consensus.nuclei[0].mask_zyx])
+    assert np.all(roi[consensus.nuclei[1].mask_zyx])
 
     target_mask = np.zeros(consensus.mask_zyx.shape, dtype=bool)
     target_index_zyx = (12, 12, 49)

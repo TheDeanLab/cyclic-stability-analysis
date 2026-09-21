@@ -129,7 +129,16 @@ def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
         "raw_structure_roi",
         lambda *_args: np.ones((3, 3, 3), dtype=bool),
     )
-    monkeypatch.setattr(morphology, "threshold_ensemble", lambda *_args: ())
+    monkeypatch.setattr(
+        morphology,
+        "threshold_ensemble",
+        lambda *_args: pytest.fail("Golgi raw signal used the legacy threshold grid"),
+    )
+    monkeypatch.setattr(
+        golgi,
+        "segment_golgi_3d",
+        lambda *_args: SimpleNamespace(member=object()),
+    )
     signal_row = SignalRow(
         "golgi",
         cell.cell_id,

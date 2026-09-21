@@ -13,6 +13,7 @@ from cyclic_stability.models import NuclearConfig
 from cyclic_stability.nuclear import NuclearComponentQc
 from cyclic_stability.task import RetainedContent
 from cyexm.spatial import ImageGeometry
+
 from scripts import run_analysis
 
 
@@ -92,6 +93,7 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         nominal_expansion_factor=4.5,
         nuclear=NuclearConfig(
             consensus_smoothing_um=0.5,
+            watershed_seed_prominence_um=6.0,
             normal_half_window_um=1.5,
             normal_step_um=0.05,
             ridge_min_sbr=3.0,
@@ -374,6 +376,7 @@ def test_nuclear_inventory_decode_cannot_publish_transient_replacement_bytes(
         nominal_expansion_factor=4.5,
         nuclear=NuclearConfig(
             consensus_smoothing_um=0.5,
+            watershed_seed_prominence_um=6.0,
             normal_half_window_um=1.5,
             normal_step_um=0.05,
             ridge_min_sbr=3.0,
@@ -523,6 +526,7 @@ def test_nuclear_inventory_reports_out_of_contract_before_target_work(
         nominal_expansion_factor=4.5,
         nuclear=NuclearConfig(
             consensus_smoothing_um=0.5,
+            watershed_seed_prominence_um=6.0,
             normal_half_window_um=1.5,
             normal_step_um=0.05,
             ridge_min_sbr=3.0,
@@ -604,6 +608,7 @@ def test_nuclear_inventory_publishes_component_qc_when_strict_normals_fail(
         nominal_expansion_factor=4.5,
         nuclear=NuclearConfig(
             consensus_smoothing_um=0.5,
+            watershed_seed_prominence_um=6.0,
             normal_half_window_um=1.5,
             normal_step_um=0.05,
             ridge_min_sbr=3.0,

@@ -9,7 +9,7 @@ import pytest
 from cyclic_stability.models import AnalysisConfig
 from cyclic_stability.morphology import threshold_ensemble
 from cyclic_stability.signal import measure_signal, raw_structure_roi
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 from synthetic import ellipsoid_dapi, synthetic_roi, synthetic_target
 
 
@@ -58,8 +58,39 @@ def test_raw_signal_roi_uses_the_union_of_every_accepted_nucleus(
     lamp_roi = raw_structure_roi("lamp1", dapi, config)
     assert np.any(lamin_roi[:, :, :28])
     assert np.any(lamin_roi[:, :, 28:])
-    assert np.array_equal(golgi_roi, ~lamin_roi)
+    distance = distance_transform_edt(~lamin_roi, sampling=spacing[::-1])
+    assert np.all(golgi_roi[lamin_roi])
+    assert np.array_equal(golgi_roi, distance <= 18.0)
     assert np.array_equal(lamp_roi, ~lamin_roi)
+
+
+def test_raw_signal_roi_does_not_require_surface_curvature(
+    analysis_config: AnalysisConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raw intensity support needs accepted masks, not strict surface geometry."""
+    spacing = (0.5, 0.5, 0.5)
+    dapi = ellipsoid_dapi(
+        ((8.0, 8.0, 8.0),),
+        ((5.0, 5.0, 5.0),),
+        spacing,
+        (36, 36, 36),
+    )
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=spacing,
+        nominal_expansion_factor=1.0,
+    )
+
+    def fail_surface(*_args, **_kwargs):
+        raise ValueError("surface curvature is unavailable")
+
+    monkeypatch.setattr(
+        "cyclic_stability.nuclear.realize_nuclear_surfaces", fail_surface
+    )
+
+    roi = raw_structure_roi("golgi", dapi, config)
+
+    assert np.any(roi)
 
 
 def test_raw_signal_rows_serialize_explicit_aggregate_nucleus_id(

@@ -26,6 +26,8 @@ from scipy.ndimage import (
 )
 from skimage.filters import threshold_otsu
 from skimage.measure import find_contours, marching_cubes, mesh_surface_area
+from skimage.morphology import h_maxima
+from skimage.segmentation import watershed
 
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.images import BackgroundSummary, load_volume, robust_background
@@ -275,6 +277,7 @@ def _spacing(
 def _validate_config(config: NuclearConfig) -> None:
     values = (
         config.consensus_smoothing_um,
+        config.watershed_seed_prominence_um,
         config.normal_half_window_um,
         config.normal_step_um,
         config.ridge_min_sbr,
@@ -408,8 +411,9 @@ def _build_lamin_reference_masks(
 
 
 def _normalized_dapi(image: NDArray[np.float64]) -> NDArray[np.float64]:
-    background = robust_background(image)
-    corrected = np.clip(image - background.median, 0.0, None)
+    """Normalize DAPI after removing acquisition-plane background offsets."""
+    plane_background = np.percentile(image, 10.0, axis=(1, 2))
+    corrected = np.clip(image - plane_background[:, None, None], 0.0, None)
     positive = corrected[corrected > 0.0]
     if positive.size == 0:
         raise ValueError("DAPI has no positive background-corrected support")
@@ -455,6 +459,59 @@ def _face_contact_fractions(
             else 0.0
         ),
     )
+
+
+def _watershed_nuclear_labels(
+    foreground_mask: NDArray[np.bool_],
+    spacing_xyz_um: tuple[float, float, float],
+    seed_prominence_um: float,
+) -> tuple[NDArray[np.uint16], int]:
+    """Split touching DAPI foreground while preserving its exact outer union."""
+    mask = np.asarray(foreground_mask, dtype=bool)
+    source_labels, source_count = label(mask, structure=np.ones((3, 3, 3), dtype=bool))
+    source_regions = find_objects(source_labels, max_label=source_count)
+    partition = np.zeros(mask.shape, dtype=np.uint16)
+    marker_count = 0
+    for component_index in range(1, source_count + 1):
+        region = source_regions[component_index - 1]
+        if region is None:
+            raise RuntimeError("connected DAPI component has no bounding slice")
+        component = source_labels[region] == component_index
+        padded_component = np.pad(component, 1)
+        distance = distance_transform_edt(
+            padded_component, sampling=spacing_xyz_um[::-1]
+        )[1:-1, 1:-1, 1:-1].astype(np.float32)
+        prominent = h_maxima(distance, seed_prominence_um) & component
+        local_markers, local_count = label(
+            prominent, structure=np.ones((3, 3, 3), dtype=bool)
+        )
+        if local_count == 0:
+            masked_distance = np.where(component, distance, -np.inf)
+            peak_index = np.unravel_index(
+                int(np.argmax(masked_distance)), masked_distance.shape
+            )
+            local_markers = np.zeros(component.shape, dtype=np.int32)
+            local_markers[peak_index] = 1
+            local_count = 1
+        watershed_markers = np.zeros(local_markers.shape, dtype=np.int32)
+        for local_index in range(1, local_count + 1):
+            marker_count += 1
+            if marker_count > np.iinfo(np.uint16).max:
+                raise ValueError("nuclear watershed produced too many markers")
+            watershed_markers[local_markers == local_index] = marker_count
+        local_partition = np.asarray(
+            watershed(
+                -distance,
+                markers=watershed_markers,
+                mask=component,
+                connectivity=np.ones((3, 3, 3), dtype=bool),
+            ),
+            dtype=np.uint16,
+        )
+        partition[region][component] = local_partition[component]
+    if not np.array_equal(partition > 0, mask):
+        raise RuntimeError("nuclear watershed did not preserve the DAPI foreground")
+    return partition, marker_count
 
 
 def _expanded_component_slice(
@@ -726,8 +783,10 @@ def adjudicate_nuclear_components(
         )
         | filled
     )
-    candidate_labels, candidate_count = label(
-        mask, structure=np.ones((3, 3, 3), dtype=bool)
+    candidate_labels, candidate_count = _watershed_nuclear_labels(
+        mask,
+        spacing,
+        config.watershed_seed_prominence_um,
     )
     full_shape_zyx = mask.shape
     component_regions = find_objects(candidate_labels, max_label=candidate_count)
@@ -841,6 +900,57 @@ def adjudicate_nuclear_components(
     )
 
 
+def _validated_accepted_components(
+    adjudication: NuclearComponentAdjudication,
+    config: NuclearConfig,
+) -> tuple[tuple[_NuclearCandidate, NuclearComponentQc], ...]:
+    """Return accepted components after enforcing the shared count contract."""
+    if config != adjudication._config:
+        raise ValueError("nuclear realization requires the adjudication configuration")
+    accepted = tuple(
+        (candidate, qc)
+        for candidate, qc in zip(
+            adjudication._candidates, adjudication.component_qc, strict=True
+        )
+        if candidate.accepted
+    )
+    minimum_count, maximum_count = config.accepted_component_count
+    if not minimum_count <= len(accepted) <= maximum_count:
+        rejected_reasons = sorted(
+            {
+                reason
+                for candidate in adjudication._candidates
+                for reason in candidate.rejection_reasons
+            }
+        )
+        reason_suffix = (
+            f"; rejected component reasons: {', '.join(rejected_reasons)}"
+            if rejected_reasons
+            else ""
+        )
+        raise ValueError(
+            "accepted nuclear component count "
+            f"{len(accepted)} is outside configured range "
+            f"[{minimum_count}, {maximum_count}]{reason_suffix}"
+        )
+    return accepted
+
+
+def _adjudicated_nuclear_mask(
+    adjudication: NuclearComponentAdjudication,
+    config: NuclearConfig,
+) -> NDArray[np.bool_]:
+    """Return the accepted target-blind union without surface realization."""
+    union = np.zeros(adjudication._full_shape_zyx, dtype=bool)
+    for candidate, _qc in _validated_accepted_components(adjudication, config):
+        geometry = candidate.accepted_geometry
+        if geometry is None:
+            raise RuntimeError("accepted DAPI component has no bounded geometry")
+        union[geometry.region_zyx] |= geometry.mask_zyx
+    union.setflags(write=False)
+    return union
+
+
 def realize_nuclear_surfaces(
     adjudication: NuclearComponentAdjudication,
     config: NuclearConfig,
@@ -866,41 +976,15 @@ def realize_nuclear_surfaces(
         range, or any accepted component cannot satisfy strict surface-normal or
         curvature realization.
     """
-    if config != adjudication._config:
-        raise ValueError("surface realization requires the adjudication configuration")
-    candidates = adjudication._candidates
     component_qc = adjudication.component_qc
-    accepted_count = sum(item.accepted for item in candidates)
-    minimum_count, maximum_count = config.accepted_component_count
-    if not minimum_count <= accepted_count <= maximum_count:
-        rejected_reasons = sorted(
-            {
-                reason
-                for candidate in candidates
-                for reason in candidate.rejection_reasons
-            }
-        )
-        reason_suffix = (
-            f"; rejected component reasons: {', '.join(rejected_reasons)}"
-            if rejected_reasons
-            else ""
-        )
-        raise ValueError(
-            "accepted nuclear component count "
-            f"{accepted_count} is outside configured range "
-            f"[{minimum_count}, {maximum_count}]{reason_suffix}"
-        )
+    accepted_components = _validated_accepted_components(adjudication, config)
 
     spacing = adjudication.spacing_xyz_um
     sx, sy, sz = spacing
     full_shape_zyx = adjudication._full_shape_zyx
     accepted_labels = np.zeros(full_shape_zyx, dtype=np.uint16)
     nuclei: list[NuclearSurface] = []
-    accepted_index = 0
-    for candidate, qc in zip(candidates, component_qc, strict=True):
-        if not candidate.accepted:
-            continue
-        accepted_index += 1
+    for accepted_index, (candidate, qc) in enumerate(accepted_components, start=1):
         geometry = candidate.accepted_geometry
         if geometry is None:
             raise RuntimeError("accepted DAPI component has no bounded geometry")
@@ -1346,6 +1430,60 @@ def _write_profile_diagnostics(
     return (surface_path, profile_path, *projection_paths)
 
 
+def _dapi_review_projections(
+    dapi_volume: NDArray[np.generic], *, xy_plane_index: int
+) -> tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]:
+    """Return exact-plane XY and per-plane-background-corrected p95 XZ/YZ views."""
+    volume = _volume(dapi_volume, "DAPI review volume").astype(np.float32, copy=False)
+    if not 0 <= xy_plane_index < volume.shape[0]:
+        raise ValueError("xy_plane_index is outside the DAPI review volume")
+    plane_background = np.percentile(volume, 10.0, axis=(1, 2)).astype(np.float32)
+    corrected = np.maximum(volume - plane_background[:, None, None], 0.0)
+    return (
+        volume[xy_plane_index].copy(),
+        np.percentile(corrected, 95.0, axis=1).astype(np.float32),
+        np.percentile(corrected, 95.0, axis=2).astype(np.float32),
+    )
+
+
+def _label_review_projections(
+    labels: NDArray[np.uint16], *, xy_plane_index: int
+) -> tuple[list[NDArray[np.bool_]], list[NDArray[np.bool_]], list[NDArray[np.bool_]]]:
+    """Project labels while matching the XY overlay to its exact DAPI plane."""
+    if labels.ndim != 3 or not 0 <= xy_plane_index < labels.shape[0]:
+        raise ValueError("labels must be 3-D and contain the requested XY plane")
+    components = [labels == value for value in range(1, int(labels.max()) + 1)]
+    return (
+        [component[xy_plane_index] for component in components],
+        [component.max(axis=1) for component in components],
+        [component.max(axis=2) for component in components],
+    )
+
+
+def _physical_image_geometry(
+    image_shape_yx: tuple[int, int],
+    *,
+    horizontal_spacing_um: float,
+    vertical_spacing_um: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], tuple[float, float, float, float]]:
+    """Return contour centers and a top-origin raster extent in physical units."""
+    height, width = image_shape_yx
+    if height < 1 or width < 1:
+        raise ValueError("image_shape_yx must be positive")
+    if any(
+        not math.isfinite(value) or value <= 0.0
+        for value in (horizontal_spacing_um, vertical_spacing_um)
+    ):
+        raise ValueError("image spacing must be finite and positive")
+    x_centers = (np.arange(width, dtype=np.float64) + 0.5) * horizontal_spacing_um
+    y_centers = (np.arange(height, dtype=np.float64) + 0.5) * vertical_spacing_um
+    return (
+        x_centers,
+        y_centers,
+        (0.0, width * horizontal_spacing_um, height * vertical_spacing_um, 0.0),
+    )
+
+
 def write_nuclear_component_diagnostic(
     output_dir: Path,
     cell_id: str,
@@ -1384,35 +1522,80 @@ def write_nuclear_component_diagnostic(
     }
     if set(diagnostic_by_id) != {item.nucleus_id for item in consensus.component_qc}:
         raise ValueError("component diagnostics do not match DAPI component QC")
+    xy_plane_index = min(35, median_dapi.shape[0] - 1)
+    dapi_projections = _dapi_review_projections(
+        median_dapi, xy_plane_index=xy_plane_index
+    )
+    label_projections = _label_review_projections(
+        consensus.labels_zyx, xy_plane_index=xy_plane_index
+    )
     projections = (
-        ("XY", 0, (0, 1), (sx, sy)),
-        ("XZ", 1, (0, 2), (sx, sz)),
-        ("YZ", 2, (1, 2), (sy, sz)),
+        (
+            "XY",
+            dapi_projections[0],
+            label_projections[0],
+            (0, 1),
+            (sx, sy),
+            f"DAPI XY plane {xy_plane_index + 1}",
+        ),
+        (
+            "XZ",
+            dapi_projections[1],
+            label_projections[1],
+            (0, 2),
+            (sx, sz),
+            "DAPI XZ p95 after per-plane p10 subtraction",
+        ),
+        (
+            "YZ",
+            dapi_projections[2],
+            label_projections[2],
+            (1, 2),
+            (sy, sz),
+            "DAPI YZ p95 after per-plane p10 subtraction",
+        ),
     )
     figure = plt.figure(figsize=(12, 8), layout="constrained")
     grid = figure.add_gridspec(2, 3, height_ratios=(2.2, 1.0))
-    for column, (plane, projection_axis, centroid_axes, plot_spacing) in enumerate(
-        projections
-    ):
+    for column, (
+        plane,
+        projection,
+        projected_masks,
+        centroid_axes,
+        plot_spacing,
+        title,
+    ) in enumerate(projections):
         axis = figure.add_subplot(grid[0, column])
-        projection = median_dapi.max(axis=projection_axis)
-        horizontal_extent = (projection.shape[1] - 1) * plot_spacing[0]
-        vertical_extent = (projection.shape[0] - 1) * plot_spacing[1]
-        extent = (0.0, horizontal_extent, 0.0, vertical_extent)
-        axis.imshow(projection, cmap="gray", origin="lower", extent=extent)
-        for component in consensus.component_qc:
-            diagnostic = diagnostic_by_id[component.nucleus_id]
-            projected = next(
-                value for value in diagnostic.projections if value.plane == plane
-            )
-            color = color_by_id.get(component.nucleus_id, "#7F7F7F")
-            for outline in projected.outlines_ab_um:
-                axis.plot(
-                    outline[:, 0],
-                    outline[:, 1],
-                    color=color,
-                    linewidth=1.2 if component.accepted else 1.0,
-                    linestyle="-" if component.accepted else "--",
+        x_centers, y_centers, extent = _physical_image_geometry(
+            projection.shape,
+            horizontal_spacing_um=plot_spacing[0],
+            vertical_spacing_um=plot_spacing[1],
+        )
+        finite = projection[np.isfinite(projection)]
+        low, high = np.percentile(finite, (1.0, 99.5))
+        if high <= low:
+            high = low + 1.0
+        axis.imshow(
+            projection,
+            cmap="gray",
+            origin="upper",
+            extent=extent,
+            vmin=low,
+            vmax=high,
+        )
+        for accepted_index, component in enumerate(
+            item for item in consensus.component_qc if item.accepted
+        ):
+            projected = projected_masks[accepted_index]
+            color = color_by_id[component.nucleus_id]
+            if np.any(projected) and not np.all(projected):
+                axis.contour(
+                    x_centers,
+                    y_centers,
+                    projected.astype(float),
+                    levels=(0.5,),
+                    colors=(color,),
+                    linewidths=1.2,
                     zorder=2,
                 )
             point = (
@@ -1425,17 +1608,12 @@ def write_nuclear_component_diagnostic(
                 color=color,
                 edgecolor="#D62728" if touches_boundary else "white",
                 linewidth=1.2,
-                marker="o" if component.accepted else "s",
+                marker="o",
                 s=22,
                 zorder=3,
             )
-            rejection = (
-                ""
-                if component.accepted
-                else f" ({','.join(component.rejection_reasons)})"
-            )
             axis.annotate(
-                f"{component.nucleus_id}{rejection}",
+                component.nucleus_id,
                 point,
                 xytext=(3, 3),
                 textcoords="offset points",
@@ -1443,11 +1621,12 @@ def write_nuclear_component_diagnostic(
                 fontsize=7,
             )
         axis.set(
-            title=f"DAPI {plane} maximum projection",
+            title=title,
             xlabel=f"{plane[0]} (um)",
             ylabel=f"{plane[1]} (um)",
             aspect="equal",
         )
+        axis.set_ylim(extent[2], extent[3])
     table_axis = figure.add_subplot(grid[1, :])
     table_axis.axis("off")
     column_labels = (

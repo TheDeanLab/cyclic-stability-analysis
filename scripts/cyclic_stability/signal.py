@@ -9,6 +9,7 @@ from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.ndimage import distance_transform_edt
 
 from cyclic_stability.models import AnalysisConfig, RoundSpec
 from cyclic_stability.morphology import MaskMember, validated_binary_mask
@@ -49,18 +50,27 @@ def raw_structure_roi(
     This shared Task 4 helper deliberately never receives a target image.  A
     per-round consensus call avoids cross-round native-grid assumptions.
     """
-    from cyclic_stability.nuclear import consensus_nuclear_surface
+    from cyclic_stability.nuclear import (
+        _adjudicated_nuclear_mask,
+        adjudicate_nuclear_components,
+    )
 
-    consensus = consensus_nuclear_surface(
+    adjudication = adjudicate_nuclear_components(
         {config.reference_acquisition_round: raw_dapi_zyx},
         config.voxel_spacing_xyz_um,
         config.nuclear,
         config.nominal_expansion_factor,
     )
+    nuclear_mask = _adjudicated_nuclear_mask(adjudication, config.nuclear)
     if cohort == "lamin":
-        return consensus.mask_zyx
-    if cohort in {"golgi", "lamp1"}:
-        return ~consensus.mask_zyx
+        return nuclear_mask
+    if cohort == "golgi":
+        distance = distance_transform_edt(
+            ~nuclear_mask, sampling=config.voxel_spacing_xyz_um[::-1]
+        )
+        return distance <= config.golgi.perinuclear_outer_distance_um
+    if cohort == "lamp1":
+        return ~nuclear_mask
     raise ValueError(f"unsupported cohort for raw signal ROI: {cohort}")
 
 

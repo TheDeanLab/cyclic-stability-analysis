@@ -33,6 +33,7 @@ class NuclearConfig:
     """DAPI consensus and normal-profile settings."""
 
     consensus_smoothing_um: float
+    watershed_seed_prominence_um: float
     normal_half_window_um: float
     normal_step_um: float
     ridge_min_sbr: float
@@ -47,6 +48,11 @@ class GolgiConfig:
     """Golgi morphology settings."""
 
     perinuclear_outer_distance_um: float
+    feature_sigma_um: float
+    background_sigma_um: float
+    hysteresis_low_sbr: float
+    hysteresis_high_sbr: float
+    minimum_component_volume_um3: float
 
 
 @dataclass(frozen=True, slots=True)

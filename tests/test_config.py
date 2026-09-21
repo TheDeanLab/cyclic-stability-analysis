@@ -98,6 +98,48 @@ def test_analysis_config_parses_multinuclear_bounds(
     assert config.nuclear.maximum_face_contact_fraction == 0.10
 
 
+def test_analysis_config_parses_accepted_segmentation_policies(
+    config_files: tuple[Path, ...],
+) -> None:
+    """Hidden fallback constants would make the reviewed masks irreproducible."""
+    config = load_analysis_config(*config_files)
+    assert config.nuclear.watershed_seed_prominence_um == 6.0
+    assert asdict(config.golgi) == {
+        "perinuclear_outer_distance_um": 18.0,
+        "feature_sigma_um": 0.5,
+        "background_sigma_um": 4.0,
+        "hysteresis_low_sbr": 4.0,
+        "hysteresis_high_sbr": 10.0,
+        "minimum_component_volume_um3": 0.1126,
+    }
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value"),
+    (
+        ("nuclear", "watershed_seed_prominence_um", 0.0),
+        ("golgi", "background_sigma_um", 0.25),
+        ("golgi", "hysteresis_high_sbr", 3.0),
+        ("golgi", "minimum_component_volume_um3", 0.0),
+    ),
+)
+def test_analysis_config_rejects_invalid_segmentation_policies(
+    tmp_path: Path,
+    config_files: tuple[Path, ...],
+    section: str,
+    key: str,
+    value: float,
+) -> None:
+    """Nonphysical or internally reversed policies must fail at admission."""
+    analysis, correspondence, decisions = config_files
+    data = yaml.safe_load(analysis.read_text(encoding="utf-8"))
+    data[section][key] = value
+    invalid = tmp_path / f"invalid-{section}-{key}.yaml"
+    invalid.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_analysis_config(invalid, correspondence, decisions)
+
+
 def test_analysis_config_uses_exact_registered_grid_and_digest(
     config_files: tuple[Path, ...],
 ) -> None:

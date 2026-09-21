@@ -11,10 +11,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
-from skimage.measure import mesh_surface_area
 from cyclic_stability import nuclear
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
-from cyclic_stability.morphology import threshold_ensemble
 from cyclic_stability.models import (
     AnalysisConfig,
     CellSpec,
@@ -22,6 +20,7 @@ from cyclic_stability.models import (
     NuclearConfig,
     QcDecision,
 )
+from cyclic_stability.morphology import threshold_ensemble
 from cyclic_stability.nuclear import (
     LaminProfileRow,
     _aggregate_ensemble_rows,
@@ -34,6 +33,7 @@ from cyclic_stability.nuclear import (
     consensus_nuclear_surface,
     lamin_normal_profiles,
 )
+from skimage.measure import mesh_surface_area
 from synthetic import (
     NUCLEAR_CONFIG,
     SPACING,
@@ -62,6 +62,81 @@ def test_consensus_accepts_one_through_six_nuclei(count: int) -> None:
     assert np.array_equal(result.mask_zyx, result.labels_zyx > 0)
     centroids = [tuple(item.centroid_xyz_um) for item in result.nuclei]
     assert centroids == sorted(centroids)
+
+
+def test_consensus_watershed_splits_touching_nuclei_without_changing_union() -> None:
+    """Connected-component labeling alone collapses two touching nuclei into one."""
+    spacing = (0.5, 0.5, 0.5)
+    shape = (48, 48, 84)
+    z, y, x = np.ogrid[: shape[0], : shape[1], : shape[2]]
+    foreground = np.zeros(shape, dtype=bool)
+    for center_x_um in (12.0, 29.0):
+        foreground |= ((x * spacing[0] - center_x_um) / 9.0) ** 2 + (
+            (y * spacing[1] - 12.0) / 9.0
+        ) ** 2 + ((z * spacing[2] - 12.0) / 9.0) ** 2 <= 1.0
+    dapi = np.broadcast_to(
+        1.0 + 0.05 * np.sin(x * spacing[0]) * np.cos(y * spacing[1]), shape
+    ).astype(np.float32, copy=True)
+    dapi[foreground] = 41.0
+    config = replace(
+        NUCLEAR_CONFIG,
+        accepted_component_count=(2, 2),
+        nominal_volume_um3=(100.0, 5000.0),
+    )
+
+    result = consensus_nuclear_surface(
+        {2: dapi}, spacing, config, nominal_expansion_factor=1.0
+    )
+
+    assert [surface.nucleus_id for surface in result.nuclei] == ["N001", "N002"]
+    assert set(np.unique(result.labels_zyx)) == {0, 1, 2}
+    assert np.array_equal(result.mask_zyx, result.labels_zyx > 0)
+
+
+def test_watershed_fallback_uses_one_marker_for_disconnected_equal_maxima() -> None:
+    """A tied distance plateau must not turn one component into fallback markers."""
+    foreground = np.zeros((9, 9, 17), dtype=bool)
+    foreground[2:7, 2:7, 2:7] = True
+    foreground[2:7, 2:7, 10:15] = True
+    foreground[4, 4, 7:10] = True
+
+    labels, count = nuclear._watershed_nuclear_labels(
+        foreground,
+        spacing_xyz_um=(1.0, 1.0, 1.0),
+        seed_prominence_um=100.0,
+    )
+
+    assert count == 1
+    assert np.array_equal(labels > 0, foreground)
+
+
+def test_watershed_preserves_diagonally_connected_foreground() -> None:
+    """Watershed connectivity must match 26-connected component discovery."""
+    foreground = np.zeros((9, 9, 9), dtype=bool)
+    foreground[1:4, 1:4, 1:4] = True
+    foreground[4:7, 4:7, 4:7] = True
+
+    labels, count = nuclear._watershed_nuclear_labels(
+        foreground,
+        spacing_xyz_um=(1.0, 1.0, 1.0),
+        seed_prominence_um=100.0,
+    )
+
+    assert count == 1
+    assert np.array_equal(labels > 0, foreground)
+
+
+def test_dapi_normalization_removes_plane_wise_additive_background() -> None:
+    """Elevated acquisition planes must not become nuclear foreground."""
+    y, x = np.indices((15, 15), dtype=np.float64)
+    dapi = np.broadcast_to(1.0 + 0.01 * x + 0.02 * y, (7, 15, 15)).copy()
+    dapi[:, 5:10, 5:10] = 21.0
+    plane_offsets = np.arange(dapi.shape[0], dtype=np.float64)[:, None, None] * 8.0
+
+    baseline = nuclear._normalized_dapi(dapi)
+    offset = nuclear._normalized_dapi(dapi + plane_offsets)
+
+    assert np.allclose(offset, baseline)
 
 
 def test_consensus_rejects_zero_valid_nuclear_components() -> None:
@@ -114,6 +189,37 @@ def test_component_diagnostic_renderer_contract_is_target_blind() -> None:
     assert tuple(
         inspect.signature(nuclear.write_nuclear_component_diagnostic).parameters
     ) == ("output_dir", "cell_id", "dapi_rounds", "consensus")
+
+
+def test_component_review_projections_match_plane_and_remove_plane_background() -> None:
+    """A raw maximum projection hides sharp nuclei behind elevated-background planes."""
+    volume = np.zeros((4, 3, 3), dtype=np.float32)
+    volume[0] = 100.0
+    volume[2, 1, 1] = 20.0
+    labels = np.zeros(volume.shape, dtype=np.uint16)
+    labels[2, 1, 1] = 1
+    labels[0, 0, 0] = 2
+
+    xy, xz, yz = nuclear._dapi_review_projections(volume, xy_plane_index=2)
+    label_xy, label_xz, label_yz = nuclear._label_review_projections(
+        labels, xy_plane_index=2
+    )
+    x_centers, y_centers, extent = nuclear._physical_image_geometry(
+        (2, 3), horizontal_spacing_um=1.0, vertical_spacing_um=2.0
+    )
+
+    assert np.array_equal(xy, volume[2])
+    assert np.all(xz[0] == 0.0)
+    assert np.all(yz[0] == 0.0)
+    assert xz[2, 1] == 18.0
+    assert yz[2, 1] == 18.0
+    assert label_xy[0][1, 1]
+    assert not np.any(label_xy[1])
+    assert label_xz[1][0, 0]
+    assert label_yz[1][0, 0]
+    assert np.array_equal(x_centers, np.array((0.5, 1.5, 2.5)))
+    assert np.array_equal(y_centers, np.array((1.0, 3.0)))
+    assert extent == (0.0, 3.0, 4.0, 0.0)
 
 
 def test_component_adjudication_freezes_retained_geometry() -> None:

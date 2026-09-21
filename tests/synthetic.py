@@ -305,6 +305,7 @@ ensembles:
   surface_tolerance_resolution_units: [0.5, 1.0, 1.5]
 nuclear:
   consensus_smoothing_um: 0.558
+  watershed_seed_prominence_um: 6.0
   normal_half_window_um: 1.5
   normal_step_um: 0.05
   ridge_min_sbr: 3.0
@@ -314,6 +315,11 @@ nuclear:
   maximum_face_contact_fraction: 0.10
 golgi:
   perinuclear_outer_distance_um: 18.0
+  feature_sigma_um: 0.5
+  background_sigma_um: 4.0
+  hysteresis_low_sbr: 4.0
+  hysteresis_high_sbr: 10.0
+  minimum_component_volume_um3: 0.1126
 lysosome:
   log_sigma_um: [0.35, 0.70, 1.40]
   detection_sbr: [3.0, 4.0, 5.0]
@@ -640,6 +646,7 @@ SPACING = (0.1, 0.1, 0.3)
 RESOLUTION = theoretical_resolution(0.640, 1.4, 1.515, 4.5)
 NUCLEAR_CONFIG = NuclearConfig(
     consensus_smoothing_um=0.558,
+    watershed_seed_prominence_um=6.0,
     normal_half_window_um=1.5,
     normal_step_um=0.05,
     ridge_min_sbr=3.0,

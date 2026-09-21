@@ -19,6 +19,7 @@ from cyexm.runtime import NativeThreadConfig
 from numpy.typing import NDArray
 from scipy.ndimage import binary_erosion, distance_transform_edt, gaussian_filter, label
 from scipy.spatial import cKDTree
+from skimage.filters import apply_hysteresis_threshold
 from skimage.measure import mesh_surface_area
 
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
@@ -55,6 +56,31 @@ class GradientSimilarityRow:
 
     sigma_um: float
     correlation: float
+
+
+@dataclass(frozen=True, slots=True)
+class GolgiSegmentation:
+    """One MIP-guided 3-D mask with projection and volume threshold evidence."""
+
+    member: MaskMember
+    center: float
+    noise_scale: float
+    low_threshold: float
+    high_threshold: float
+    projection_center: float
+    projection_noise_scale: float
+    projection_low_threshold: float
+    projection_high_threshold: float
+
+
+@dataclass(frozen=True, slots=True)
+class _GolgiAnalysisContext:
+    """Internal numerical result plus exact masks reused by diagnostic publication."""
+
+    result: MarkerResult
+    consensus: NuclearConsensus
+    roi: NDArray[np.bool_]
+    segmentations: Mapping[int, GolgiSegmentation]
 
 
 ENSEMBLE_ENDPOINTS = (
@@ -149,7 +175,7 @@ def _support_background(
 def _masked_gaussian(
     image: NDArray[np.float64],
     validity_mask: NDArray[np.bool_],
-    sigma_zyx: tuple[float, float, float],
+    sigma_zyx: tuple[float, ...],
 ) -> NDArray[np.float64]:
     """Smooth valid samples with normalized convolution, never padding intensities."""
     support = validity_mask.astype(np.float64, copy=False)
@@ -160,6 +186,127 @@ def _masked_gaussian(
         denominator,
         out=np.zeros_like(numerator),
         where=denominator > np.finfo(np.float64).eps,
+    )
+
+
+def _mip_golgi_lateral_mask(
+    source: NDArray[np.float64],
+    domain: NDArray[np.bool_],
+    config: AnalysisConfig,
+) -> tuple[NDArray[np.bool_], float, float, float, float]:
+    """Return the accepted conservative XY-MIP mask as a 3-D lateral gate."""
+    policy = config.golgi
+    sx, sy, sz = config.voxel_spacing_xyz_um
+    mip = source.max(axis=0)
+    support_yx = domain.any(axis=0)
+    feature = _masked_gaussian(
+        mip,
+        support_yx,
+        (policy.feature_sigma_um / sy, policy.feature_sigma_um / sx),
+    ) - _masked_gaussian(
+        mip,
+        support_yx,
+        (policy.background_sigma_um / sy, policy.background_sigma_um / sx),
+    )
+    samples = feature[support_yx]
+    center = float(np.median(samples))
+    noise_scale = float(1.4826 * np.median(np.abs(samples - center)))
+    if not math.isfinite(noise_scale) or noise_scale <= 0.0:
+        raise ValueError("Golgi MIP residual has no positive noise scale")
+    low_threshold = center + policy.hysteresis_low_sbr * noise_scale
+    high_threshold = center + policy.hysteresis_high_sbr * noise_scale
+    mask = np.asarray(
+        apply_hysteresis_threshold(feature, low_threshold, high_threshold), dtype=bool
+    )
+    mask &= support_yx
+    component_labels, component_count = label(
+        mask, structure=np.ones((3, 3), dtype=bool)
+    )
+    if component_count:
+        sizes_um2 = np.bincount(component_labels.ravel()).astype(np.float64)
+        sizes_um2 *= sx * sy
+        minimum_area_um2 = policy.minimum_component_volume_um3 / sz
+        keep = sizes_um2 >= minimum_area_um2
+        keep[0] = False
+        mask = keep[component_labels]
+    else:
+        mask = np.zeros(mask.shape, dtype=bool)
+    mask.setflags(write=False)
+    return mask, center, noise_scale, low_threshold, high_threshold
+
+
+def segment_golgi_3d(
+    image: NDArray[np.generic],
+    support: NDArray[np.generic],
+    config: AnalysisConfig,
+) -> GolgiSegmentation:
+    """Apply the reviewed conservative MIP-guided DoG/hysteresis policy in 3-D."""
+    source = _volume(image, "Golgi image")
+    domain = validated_binary_mask(support, "Golgi segmentation support")
+    if domain.ndim != 3 or domain.shape != source.shape or not np.any(domain):
+        raise ValueError("Golgi image and non-empty support must share 3D geometry")
+    policy = config.golgi
+    if policy.background_sigma_um <= policy.feature_sigma_um:
+        raise ValueError("Golgi background sigma must exceed feature sigma")
+    if policy.hysteresis_high_sbr <= policy.hysteresis_low_sbr:
+        raise ValueError("Golgi high hysteresis SBR must exceed low SBR")
+    (
+        lateral_mask,
+        projection_center,
+        projection_noise_scale,
+        projection_low_threshold,
+        projection_high_threshold,
+    ) = _mip_golgi_lateral_mask(source, domain, config)
+    feature = _masked_gaussian(
+        source,
+        domain,
+        gaussian_sigma_zyx(policy.feature_sigma_um, config.voxel_spacing_xyz_um),
+    ) - _masked_gaussian(
+        source,
+        domain,
+        gaussian_sigma_zyx(policy.background_sigma_um, config.voxel_spacing_xyz_um),
+    )
+    samples = feature[domain]
+    center = float(np.median(samples))
+    noise_scale = float(1.4826 * np.median(np.abs(samples - center)))
+    if not math.isfinite(noise_scale) or noise_scale <= 0.0:
+        raise ValueError("Golgi local-background residual has no positive noise scale")
+    low_threshold = center + policy.hysteresis_low_sbr * noise_scale
+    high_threshold = center + policy.hysteresis_high_sbr * noise_scale
+    mask = np.asarray(
+        apply_hysteresis_threshold(feature, low_threshold, high_threshold), dtype=bool
+    )
+    mask &= domain & lateral_mask[None, :, :]
+    component_labels, component_count = label(
+        mask, structure=np.ones((3, 3, 3), dtype=bool)
+    )
+    if component_count:
+        sizes_um3 = np.bincount(component_labels.ravel()).astype(np.float64)
+        sizes_um3 *= float(np.prod(config.voxel_spacing_xyz_um))
+        keep = sizes_um3 >= policy.minimum_component_volume_um3
+        keep[0] = False
+        mask = keep[component_labels]
+    else:
+        mask = np.zeros(mask.shape, dtype=bool)
+    mask.setflags(write=False)
+    background = _support_background(source, domain)
+    return GolgiSegmentation(
+        MaskMember(
+            mask,
+            policy.feature_sigma_um,
+            policy.hysteresis_low_sbr,
+            background,
+            config.voxel_spacing_xyz_um,
+            "nonempty" if np.any(mask) else "empty",
+        ),
+        center,
+        noise_scale,
+        low_threshold,
+        high_threshold,
+        projection_center,
+        projection_noise_scale,
+        projection_low_threshold,
+        projection_high_threshold,
     )
 
 
@@ -328,7 +475,7 @@ def _perinuclear_roi(
     validity_masks: Mapping[int, NDArray[np.bool_]],
     config: AnalysisConfig,
 ) -> NDArray[np.bool_]:
-    """Build one fixed exterior ROI from explicit transform-valid support masks.
+    """Build one fixed nuclear-plus-perinuclear ROI from transform-valid support.
 
     A registered target can contain finite padding outside its transformed source
     support.  Therefore validity is an input derived from the transform chain, not
@@ -351,11 +498,7 @@ def _perinuclear_roi(
         valid &= transform_valid
     sx, sy, sz = _spacing(config)
     exterior_distance = distance_transform_edt(~nucleus, sampling=(sz, sy, sx))
-    roi = (
-        (~nucleus)
-        & (exterior_distance <= config.golgi.perinuclear_outer_distance_um)
-        & valid
-    )
+    roi = (exterior_distance <= config.golgi.perinuclear_outer_distance_um) & valid
     if not np.any(roi):
         raise ValueError("fixed perinuclear ROI is empty")
     roi.setflags(write=False)
@@ -388,31 +531,12 @@ def _support_threshold_ensemble(
     validity_mask: NDArray[np.bool_],
     config: AnalysisConfig,
 ) -> tuple[MaskMember, ...]:
-    """Build the frozen Golgi mask grid using only common-valid source support."""
-    background = _support_background(image, validity_mask)
-    members: list[MaskMember] = []
-    for sigma_um in config.ensembles.gaussian_sigma_um:
-        smoothed = _masked_gaussian(
-            image,
-            validity_mask,
-            gaussian_sigma_zyx(sigma_um, config.voxel_spacing_xyz_um),
-        )
-        for threshold_sbr in config.ensembles.threshold_sbr:
-            mask = (
-                smoothed > background.median + threshold_sbr * background.scale
-            ) & roi
-            mask.setflags(write=False)
-            members.append(
-                MaskMember(
-                    mask,
-                    sigma_um,
-                    threshold_sbr,
-                    background,
-                    config.voxel_spacing_xyz_um,
-                    "nonempty" if np.any(mask) else "empty",
-                )
-            )
-    return tuple(members)
+    """Return the one reviewed conservative 3-D Golgi segmentation member."""
+    support = validated_binary_mask(roi, "Golgi ROI")
+    valid = validated_binary_mask(validity_mask, "Golgi validity mask")
+    if support.shape != valid.shape or np.any(support & ~valid):
+        raise ValueError("Golgi ROI must be contained in common validity support")
+    return (segment_golgi_3d(image, support, config).member,)
 
 
 def _artifact_validity_masks(
@@ -598,12 +722,17 @@ def _ensemble_row(
     *,
     surface_tolerance_resolution_units: float | None = None,
 ) -> EnsembleRow:
+    policy = config.golgi
     return EnsembleRow(
         cohort="golgi",
         cell_id="array",
         acquisition_round=round_number,
         endpoint=endpoint,
-        ensemble_name=f"sigma={sigma_um:g};sbr={threshold_sbr:g}",
+        ensemble_name=(
+            f"mip-guided-dog={policy.feature_sigma_um:g}/{policy.background_sigma_um:g};"
+            f"hysteresis={policy.hysteresis_low_sbr:g}/{policy.hysteresis_high_sbr:g};"
+            f"minimum-volume-um3={policy.minimum_component_volume_um3:g}"
+        ),
         ensemble_value=(
             surface_tolerance_resolution_units
             if surface_tolerance_resolution_units is not None
@@ -666,13 +795,13 @@ def _comparison_values(
     )
 
 
-def analyze_golgi_arrays(
+def _analyze_golgi_arrays_with_context(
     golgi_rounds: Mapping[int, NDArray],
     dapi_rounds: Mapping[int, NDArray],
     config: AnalysisConfig,
     *,
     validity_masks: Mapping[int, NDArray[np.bool_]],
-) -> MarkerResult:
+) -> _GolgiAnalysisContext:
     """Analyze one cell's registered Golgi arrays with round 2 fixed as reference.
 
     This numerical kernel makes no filesystem writes and has no cohort aggregation.
@@ -701,14 +830,13 @@ def analyze_golgi_arrays(
     )
     roi = _perinuclear_roi(consensus.mask_zyx, common_validity, config)
     reference = rounds[REFERENCE_ROUND]
-    ensemble_by_round = {
-        round_number: _support_threshold_ensemble(
-            image,
-            roi,
-            common_support,
-            config,
-        )
+    segmentations = {
+        round_number: segment_golgi_3d(image, roi, config)
         for round_number, image in rounds.items()
+    }
+    ensemble_by_round = {
+        round_number: (segmentation.member,)
+        for round_number, segmentation in segmentations.items()
     }
     reference_members = ensemble_by_round[REFERENCE_ROUND]
     ensemble_rows: list[EnsembleRow] = []
@@ -823,15 +951,33 @@ def analyze_golgi_arrays(
                     config.config_digest,
                 )
             )
-    return MarkerResult(
-        "golgi",
-        "array",
-        tuple(summary_rows),
-        tuple(ensemble_rows),
-        (),
-        (),
-        tuple(MappingProxyType(asdict(row)) for row in consensus.component_qc),
+    return _GolgiAnalysisContext(
+        MarkerResult(
+            "golgi",
+            "array",
+            tuple(summary_rows),
+            tuple(ensemble_rows),
+            (),
+            (),
+            tuple(MappingProxyType(asdict(row)) for row in consensus.component_qc),
+        ),
+        consensus,
+        roi,
+        MappingProxyType(segmentations),
     )
+
+
+def analyze_golgi_arrays(
+    golgi_rounds: Mapping[int, NDArray],
+    dapi_rounds: Mapping[int, NDArray],
+    config: AnalysisConfig,
+    *,
+    validity_masks: Mapping[int, NDArray[np.bool_]],
+) -> MarkerResult:
+    """Analyze registered Golgi arrays with the reviewed conservative 3-D policy."""
+    return _analyze_golgi_arrays_with_context(
+        golgi_rounds, dapi_rounds, config, validity_masks=validity_masks
+    ).result
 
 
 def _rebind_cell(result: MarkerResult, cell: CellSpec) -> MarkerResult:
@@ -858,11 +1004,12 @@ def _write_diagnostics(
     rounds: Mapping[int, NDArray[np.float64]],
     dapi_rounds: Mapping[int, NDArray[np.float64]],
     result: MarkerResult,
+    config: AnalysisConfig,
     consensus: NuclearConsensus,
     roi: NDArray[np.bool_],
-    threshold_masks: Mapping[int, tuple[MaskMember, ...]],
+    segmentations: Mapping[int, GolgiSegmentation],
 ) -> tuple[Path, ...]:
-    """Atomically publish fixed-grid composite overlays and threshold-response curves."""
+    """Atomically publish fixed-grid overlays and segmentation evidence."""
     staged_paths: tuple[Path, ...] = ()
     staging_root: Path | None = None
 
@@ -878,13 +1025,115 @@ def _write_diagnostics(
         np.savez_compressed(
             overlay,
             consensus_nuclear_mask_zyx=consensus.mask_zyx,
-            fixed_perinuclear_roi_zyx=roi,
-            **{f"round_{number}_target_zyx": image for number, image in rounds.items()},
+            consensus_nuclear_labels_zyx=consensus.labels_zyx,
+            fixed_golgi_analysis_roi_zyx=roi,
             **{
-                f"round_{number}_sigma_{member.sigma_um:g}_sbr_{member.threshold_sbr:g}_threshold_mask_zyx": member.mask_zyx
-                for number, members in threshold_masks.items()
-                for member in members
+                f"round_{number}_target_mip_yx": image.max(axis=0)
+                for number, image in rounds.items()
             },
+            **{
+                f"round_{number}_conservative_golgi_mask_zyx": segmentation.member.mask_zyx
+                for number, segmentation in segmentations.items()
+            },
+        )
+        segmentation_qc = staged / "golgi-segmentation-qc.csv"
+        with segmentation_qc.open("w", newline="", encoding="utf-8") as handle:
+            fieldnames = (
+                "acquisition_round",
+                "feature_sigma_um",
+                "background_sigma_um",
+                "hysteresis_low_sbr",
+                "hysteresis_high_sbr",
+                "minimum_component_volume_um3",
+                "residual_center",
+                "residual_noise_scale",
+                "low_threshold",
+                "high_threshold",
+                "projection_residual_center",
+                "projection_residual_noise_scale",
+                "projection_low_threshold",
+                "projection_high_threshold",
+                "mask_voxels",
+                "projected_mask_pixels",
+                "support_fraction",
+                "nuclear_overlap_fraction",
+            )
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for number, segmentation in sorted(segmentations.items()):
+                mask = segmentation.member.mask_zyx
+                mask_voxels = int(mask.sum())
+                writer.writerow(
+                    {
+                        "acquisition_round": number,
+                        "feature_sigma_um": segmentation.member.sigma_um,
+                        "background_sigma_um": config.golgi.background_sigma_um,
+                        "hysteresis_low_sbr": segmentation.member.threshold_sbr,
+                        "hysteresis_high_sbr": config.golgi.hysteresis_high_sbr,
+                        "minimum_component_volume_um3": config.golgi.minimum_component_volume_um3,
+                        "residual_center": segmentation.center,
+                        "residual_noise_scale": segmentation.noise_scale,
+                        "low_threshold": segmentation.low_threshold,
+                        "high_threshold": segmentation.high_threshold,
+                        "projection_residual_center": segmentation.projection_center,
+                        "projection_residual_noise_scale": segmentation.projection_noise_scale,
+                        "projection_low_threshold": segmentation.projection_low_threshold,
+                        "projection_high_threshold": segmentation.projection_high_threshold,
+                        "mask_voxels": mask_voxels,
+                        "projected_mask_pixels": int(mask.any(axis=0).sum()),
+                        "support_fraction": mask_voxels / int(roi.sum()),
+                        "nuclear_overlap_fraction": (
+                            float((mask & consensus.mask_zyx).sum() / mask_voxels)
+                            if mask_voxels
+                            else math.nan
+                        ),
+                    }
+                )
+        segmentation_manifest = staged / "golgi-segmentation-manifest.json"
+        segmentation_manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "segmentation_algorithm": "conservative-mip-guided-physical-3d-dog-hysteresis",
+                    "segmentation_policy": asdict(config.golgi),
+                    "minimum_projected_area_um2": (
+                        config.golgi.minimum_component_volume_um3
+                        / config.voxel_spacing_xyz_um[2]
+                    ),
+                    "diagnostic_intensity_storage": "per-round-xy-maximum-projection",
+                    "nuclear_watershed_seed_prominence_um": config.nuclear.watershed_seed_prominence_um,
+                    "nuclear_mask_policy": "context-only-not-hard-exclusion",
+                    "analysis_roi": (
+                        "nuclear union plus exterior distance bounded by "
+                        "perinuclear_outer_distance_um and common transform support"
+                    ),
+                    "review_display": {
+                        "xy_plane_1based": min(
+                            36, next(iter(rounds.values())).shape[0]
+                        ),
+                        "xy_method": "raw-plane",
+                        "orthogonal_plane_background_percentile": 10.0,
+                        "orthogonal_projection_percentile": 95.0,
+                        "coordinate_policy": (
+                            "shared-physical-pixel-centers-row-zero-at-top"
+                        ),
+                    },
+                    "nuclear_labels": _validity_mask_provenance(
+                        consensus.labels_zyx > 0
+                    ),
+                    "analysis_roi_mask": _validity_mask_provenance(roi),
+                    "golgi_masks": {
+                        str(number): _validity_mask_provenance(
+                            segmentation.member.mask_zyx
+                        )
+                        for number, segmentation in sorted(segmentations.items())
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
         )
         curves = staged / "golgi-threshold-robustness.csv"
         with curves.open("w", newline="", encoding="utf-8") as handle:
@@ -902,8 +1151,8 @@ def _write_diagnostics(
         nucleus_mip = consensus.mask_zyx.max(axis=0)
         figure_paths: list[Path] = []
         union_masks = {
-            number: np.logical_or.reduce([member.mask_zyx for member in members])
-            for number, members in threshold_masks.items()
+            number: segmentation.member.mask_zyx
+            for number, segmentation in segmentations.items()
         }
         for round_number, image in sorted(rounds.items()):
             figure, axes = plt.subplots(1, 2, figsize=(8, 4), layout="constrained")
@@ -935,7 +1184,14 @@ def _write_diagnostics(
             figure.savefig(path, dpi=200)
             plt.close(figure)
             figure_paths.append(path)
-        staged_paths = (component_diagnostic, overlay, curves, *figure_paths)
+        staged_paths = (
+            component_diagnostic,
+            overlay,
+            segmentation_qc,
+            segmentation_manifest,
+            curves,
+            *figure_paths,
+        )
 
     _atomic_publish_directory(output_dir, populate)
     assert staging_root is not None
@@ -973,27 +1229,19 @@ def analyze_golgi_cell(
     common_validity, validity_digest, validity_identities = _artifact_validity_masks(
         {number: by_round[number] for number in accepted}, config
     )
-    result = _rebind_cell(
-        analyze_golgi_arrays(golgi, dapi, config, validity_masks=common_validity), cell
+    context = _analyze_golgi_arrays_with_context(
+        golgi, dapi, config, validity_masks=common_validity
     )
-    consensus = consensus_nuclear_surface(
-        dapi,
-        config.voxel_spacing_xyz_um,
-        config.nuclear,
-        config.nominal_expansion_factor,
-    )
-    roi = _perinuclear_roi(consensus.mask_zyx, common_validity, config)
-    threshold_masks = {
-        round_number: _support_threshold_ensemble(
-            image,
-            roi,
-            np.logical_and.reduce(tuple(common_validity.values())),
-            config,
-        )
-        for round_number, image in golgi.items()
-    }
+    result = _rebind_cell(context.result, cell)
     diagnostics = _write_diagnostics(
-        output_dir, golgi, dapi, result, consensus, roi, threshold_masks
+        output_dir,
+        golgi,
+        dapi,
+        result,
+        config,
+        context.consensus,
+        context.roi,
+        context.segmentations,
     )
     return replace(
         result,
@@ -1013,9 +1261,11 @@ def analyze_golgi_cell(
 
 __all__ = [
     "ENSEMBLE_ENDPOINTS",
+    "GolgiSegmentation",
     "GradientSimilarityRow",
     "analyze_golgi_arrays",
     "analyze_golgi_cell",
     "golgi_nucleus_distances",
     "multiscale_gradient_similarity",
+    "segment_golgi_3d",
 ]

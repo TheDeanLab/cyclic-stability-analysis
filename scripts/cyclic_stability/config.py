@@ -132,6 +132,30 @@ def _closed_fraction(value: object, name: str, *, lower_open: bool = False) -> f
     return result
 
 
+def _golgi_config(
+    *,
+    perinuclear_outer_distance_um: float,
+    feature_sigma_um: float,
+    background_sigma_um: float,
+    hysteresis_low_sbr: float,
+    hysteresis_high_sbr: float,
+    minimum_component_volume_um3: float,
+) -> GolgiConfig:
+    """Validate relational constraints in the reviewed Golgi policy."""
+    if background_sigma_um <= feature_sigma_um:
+        raise ValueError("golgi.background_sigma_um must exceed feature_sigma_um")
+    if hysteresis_high_sbr <= hysteresis_low_sbr:
+        raise ValueError("golgi.hysteresis_high_sbr must exceed hysteresis_low_sbr")
+    return GolgiConfig(
+        perinuclear_outer_distance_um=perinuclear_outer_distance_um,
+        feature_sigma_um=feature_sigma_um,
+        background_sigma_um=background_sigma_um,
+        hysteresis_low_sbr=hysteresis_low_sbr,
+        hysteresis_high_sbr=hysteresis_high_sbr,
+        minimum_component_volume_um3=minimum_component_volume_um3,
+    )
+
+
 def _nonnegative_int(value: str, name: str) -> int:
     try:
         result = int(value)
@@ -260,6 +284,7 @@ def _parse_scientific_config(
         "nuclear",
         {
             "consensus_smoothing_um",
+            "watershed_seed_prominence_um",
             "normal_half_window_um",
             "normal_step_um",
             "ridge_min_sbr",
@@ -269,7 +294,18 @@ def _parse_scientific_config(
             "maximum_face_contact_fraction",
         },
     )
-    golgi_data = _mapping(data["golgi"], "golgi", {"perinuclear_outer_distance_um"})
+    golgi_data = _mapping(
+        data["golgi"],
+        "golgi",
+        {
+            "perinuclear_outer_distance_um",
+            "feature_sigma_um",
+            "background_sigma_um",
+            "hysteresis_low_sbr",
+            "hysteresis_high_sbr",
+            "minimum_component_volume_um3",
+        },
+    )
     lysosome_data = _mapping(
         data["lysosome"],
         "lysosome",
@@ -313,6 +349,10 @@ def _parse_scientific_config(
                 nuclear_data["consensus_smoothing_um"],
                 "nuclear.consensus_smoothing_um",
             ),
+            watershed_seed_prominence_um=_number(
+                nuclear_data["watershed_seed_prominence_um"],
+                "nuclear.watershed_seed_prominence_um",
+            ),
             normal_half_window_um=_number(
                 nuclear_data["normal_half_window_um"],
                 "nuclear.normal_half_window_um",
@@ -339,11 +379,27 @@ def _parse_scientific_config(
                 "nuclear.maximum_face_contact_fraction",
             ),
         ),
-        GolgiConfig(
-            _number(
+        _golgi_config(
+            perinuclear_outer_distance_um=_number(
                 golgi_data["perinuclear_outer_distance_um"],
                 "golgi.perinuclear_outer_distance_um",
-            )
+            ),
+            feature_sigma_um=_number(
+                golgi_data["feature_sigma_um"], "golgi.feature_sigma_um"
+            ),
+            background_sigma_um=_number(
+                golgi_data["background_sigma_um"], "golgi.background_sigma_um"
+            ),
+            hysteresis_low_sbr=_number(
+                golgi_data["hysteresis_low_sbr"], "golgi.hysteresis_low_sbr"
+            ),
+            hysteresis_high_sbr=_number(
+                golgi_data["hysteresis_high_sbr"], "golgi.hysteresis_high_sbr"
+            ),
+            minimum_component_volume_um3=_number(
+                golgi_data["minimum_component_volume_um3"],
+                "golgi.minimum_component_volume_um3",
+            ),
         ),
         LysosomeConfig(
             _sequence_numbers(lysosome_data["log_sigma_um"], "lysosome.log_sigma_um"),
