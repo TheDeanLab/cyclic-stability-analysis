@@ -18,9 +18,15 @@ from cyclic_stability.golgi import (
     _atomic_publish_directory,
     _component_volume_gini,
     _effective_gradient_roi,
+    _GolgiCropPlan,
     _gradient_magnitude,
     _mask_geometry,
     _perinuclear_roi,
+    _require_compact_crop,
+    _sampled_support_bounds,
+    _shared_crop_bounds_from_artifacts,
+    _shared_crop_bounds_from_support_masks,
+    _SharedCropBounds,
     analyze_golgi_arrays,
     analyze_golgi_cell,
     golgi_nucleus_distances,
@@ -84,6 +90,130 @@ def _full_support(rounds: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
     return {
         number: np.ones(image.shape, dtype=bool) for number, image in rounds.items()
     }
+
+
+def test_shared_crop_bounds_cover_dapi_and_golgi_support_with_distinct_margins(
+    analysis_config,
+) -> None:
+    """One Golgi crop must preserve perinuclear DAPI and target support in every round."""
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=(1.0, 1.0, 1.0),
+        golgi=replace(analysis_config.golgi, perinuclear_outer_distance_um=2.0),
+        ensembles=replace(analysis_config.ensembles, gaussian_sigma_um=(1.0,)),
+    )
+    shape = (40, 40, 40)
+    dapi_two = np.zeros(shape, dtype=bool)
+    dapi_three = np.zeros(shape, dtype=bool)
+    golgi_two = np.zeros(shape, dtype=bool)
+    golgi_three = np.zeros(shape, dtype=bool)
+    dapi_two[10:13, 10:13, 10:13] = True
+    dapi_three[12:15, 11:14, 9:12] = True
+    golgi_two[25:28, 25:28, 25:28] = True
+    golgi_three[24:27, 27:30, 26:29] = True
+
+    crop = _shared_crop_bounds_from_support_masks(
+        {2: (dapi_two, golgi_two), 3: (dapi_three, golgi_three)}, config
+    )
+
+    assert crop.start_zyx == (5, 5, 4)
+    assert crop.stop_zyx == (31, 33, 32)
+    assert crop.full_shape_zyx == shape
+
+
+def test_shared_crop_bounds_fall_back_to_full_field_for_unlocalized_support(
+    analysis_config,
+) -> None:
+    """A missing DAPI or Golgi support must not cause data to be cropped away."""
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=(1.0, 1.0, 1.0),
+        golgi=replace(analysis_config.golgi, perinuclear_outer_distance_um=2.0),
+        ensembles=replace(analysis_config.ensembles, gaussian_sigma_um=(1.0,)),
+    )
+    shape = (20, 20, 20)
+    dapi = np.zeros(shape, dtype=bool)
+    golgi = np.zeros(shape, dtype=bool)
+    dapi[8:12, 8:12, 8:12] = True
+
+    crop = _shared_crop_bounds_from_support_masks({2: (dapi, golgi)}, config)
+
+    assert crop.start_zyx == (0, 0, 0)
+    assert crop.stop_zyx == shape
+
+
+def test_sampled_support_bounds_retain_largest_plausible_component_only() -> None:
+    """A sparse remote artifact must not expand the common Golgi analysis crop."""
+    image = np.random.default_rng(4).normal(10.0, 0.1, (16, 40, 40)).astype(np.float32)
+    image[4:10, 8:24, 12:28] = 100.0
+    image[14, 36, 36] = 1000.0
+
+    bounds = _sampled_support_bounds(
+        image,
+        threshold_sbr=8.0,
+        sample_step_zyx=(2, 4, 4),
+        maximum_components=1,
+    )
+
+    assert bounds == ((4, 8, 12), (10, 24, 28))
+
+
+def test_artifact_crop_uses_the_dapi_stop_when_golgi_support_is_absent(
+    analysis_config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DAPI support alone must produce a bounded crop, never a malformed plan."""
+    shape = (30, 40, 50)
+    dapi = np.zeros(shape, dtype=np.float32)
+    golgi = np.zeros(shape, dtype=np.float32)
+    dapi[10:14, 12:20, 16:28] = 100.0
+    artifacts = {
+        2: type(
+            "Artifact", (), {"registered_dapi": "dapi", "registered_target": "golgi"}
+        )()
+    }
+    monkeypatch.setattr(
+        "cyclic_stability.golgi.load_volume",
+        lambda path: dapi if path == "dapi" else golgi,
+    )
+    supports = iter(
+        (
+            (((10, 12, 16), (14, 20, 28)), np.ones((2, 2, 2), dtype=bool)),
+            None,
+        )
+    )
+    monkeypatch.setattr(
+        "cyclic_stability.golgi._sampled_support",
+        lambda *_args, **_kwargs: next(supports),
+    )
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=(1.0, 1.0, 1.0),
+        golgi=replace(analysis_config.golgi, perinuclear_outer_distance_um=2.0),
+        ensembles=replace(analysis_config.ensembles, gaussian_sigma_um=(1.0,)),
+    )
+
+    crop = _shared_crop_bounds_from_artifacts(artifacts, (2,), config)
+
+    assert crop.start_zyx == (5, 7, 11)
+    assert crop.stop_zyx == (19, 25, 33)
+    assert crop.retained_fraction < 1.0
+
+
+def test_near_full_crop_is_rejected_before_target_specific_analysis(
+    tmp_path: Path,
+) -> None:
+    """A near-full candidate crop must stop before large target allocations."""
+    plan = _GolgiCropPlan(
+        _SharedCropBounds((0, 0, 0), (9, 10, 10), (10, 10, 10)),
+        {},
+        {},
+        {},
+        {},
+        (2, 8, 8),
+    )
+
+    with pytest.raises(ValueError, match=r"retained 90.0%.*crop-plan.json"):
+        _require_compact_crop(plan, tmp_path)
 
 
 def _producer_geometry(spacing: tuple[float, float, float]) -> ImageGeometry:
@@ -316,6 +446,48 @@ def test_artifact_support_replays_exact_producer_request_and_provenance(
         _backend=_ValidityBackend(fixed, source, request.geometry),
     )
     assert changed_digest != digest
+
+
+def test_artifact_support_accepts_byte_identical_fixed_reference_copy(
+    analysis_config, tmp_path
+) -> None:
+    """A copied fixed reference is valid only when its exact bytes are identical."""
+    reference, moving, fixed, source, _affine, _warp, request = _producer_artifacts(
+        tmp_path, analysis_config
+    )
+    copied_fixed = tmp_path / "fixed-reference-copy.tif"
+    copied_fixed.write_bytes(fixed.read_bytes())
+    reference = replace(reference, registered_tubulin=copied_fixed)
+
+    _masks, _digest, identities = _artifact_validity_masks(
+        {2: reference, 3: moving},
+        analysis_config,
+        _backend=_ValidityBackend(fixed, source, request.geometry),
+    )
+
+    provenance = json.loads(identities[0].removeprefix("validity-provenance:"))
+    moving_provenance = provenance["moving"][0]
+    assert moving_provenance["fixed_reference_match"] == "exact-byte-equivalent"
+    assert moving_provenance["selected_fixed"]["path"] == str(copied_fixed.resolve())
+
+
+def test_artifact_support_inherits_process_native_thread_configuration(
+    analysis_config, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Validity replay must not reset an already-configured ANTs runtime to one."""
+    reference, moving, fixed, source, _affine, _warp, request = _producer_artifacts(
+        tmp_path, analysis_config
+    )
+    observed: list[object] = []
+
+    def backend(native_threads: object = None) -> _ValidityBackend:
+        observed.append(native_threads)
+        return _ValidityBackend(fixed, source, request.geometry)
+
+    monkeypatch.setattr("cyclic_stability.golgi.AntsRegistrationBackend", backend)
+    _artifact_validity_masks({2: reference, 3: moving}, analysis_config)
+
+    assert observed == [None]
 
 
 @pytest.mark.parametrize(
@@ -735,12 +907,13 @@ def test_golgi_cell_publishes_target_blind_component_diagnostic(
     )
     monkeypatch.setattr(
         "cyclic_stability.golgi._artifact_validity_masks",
-        lambda *_args: (
+        lambda *_args, **_kwargs: (
             {2: np.ones(dapi.shape, dtype=bool)},
             "synthetic-digest",
             ("synthetic-validity",),
         ),
     )
+    monkeypatch.setattr("cyclic_stability.golgi._MAX_RETAINED_GOLGI_CROP_FRACTION", 1.0)
 
     result = analyze_golgi_cell(
         cell,
@@ -752,6 +925,9 @@ def test_golgi_cell_publishes_target_blind_component_diagnostic(
     diagnostic = tmp_path / "out" / "nuclear-component-inventory.pdf"
     assert diagnostic.is_file()
     assert diagnostic in result.diagnostics
+    with np.load(tmp_path / "out" / "golgi-registered-overlays.npz") as overlay:
+        np.testing.assert_array_equal(overlay["crop_start_zyx"], (0, 0, 0))
+        np.testing.assert_array_equal(overlay["full_shape_zyx"], dapi.shape)
 
 
 def test_atomic_golgi_diagnostic_publisher_restores_previous_tree_on_failure(
@@ -808,6 +984,35 @@ def test_target_distance_characterizes_anisotropic_voxel_center_coordinates() ->
     assert golgi_nucleus_distances(mask, surface, (0.1, 0.1, 0.3)) == pytest.approx(
         (0.3,)
     )
+
+
+def test_target_distances_use_a_cached_physical_distance_field() -> None:
+    """The production fast path must sample one reusable fixed-grid distance field."""
+    spacing = (0.1, 0.1, 0.3)
+    nucleus = np.zeros((7, 7, 7), dtype=bool)
+    nucleus[3, 3, 3] = True
+    surface = NuclearSurface(
+        "N001",
+        nucleus,
+        np.array(((0.3, 0.3, 0.9),)),
+        np.empty((0, 3), dtype=int),
+        np.array(((0.0, 0.0, 1.0),)),
+        np.array((0.3, 0.3, 0.9)),
+        np.zeros(1),
+        spacing,
+    )
+    golgi = np.zeros(nucleus.shape, dtype=bool)
+    golgi[4, 3, 3] = True
+    cached = distance_transform_edt(~nucleus, sampling=(0.3, 0.1, 0.1))
+
+    distances = golgi_nucleus_distances(
+        golgi,
+        surface,
+        spacing,
+        distance_field_zyx=cached,
+    )
+
+    assert distances == pytest.approx((0.3,))
 
 
 def test_golgi_union_roi_and_distances_consume_every_accepted_nucleus(

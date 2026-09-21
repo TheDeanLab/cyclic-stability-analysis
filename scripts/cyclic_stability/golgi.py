@@ -15,11 +15,9 @@ import numpy as np
 from cyexm.registration._request_policy import channel_transform_parameters
 from cyexm.registration.artifacts import FileIdentity
 from cyexm.registration.backend import AntsRegistrationBackend
-from cyexm.runtime import NativeThreadConfig
 from numpy.typing import NDArray
 from scipy.ndimage import binary_erosion, distance_transform_edt, gaussian_filter, label
 from scipy.spatial import cKDTree
-from skimage.measure import mesh_surface_area
 
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.images import BackgroundSummary, load_volume, robust_background
@@ -42,7 +40,6 @@ from cyclic_stability.nuclear import (
     NuclearSurface,
     _accepted_rounds,
     _atomic_publish_directory,
-    _surface_from_mask,
     consensus_nuclear_surface,
     write_nuclear_component_diagnostic,
 )
@@ -55,6 +52,61 @@ class GradientSimilarityRow:
 
     sigma_um: float
     correlation: float
+
+
+@dataclass(frozen=True, slots=True)
+class _SharedCropBounds:
+    """One conservative fixed-grid ZYX crop shared by every accepted round."""
+
+    start_zyx: tuple[int, int, int]
+    stop_zyx: tuple[int, int, int]
+    full_shape_zyx: tuple[int, int, int]
+
+    @property
+    def retained_fraction(self) -> float:
+        """Return the fraction of the fixed grid retained by this crop."""
+        retained_voxels = math.prod(
+            stop - start
+            for start, stop in zip(self.start_zyx, self.stop_zyx, strict=True)
+        )
+        return retained_voxels / math.prod(self.full_shape_zyx)
+
+    @property
+    def slices_zyx(self) -> tuple[slice, slice, slice]:
+        """Return the crop as ZYX slices."""
+        return tuple(
+            slice(start, stop)
+            for start, stop in zip(self.start_zyx, self.stop_zyx, strict=True)
+        )  # type: ignore[return-value]
+
+
+@dataclass(frozen=True, slots=True)
+class _GolgiArrayAnalysis:
+    """Numerical Golgi result together with reusable diagnostic intermediates."""
+
+    result: MarkerResult
+    consensus: NuclearConsensus
+    roi: NDArray[np.bool_]
+    threshold_masks: Mapping[int, tuple[MaskMember, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class _GolgiCropPlan:
+    """Small target-specific crop evidence produced after target-blind QC."""
+
+    crop: _SharedCropBounds
+    dapi_bounds_by_round: Mapping[
+        int, tuple[tuple[int, int, int], tuple[int, int, int]]
+    ]
+    golgi_bounds_by_round: Mapping[
+        int, tuple[tuple[int, int, int], tuple[int, int, int]] | None
+    ]
+    dapi_support_mips: Mapping[int, NDArray[np.bool_]]
+    golgi_support_mips: Mapping[int, NDArray[np.bool_]]
+    sample_step_zyx: tuple[int, int, int]
+
+
+_MAX_RETAINED_GOLGI_CROP_FRACTION = 0.75
 
 
 ENSEMBLE_ENDPOINTS = (
@@ -72,6 +124,291 @@ ENSEMBLE_ENDPOINTS = (
     "fixed_to_moving_boundary_distance_p95",
     "moving_to_fixed_boundary_distance_p95",
 )
+
+
+def _mask_bounds(
+    mask: NDArray[np.bool_],
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    """Return exclusive ZYX bounds for one non-empty binary support mask."""
+    positive = validated_binary_mask(mask, "coarse support mask")
+    if positive.ndim != 3:
+        raise ValueError("coarse support mask must be 3D ZYX")
+    occupied = tuple(
+        np.flatnonzero(np.any(positive, axis=axes)) for axes in ((1, 2), (0, 2), (0, 1))
+    )
+    if any(axis.size == 0 for axis in occupied):
+        return None
+    return (
+        tuple(int(axis[0]) for axis in occupied),
+        tuple(int(axis[-1]) + 1 for axis in occupied),
+    )
+
+
+def _margin_zyx(
+    distance_um: float, spacing_xyz_um: tuple[float, float, float]
+) -> tuple[int, int, int]:
+    """Convert a physical conservative distance into ceiling ZYX pixel margins."""
+    sx, sy, sz = spacing_xyz_um
+    return tuple(math.ceil(distance_um / value) for value in (sz, sy, sx))
+
+
+def _shared_crop_bounds_from_support_masks(
+    supports: Mapping[int, tuple[NDArray[np.bool_], NDArray[np.bool_]]],
+    config: AnalysisConfig,
+) -> _SharedCropBounds:
+    """Bound all loose DAPI and Golgi supports with one conservative crop.
+
+    DAPI receives the full exterior-ROI distance plus three standard deviations of
+    the widest frozen Gaussian. Golgi receives the smoothing margin alone. Any
+    missing support retains the full fixed grid rather than guessing a crop.
+    """
+    if not supports:
+        raise ValueError("shared Golgi crop requires at least one accepted round")
+    shape: tuple[int, int, int] | None = None
+    starts: list[tuple[int, int, int]] = []
+    stops: list[tuple[int, int, int]] = []
+    smoothing_margin_um = 3.0 * max(config.ensembles.gaussian_sigma_um)
+    dapi_margin = _margin_zyx(
+        config.golgi.perinuclear_outer_distance_um + smoothing_margin_um,
+        config.voxel_spacing_xyz_um,
+    )
+    golgi_margin = _margin_zyx(smoothing_margin_um, config.voxel_spacing_xyz_um)
+    for dapi_support, golgi_support in supports.values():
+        for support_name, support, margin in (
+            ("DAPI", dapi_support, dapi_margin),
+            ("Golgi", golgi_support, golgi_margin),
+        ):
+            binary = validated_binary_mask(support, f"coarse {support_name} support")
+            if binary.ndim != 3:
+                raise ValueError(f"coarse {support_name} support must be 3D ZYX")
+            if shape is None:
+                shape = tuple(int(value) for value in binary.shape)
+            elif binary.shape != shape:
+                raise ValueError(
+                    "coarse DAPI and Golgi supports must share fixed-grid geometry"
+                )
+            bounds = _mask_bounds(binary)
+            if bounds is None:
+                assert shape is not None
+                return _SharedCropBounds((0, 0, 0), shape, shape)
+            start, stop = bounds
+            starts.append(
+                tuple(
+                    max(0, value - pad)
+                    for value, pad in zip(start, margin, strict=True)
+                )
+            )
+            stops.append(
+                tuple(
+                    min(limit, value + pad)
+                    for value, pad, limit in zip(stop, margin, shape, strict=True)
+                )
+            )
+    assert shape is not None
+    if not starts:
+        return _SharedCropBounds((0, 0, 0), shape, shape)
+    return _SharedCropBounds(
+        tuple(min(start[axis] for start in starts) for axis in range(3)),
+        tuple(max(stop[axis] for stop in stops) for axis in range(3)),
+        shape,
+    )
+
+
+def _sampled_support(
+    image: NDArray[np.generic],
+    *,
+    threshold_sbr: float,
+    sample_step_zyx: tuple[int, int, int],
+    maximum_components: int,
+    minimum_quantile: float | None = None,
+) -> tuple[tuple[tuple[int, int, int], tuple[int, int, int]], NDArray[np.bool_]] | None:
+    """Return full-resolution bounds and sampled mask of plausible support."""
+    source = np.asarray(image)
+    if source.ndim != 3 or not np.all(np.isfinite(source)):
+        raise ValueError("coarse support source must be one finite 3D ZYX image")
+    if (
+        any(step <= 0 for step in sample_step_zyx)
+        or maximum_components <= 0
+        or not math.isfinite(threshold_sbr)
+        or threshold_sbr <= 0.0
+        or (
+            minimum_quantile is not None
+            and (
+                not math.isfinite(minimum_quantile) or not 0.0 < minimum_quantile < 1.0
+            )
+        )
+    ):
+        raise ValueError("coarse support settings must be finite and positive")
+    sample = source[:: sample_step_zyx[0], :: sample_step_zyx[1], :: sample_step_zyx[2]]
+    try:
+        background = robust_background(sample)
+    except ValueError:
+        return None
+    threshold = background.median + threshold_sbr * background.scale
+    if minimum_quantile is not None:
+        threshold = max(threshold, float(np.quantile(sample, minimum_quantile)))
+    support = sample >= threshold
+    labels, count = label(support, structure=np.ones((3, 3, 3), dtype=bool))
+    if count == 0:
+        return None
+    sizes = np.bincount(labels.ravel())[1:]
+    largest = int(sizes.max())
+    minimum_size = max(2, math.ceil(largest * 0.02))
+    selected = np.flatnonzero(sizes >= minimum_size)
+    if selected.size == 0:
+        return None
+    selected = selected[np.argsort(sizes[selected])[::-1][:maximum_components]] + 1
+    retained = np.isin(labels, selected)
+    bounds = _mask_bounds(retained)
+    if bounds is None:
+        return None
+    start, stop = bounds
+    full_start = tuple(
+        index * step for index, step in zip(start, sample_step_zyx, strict=True)
+    )
+    full_stop = tuple(
+        min(limit, index * step)
+        for index, step, limit in zip(stop, sample_step_zyx, source.shape, strict=True)
+    )
+    retained.setflags(write=False)
+    return (full_start, full_stop), retained
+
+
+def _sampled_support_bounds(
+    image: NDArray[np.generic],
+    *,
+    threshold_sbr: float,
+    sample_step_zyx: tuple[int, int, int],
+    maximum_components: int,
+    minimum_quantile: float | None = None,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
+    """Return full-resolution bounds of plausible supports from a small 3D sample."""
+    support = _sampled_support(
+        image,
+        threshold_sbr=threshold_sbr,
+        sample_step_zyx=sample_step_zyx,
+        maximum_components=maximum_components,
+        minimum_quantile=minimum_quantile,
+    )
+    return None if support is None else support[0]
+
+
+def _shared_crop_bounds_from_artifacts(
+    artifacts: Mapping[int, RoundArtifacts],
+    accepted: tuple[int, ...],
+    config: AnalysisConfig,
+) -> _SharedCropBounds:
+    """Plan one crop sequentially, retaining support bounds rather than image stacks."""
+    return _golgi_crop_plan_from_artifacts(artifacts, accepted, config).crop
+
+
+def _golgi_crop_plan_from_artifacts(
+    artifacts: Mapping[int, RoundArtifacts],
+    accepted: tuple[int, ...],
+    config: AnalysisConfig,
+) -> _GolgiCropPlan:
+    """Build bounded target-specific crop evidence after target-blind QC passes."""
+    shape: tuple[int, int, int] | None = None
+    starts: list[tuple[int, int, int]] = []
+    stops: list[tuple[int, int, int]] = []
+    dapi_bounds_by_round: dict[
+        int, tuple[tuple[int, int, int], tuple[int, int, int]]
+    ] = {}
+    golgi_bounds_by_round: dict[
+        int, tuple[tuple[int, int, int], tuple[int, int, int]] | None
+    ] = {}
+    dapi_support_mips: dict[int, NDArray[np.bool_]] = {}
+    golgi_support_mips: dict[int, NDArray[np.bool_]] = {}
+    threshold_sbr = max(8.0, min(config.ensembles.threshold_sbr))
+    sample_step_zyx = (2, 8, 8)
+    smoothing_margin_um = 3.0 * max(config.ensembles.gaussian_sigma_um)
+    dapi_margin = _margin_zyx(
+        config.golgi.perinuclear_outer_distance_um + smoothing_margin_um,
+        config.voxel_spacing_xyz_um,
+    )
+    for number in accepted:
+        artifact = artifacts[number]
+        dapi_image = load_volume(artifact.registered_dapi)
+        golgi_image = load_volume(artifact.registered_target)
+        if shape is None:
+            shape = tuple(int(value) for value in dapi_image.shape)
+        if dapi_image.shape != shape or golgi_image.shape != shape:
+            raise ValueError("registered Golgi rounds must share fixed-grid geometry")
+        dapi_support = _sampled_support(
+            dapi_image,
+            threshold_sbr=threshold_sbr,
+            sample_step_zyx=sample_step_zyx,
+            maximum_components=6,
+            minimum_quantile=0.995,
+        )
+        golgi_support = _sampled_support(
+            golgi_image,
+            threshold_sbr=threshold_sbr,
+            sample_step_zyx=sample_step_zyx,
+            maximum_components=6,
+        )
+        if dapi_support is None:
+            assert shape is not None
+            return _GolgiCropPlan(
+                _SharedCropBounds((0, 0, 0), shape, shape),
+                MappingProxyType(dapi_bounds_by_round),
+                MappingProxyType(golgi_bounds_by_round),
+                MappingProxyType(dapi_support_mips),
+                MappingProxyType(golgi_support_mips),
+                sample_step_zyx,
+            )
+        dapi_bounds, dapi_mask = dapi_support
+        dapi_bounds_by_round[number] = dapi_bounds
+        dapi_support_mips[number] = dapi_mask.max(axis=0)
+        if golgi_support is None:
+            golgi_bounds = None
+            golgi_support_mips[number] = np.zeros(dapi_mask.shape[1:], dtype=bool)
+        else:
+            golgi_bounds, golgi_mask = golgi_support
+            golgi_support_mips[number] = golgi_mask.max(axis=0)
+        golgi_bounds_by_round[number] = golgi_bounds
+        # The fixed round defines the common measurement domain.  Unioning every
+        # registered moving support allows a residual edge/background artifact to
+        # re-expand a bounded analysis back to the full image.  Moving-round
+        # support remains published as QC evidence, while transform-valid masks
+        # exclude any unsupported moving pixels within this fixed anchored crop.
+        if number != REFERENCE_ROUND:
+            continue
+        for bounds, margin in ((dapi_bounds, dapi_margin),):
+            start, stop = bounds
+            starts.append(
+                tuple(
+                    max(0, value - pad)
+                    for value, pad in zip(start, margin, strict=True)
+                )
+            )
+            stops.append(
+                tuple(
+                    min(limit, value + pad)
+                    for value, pad, limit in zip(stop, margin, shape, strict=True)
+                )
+            )
+        if golgi_bounds is None:
+            continue
+        # Golgi morphology is explicitly measured only inside the DAPI-defined
+        # perinuclear domain.  Keep the independent target support in the
+        # preflight evidence, but never let distal target signal enlarge the
+        # fixed measurement volume.  The DAPI envelope already includes the
+        # full declared perinuclear distance and three Gaussian sigmas.
+    assert shape is not None
+    crop = _SharedCropBounds(
+        tuple(min(start[axis] for start in starts) for axis in range(3)),
+        tuple(max(stop[axis] for stop in stops) for axis in range(3)),
+        shape,
+    )
+    return _GolgiCropPlan(
+        crop,
+        MappingProxyType(dapi_bounds_by_round),
+        MappingProxyType(golgi_bounds_by_round),
+        MappingProxyType(dapi_support_mips),
+        MappingProxyType(golgi_support_mips),
+        sample_step_zyx,
+    )
 
 
 def _ensemble_units(config: AnalysisConfig) -> dict[str, str]:
@@ -238,12 +575,15 @@ def golgi_nucleus_distances(
     mask: NDArray[np.bool_],
     nuclear_surfaces: NuclearSurface | tuple[NuclearSurface, ...],
     spacing_xyz_um: tuple[float, float, float],
+    *,
+    distance_field_zyx: NDArray[np.floating] | None = None,
 ) -> NDArray[np.float64]:
-    """Return physical XYZ distances to the nearest accepted surface vertex.
+    """Return physical distances from Golgi voxel centers to accepted nuclei.
 
-    Target voxels are represented by their voxel centers.  This is a reproducible
-    nearest-vertex approximation to a triangulated surface distance, not an exact
-    point-to-triangle distance; spacing anisotropy is nevertheless preserved.
+    Without a cached field, this retains the legacy nearest-vertex approximation to
+    a triangulated surface. A supplied ``distance_field_zyx`` instead samples a
+    physical fixed-grid exterior distance field for the same consensus nuclei and
+    avoids constructing one nearest-neighbor query per threshold member.
     """
     positive = validated_binary_mask(mask, "Golgi mask")
     surfaces = (
@@ -259,6 +599,18 @@ def golgi_nucleus_distances(
         tuple(spacing_xyz_um) != tuple(surface.spacing_xyz_um) for surface in surfaces
     ):
         raise ValueError("Golgi and nuclear-surface spacing must match")
+    if distance_field_zyx is not None:
+        field = np.asarray(distance_field_zyx)
+        if (
+            field.shape != positive.shape
+            or not np.issubdtype(field.dtype, np.floating)
+            or not np.all(np.isfinite(field))
+            or np.any(field < 0.0)
+        ):
+            raise ValueError(
+                "cached nuclear distance field must be finite, non-negative, and share mask geometry"
+            )
+        return np.asarray(field[positive], dtype=np.float64)
     indices_zyx = np.argwhere(positive)
     if indices_zyx.size == 0:
         return np.empty(0, dtype=np.float64)
@@ -268,6 +620,32 @@ def golgi_nucleus_distances(
         tuple(surface.vertices_xyz_um for surface in surfaces), axis=0
     )
     return cKDTree(vertices_xyz_um).query(points_xyz, k=1)[0]
+
+
+def _nuclear_distance_field(
+    nuclear_surfaces: tuple[NuclearSurface, ...],
+) -> NDArray[np.float32]:
+    """Return one physical exterior distance field for all accepted nuclei."""
+    if not nuclear_surfaces:
+        raise ValueError(
+            "nuclear distance field requires at least one accepted nucleus"
+        )
+    shape = nuclear_surfaces[0].mask_zyx.shape
+    spacing = nuclear_surfaces[0].spacing_xyz_um
+    if any(
+        surface.mask_zyx.shape != shape or surface.spacing_xyz_um != spacing
+        for surface in nuclear_surfaces
+    ):
+        raise ValueError("accepted nuclear surfaces must share fixed-grid geometry")
+    sx, sy, sz = spacing
+    union = np.logical_or.reduce(
+        tuple(surface.mask_zyx for surface in nuclear_surfaces)
+    )
+    field = distance_transform_edt(~union, sampling=(sz, sy, sx)).astype(
+        np.float32, copy=False
+    )
+    field.setflags(write=False)
+    return field
 
 
 def _component_volume_gini(volumes_um3: NDArray[np.float64]) -> float:
@@ -311,8 +689,22 @@ def _mask_geometry(
     labels, count = label(positive, structure=np.ones((3, 3, 3), dtype=bool))
     sizes = np.bincount(labels.ravel())[1:]
     component_volumes = sizes.astype(np.float64) * voxel_volume
-    vertices, faces = _surface_from_mask(positive, spacing_xyz_um)
-    area = float(mesh_surface_area(vertices, faces))
+    sx, sy, sz = spacing_xyz_um
+    # Fixed-grid voxel-interface area is deliberately used instead of a dense
+    # marching-cubes mesh.  The study compares the same acquisition grid and
+    # threshold ensemble across rounds, so this stable discretization is the
+    # relevant relative morphology measure and has bounded memory.
+    area = float(
+        np.count_nonzero(positive[0]) * sx * sy
+        + np.count_nonzero(positive[-1]) * sx * sy
+        + np.count_nonzero(positive[:, 0]) * sx * sz
+        + np.count_nonzero(positive[:, -1]) * sx * sz
+        + np.count_nonzero(positive[:, :, 0]) * sy * sz
+        + np.count_nonzero(positive[:, :, -1]) * sy * sz
+        + np.count_nonzero(positive[1:] != positive[:-1]) * sx * sy
+        + np.count_nonzero(positive[:, 1:] != positive[:, :-1]) * sx * sz
+        + np.count_nonzero(positive[:, :, 1:] != positive[:, :, :-1]) * sy * sz
+    )
     return {
         "volume_um3": volume,
         "component_count": float(count),
@@ -420,6 +812,7 @@ def _artifact_validity_masks(
     config: AnalysisConfig,
     *,
     _backend: AntsRegistrationBackend | None = None,
+    fixed_shape_zyx: tuple[int, int, int] | None = None,
 ) -> tuple[dict[int, NDArray[np.bool_]], str, tuple[str, ...]]:
     """Recreate support from the registered-target producer record alone.
 
@@ -428,10 +821,10 @@ def _artifact_validity_masks(
     spacing is deliberately not substituted for the producer geometry.
     """
     reference_artifact = artifacts[REFERENCE_ROUND]
-    backend = _backend or AntsRegistrationBackend(
-        NativeThreadConfig(itk_threads=1, blas_threads=1)
+    backend = _backend or AntsRegistrationBackend()
+    fixed_shape = fixed_shape_zyx or tuple(
+        load_volume(reference_artifact.registered_target).shape
     )
-    fixed_shape = tuple(load_volume(reference_artifact.registered_target).shape)
     reference_mask = np.ones(fixed_shape, dtype=bool)
     masks: dict[int, NDArray[np.bool_]] = {REFERENCE_ROUND: reference_mask}
     provenance: dict[str, object] = {
@@ -511,10 +904,15 @@ def _artifact_validity_masks(
                     "registered target input identity changed after completion"
                 )
         source = artifact.native_target
+        selected_fixed_identity = FileIdentity.from_path(
+            reference_artifact.registered_tubulin
+        )
+        fixed_reference_match = _fixed_reference_match(
+            fixed_identity, selected_fixed_identity
+        )
         if (
             source_identity != FileIdentity.from_path(source)
-            or fixed_identity
-            != FileIdentity.from_path(reference_artifact.registered_tubulin)
+            or fixed_reference_match is None
             or affine_identity != FileIdentity.from_path(artifact.affine)
             or warp_identity != FileIdentity.from_path(artifact.warp)
             or request.upstream != warp_identity
@@ -555,6 +953,8 @@ def _artifact_validity_masks(
                 "registered_target": target_record.artifact.to_dict(),
                 "request": request.to_dict(),
                 "fixed": fixed_identity.to_dict(),
+                "selected_fixed": selected_fixed_identity.to_dict(),
+                "fixed_reference_match": fixed_reference_match,
                 "source": source_identity.to_dict(),
                 "affine": affine_identity.to_dict(),
                 "warp": warp_identity.to_dict(),
@@ -574,6 +974,36 @@ def _artifact_validity_masks(
             f"validity-provenance-sha256:{digest}",
         ),
     )
+
+
+def _fixed_reference_match(
+    recorded: FileIdentity, selected: FileIdentity
+) -> str | None:
+    """Return the sole admissible match mode for a producer fixed reference.
+
+    A normal chain uses the exact recorded path, size, and modification time.
+    Cy-ExM may also materialize an independently copied, byte-identical fixed
+    reference while preserving the same fixed grid.  That copy is admissible
+    only after a full streaming SHA-256 comparison; all moving inputs and both
+    transform identities remain exact-file checks.
+    """
+    if recorded == selected:
+        return "exact-file-identity"
+    try:
+        recorded_digest = _file_sha256(Path(recorded.path))
+        selected_digest = _file_sha256(Path(selected.path))
+    except OSError:
+        return None
+    return "exact-byte-equivalent" if recorded_digest == selected_digest else None
+
+
+def _file_sha256(path: Path) -> str:
+    """Return a streaming SHA-256 digest without loading a volume into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _validity_mask_provenance(mask: NDArray[np.bool_]) -> dict[str, object]:
@@ -666,19 +1096,14 @@ def _comparison_values(
     )
 
 
-def analyze_golgi_arrays(
+def _analyze_golgi_arrays(
     golgi_rounds: Mapping[int, NDArray],
     dapi_rounds: Mapping[int, NDArray],
     config: AnalysisConfig,
     *,
     validity_masks: Mapping[int, NDArray[np.bool_]],
-) -> MarkerResult:
-    """Analyze one cell's registered Golgi arrays with round 2 fixed as reference.
-
-    This numerical kernel makes no filesystem writes and has no cohort aggregation.
-    Its ``array`` identity is rebound to the validated cell only by
-    :func:`analyze_golgi_cell`, the I/O-owning entry point.
-    """
+) -> _GolgiArrayAnalysis:
+    """Compute Golgi measurements and retain intermediates for diagnostics."""
     if REFERENCE_ROUND not in golgi_rounds or REFERENCE_ROUND not in dapi_rounds:
         raise ValueError("Golgi analysis requires acquisition round 2")
     if set(golgi_rounds) != set(dapi_rounds):
@@ -711,6 +1136,7 @@ def analyze_golgi_arrays(
         for round_number, image in rounds.items()
     }
     reference_members = ensemble_by_round[REFERENCE_ROUND]
+    nuclear_distance_field = _nuclear_distance_field(consensus.nuclei)
     ensemble_rows: list[EnsembleRow] = []
     summary_rows: list[MetricRow] = []
     units = _ensemble_units(config)
@@ -766,7 +1192,10 @@ def analyze_golgi_arrays(
         ):
             geometry = _mask_geometry(member.mask_zyx, config.voxel_spacing_xyz_um)
             distances = golgi_nucleus_distances(
-                member.mask_zyx, consensus.nuclei, config.voxel_spacing_xyz_um
+                member.mask_zyx,
+                consensus.nuclei,
+                config.voxel_spacing_xyz_um,
+                distance_field_zyx=nuclear_distance_field,
             )
             background = member.background
             corrected_signal = float(
@@ -823,15 +1252,38 @@ def analyze_golgi_arrays(
                     config.config_digest,
                 )
             )
-    return MarkerResult(
-        "golgi",
-        "array",
-        tuple(summary_rows),
-        tuple(ensemble_rows),
-        (),
-        (),
-        tuple(MappingProxyType(asdict(row)) for row in consensus.component_qc),
+    return _GolgiArrayAnalysis(
+        MarkerResult(
+            "golgi",
+            "array",
+            tuple(summary_rows),
+            tuple(ensemble_rows),
+            (),
+            (),
+            tuple(MappingProxyType(asdict(row)) for row in consensus.component_qc),
+        ),
+        consensus,
+        roi,
+        MappingProxyType(ensemble_by_round),
     )
+
+
+def analyze_golgi_arrays(
+    golgi_rounds: Mapping[int, NDArray],
+    dapi_rounds: Mapping[int, NDArray],
+    config: AnalysisConfig,
+    *,
+    validity_masks: Mapping[int, NDArray[np.bool_]],
+) -> MarkerResult:
+    """Analyze one cell's registered Golgi arrays with round 2 fixed as reference.
+
+    This numerical kernel makes no filesystem writes and has no cohort aggregation.
+    Its ``array`` identity is rebound to the validated cell only by
+    :func:`analyze_golgi_cell`, the I/O-owning entry point.
+    """
+    return _analyze_golgi_arrays(
+        golgi_rounds, dapi_rounds, config, validity_masks=validity_masks
+    ).result
 
 
 def _rebind_cell(result: MarkerResult, cell: CellSpec) -> MarkerResult:
@@ -861,6 +1313,7 @@ def _write_diagnostics(
     consensus: NuclearConsensus,
     roi: NDArray[np.bool_],
     threshold_masks: Mapping[int, tuple[MaskMember, ...]],
+    crop: _SharedCropBounds,
 ) -> tuple[Path, ...]:
     """Atomically publish fixed-grid composite overlays and threshold-response curves."""
     staged_paths: tuple[Path, ...] = ()
@@ -879,6 +1332,9 @@ def _write_diagnostics(
             overlay,
             consensus_nuclear_mask_zyx=consensus.mask_zyx,
             fixed_perinuclear_roi_zyx=roi,
+            crop_start_zyx=np.asarray(crop.start_zyx, dtype=np.int64),
+            crop_stop_zyx=np.asarray(crop.stop_zyx, dtype=np.int64),
+            full_shape_zyx=np.asarray(crop.full_shape_zyx, dtype=np.int64),
             **{f"round_{number}_target_zyx": image for number, image in rounds.items()},
             **{
                 f"round_{number}_sigma_{member.sigma_um:g}_sbr_{member.threshold_sbr:g}_threshold_mask_zyx": member.mask_zyx
@@ -942,6 +1398,106 @@ def _write_diagnostics(
     return tuple(output_dir / path.relative_to(staging_root) for path in staged_paths)
 
 
+def _write_crop_preflight(
+    output_dir: Path, cell: CellSpec, accepted: tuple[int, ...], plan: _GolgiCropPlan
+) -> tuple[Path, ...]:
+    """Atomically publish a small, inspectable Golgi crop plan before analysis."""
+    staged_paths: tuple[Path, ...] = ()
+    staging_root: Path | None = None
+
+    def bounds_json(
+        bounds: tuple[tuple[int, int, int], tuple[int, int, int]] | None,
+    ) -> dict[str, list[int]] | None:
+        if bounds is None:
+            return None
+        return {"start_zyx": list(bounds[0]), "stop_zyx": list(bounds[1])}
+
+    def populate(staged: Path) -> None:
+        nonlocal staged_paths, staging_root
+        import matplotlib.pyplot as plt
+
+        staging_root = staged
+        plan_path = staged / "crop-plan.json"
+        plan_path.write_text(
+            json.dumps(
+                {
+                    "cohort": cell.cohort,
+                    "cell_id": cell.cell_id,
+                    "accepted_rounds": list(accepted),
+                    "sample_step_zyx": list(plan.sample_step_zyx),
+                    "full_shape_zyx": list(plan.crop.full_shape_zyx),
+                    "crop_start_zyx": list(plan.crop.start_zyx),
+                    "crop_stop_zyx": list(plan.crop.stop_zyx),
+                    "retained_fraction": plan.crop.retained_fraction,
+                    "maximum_allowed_retained_fraction": _MAX_RETAINED_GOLGI_CROP_FRACTION,
+                    "dapi_support_bounds": {
+                        str(number): bounds_json(bounds)
+                        for number, bounds in sorted(plan.dapi_bounds_by_round.items())
+                    },
+                    "golgi_support_bounds": {
+                        str(number): bounds_json(bounds)
+                        for number, bounds in sorted(plan.golgi_bounds_by_round.items())
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        plt.rcParams.update(
+            {"pdf.fonttype": 42, "ps.fonttype": 42, "svg.fonttype": "none"}
+        )
+        figure_paths: list[Path] = []
+        for number in accepted:
+            figure, axes = plt.subplots(1, 2, figsize=(7, 3.5), layout="constrained")
+            for axis, title, support, color in (
+                (
+                    axes[0],
+                    "DAPI coarse support",
+                    plan.dapi_support_mips.get(number),
+                    "#C44EAD",
+                ),
+                (
+                    axes[1],
+                    "Golgi coarse support",
+                    plan.golgi_support_mips.get(number),
+                    "#009E73",
+                ),
+            ):
+                if support is None or not np.any(support):
+                    axis.text(
+                        0.5, 0.5, "no plausible support", ha="center", va="center"
+                    )
+                else:
+                    axis.imshow(support, cmap="gray", interpolation="nearest")
+                    axis.contour(support, levels=(0.5,), colors=color, linewidths=0.8)
+                axis.set_title(title)
+                axis.set_axis_off()
+            figure.suptitle(f"{cell.cell_id}: round {number} (coarse sampled MIP)")
+            path = staged / f"crop-support-round-{number}.png"
+            figure.savefig(path, dpi=180)
+            plt.close(figure)
+            figure_paths.append(path)
+        staged_paths = (plan_path, *figure_paths)
+
+    _atomic_publish_directory(output_dir, populate)
+    assert staging_root is not None
+    return tuple(output_dir / path.relative_to(staging_root) for path in staged_paths)
+
+
+def _require_compact_crop(plan: _GolgiCropPlan, preflight_dir: Path) -> None:
+    """Fail before large allocations when the candidate crop remains near-full field."""
+    fraction = plan.crop.retained_fraction
+    if fraction > _MAX_RETAINED_GOLGI_CROP_FRACTION:
+        raise ValueError(
+            "Golgi crop preflight retained "
+            f"{fraction:.1%} of the fixed grid (limit "
+            f"{_MAX_RETAINED_GOLGI_CROP_FRACTION:.0%}); inspect "
+            f"{preflight_dir / 'crop-plan.json'} before target-specific analysis"
+        )
+
+
 def analyze_golgi_cell(
     cell: CellSpec,
     artifacts: tuple[RoundArtifacts, ...],
@@ -964,40 +1520,44 @@ def analyze_golgi_cell(
             "cell and validated artifact acquisition-round inventories disagree"
         )
     accepted = _accepted_rounds(cell, config)
+    crop_plan = _golgi_crop_plan_from_artifacts(by_round, accepted, config)
+    preflight_dir = output_dir.parent / f"{output_dir.name}-crop-preflight"
+    preflight_paths = _write_crop_preflight(preflight_dir, cell, accepted, crop_plan)
+    _require_compact_crop(crop_plan, preflight_dir)
+    crop = crop_plan.crop
     dapi = {
-        number: load_volume(by_round[number].registered_dapi) for number in accepted
+        number: load_volume(by_round[number].registered_dapi)[crop.slices_zyx]
+        for number in accepted
     }
     golgi = {
-        number: load_volume(by_round[number].registered_target) for number in accepted
+        number: load_volume(by_round[number].registered_target)[crop.slices_zyx]
+        for number in accepted
     }
-    common_validity, validity_digest, validity_identities = _artifact_validity_masks(
-        {number: by_round[number] for number in accepted}, config
+    full_validity, validity_digest, validity_identities = _artifact_validity_masks(
+        {number: by_round[number] for number in accepted},
+        config,
+        fixed_shape_zyx=crop.full_shape_zyx,
     )
-    result = _rebind_cell(
-        analyze_golgi_arrays(golgi, dapi, config, validity_masks=common_validity), cell
-    )
-    consensus = consensus_nuclear_surface(
-        dapi,
-        config.voxel_spacing_xyz_um,
-        config.nuclear,
-        config.nominal_expansion_factor,
-    )
-    roi = _perinuclear_roi(consensus.mask_zyx, common_validity, config)
-    threshold_masks = {
-        round_number: _support_threshold_ensemble(
-            image,
-            roi,
-            np.logical_and.reduce(tuple(common_validity.values())),
-            config,
-        )
-        for round_number, image in golgi.items()
+    common_validity = {
+        number: mask[crop.slices_zyx] for number, mask in full_validity.items()
     }
+    analysis = _analyze_golgi_arrays(
+        golgi, dapi, config, validity_masks=common_validity
+    )
+    result = _rebind_cell(analysis.result, cell)
     diagnostics = _write_diagnostics(
-        output_dir, golgi, dapi, result, consensus, roi, threshold_masks
+        output_dir,
+        golgi,
+        dapi,
+        result,
+        analysis.consensus,
+        analysis.roi,
+        analysis.threshold_masks,
+        crop,
     )
     return replace(
         result,
-        diagnostics=diagnostics,
+        diagnostics=(*preflight_paths, *diagnostics),
         input_identities=tuple(
             str(path)
             for number in accepted

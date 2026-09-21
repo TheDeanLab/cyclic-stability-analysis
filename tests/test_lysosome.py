@@ -15,9 +15,14 @@ from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.lysosome import (
     DetectionSet,
     LysosomeObject,
+    ObjectMatchResult,
     _comparison_specs,
+    _draw_mip_match_status,
     _fixed_lamp_roi,
     _maxima,
+    _mip_candidates,
+    _mip_dog_candidates,
+    _merge_mip_seed_footprints,
     _physical_log_response,
     _rows_for_detections,
     _with_nuclear_distances,
@@ -74,6 +79,211 @@ def test_log_detector_recovers_anisotropic_physical_spots() -> None:
     )
     assert len(detected) == 9
     assert [item.object_count for item in detected] == [3] * 9
+
+
+def test_mip_production_bands_cover_approved_five_to_one_hundred_pixel_range() -> None:
+    """A 10-pixel floor or 70-pixel ceiling would inflate or truncate candidates."""
+    shape = (15, 256, 256)
+    z, y, x = np.indices(shape, dtype=float)
+    image = np.ones(shape, dtype=np.float64)
+    production_spacing = (0.1083, 0.1083, 0.3)
+    ring = (x - 150.0) ** 2 + (y - 150.0) ** 2
+    image += 100.0 * np.exp(-ring / (2.0 * 45.0**2))
+    image[((x - 30.0) ** 2 + (y - 30.0) ** 2 <= 3.0**2) & (z >= 6) & (z <= 8)] = 100.0
+
+    small_candidates = _mip_candidates(
+        image,
+        np.ones(shape, dtype=bool),
+        sigma_um=0.35,
+        detection_sbr=3.75,
+        spacing_xyz_um=production_spacing,
+    )
+    small_bounds = [
+        bounds
+        for bounds, _footprint in small_candidates
+        if math.dist(
+            (
+                (bounds[1].start + bounds[1].stop - 1) / 2.0,
+                (bounds[0].start + bounds[0].stop - 1) / 2.0,
+            ),
+            (30.0, 30.0),
+        )
+        <= 2.0
+    ]
+    assert len(small_bounds) == 1
+    assert (
+        max(
+            small_bounds[0][0].stop - small_bounds[0][0].start,
+            small_bounds[0][1].stop - small_bounds[0][1].start,
+        )
+        <= 7
+    )
+
+    large_candidates = _mip_candidates(
+        image,
+        np.ones(shape, dtype=bool),
+        sigma_um=1.40,
+        detection_sbr=3.75,
+        spacing_xyz_um=production_spacing,
+    )
+    large_bounds = [
+        bounds
+        for bounds, _footprint in large_candidates
+        if math.dist(
+            (
+                (bounds[1].start + bounds[1].stop - 1) / 2.0,
+                (bounds[0].start + bounds[0].stop - 1) / 2.0,
+            ),
+            (150.0, 150.0),
+        )
+        <= 2.0
+    ]
+    assert len(large_bounds) == 1, [
+        (
+            (bounds[1].start + bounds[1].stop - 1) / 2.0,
+            (bounds[0].start + bounds[0].stop - 1) / 2.0,
+            bounds[1].stop - bounds[1].start,
+            bounds[0].stop - bounds[0].start,
+        )
+        for bounds, _footprint in large_candidates
+    ]
+    assert (
+        min(
+            large_bounds[0][0].stop - large_bounds[0][0].start,
+            large_bounds[0][1].stop - large_bounds[0][1].start,
+        )
+        > 71
+    )
+
+
+def test_mip_dog_candidates_seed_one_hollow_object_but_not_a_subthreshold_dot() -> None:
+    """Explicit MIP DoG bounds must represent their requested object scale."""
+    shape = (15, 160, 160)
+    z, y, x = np.indices(shape, dtype=float)
+    image = np.random.default_rng(8).normal(1.0, 0.02, shape)
+    ring = (x - 80.0) ** 2 + (y - 80.0) ** 2
+    image[((ring >= 15.0**2) & (ring <= 25.0**2) & (z >= 4) & (z <= 10))] = 100.0
+    image[((x - 30.0) ** 2 + (y - 30.0) ** 2 <= 3.0**2) & (z >= 6) & (z <= 8)] = 100.0
+
+    candidates = _mip_dog_candidates(
+        image.astype(np.uint16),
+        np.ones(shape, dtype=bool),
+        detection_sbr=4.0,
+        spacing_xyz_um=SPACING,
+        min_lateral_diameter_px=10.0,
+        max_lateral_diameter_px=70.0,
+    )
+
+    assert len(candidates) == 1
+    bounds, footprint = candidates[0]
+    assert (bounds[0].start + bounds[0].stop - 1) / 2.0 == pytest.approx(80.0, abs=2.0)
+    assert (bounds[1].start + bounds[1].stop - 1) / 2.0 == pytest.approx(80.0, abs=2.0)
+    assert footprint[footprint.shape[0] // 2, footprint.shape[1] // 2]
+
+
+def test_mip_dog_candidate_diameter_bounds_can_admit_five_pixel_objects() -> None:
+    """A 5--100 pixel preview must recover a small spot excluded by 10--70."""
+    shape = (15, 160, 160)
+    z, y, x = np.indices(shape, dtype=float)
+    image = np.ones(shape, dtype=np.uint16)
+    ring = (x - 80.0) ** 2 + (y - 80.0) ** 2
+    image[((ring >= 15.0**2) & (ring <= 25.0**2) & (z >= 4) & (z <= 10))] = 100
+    image[((x - 30.0) ** 2 + (y - 30.0) ** 2 <= 3.0**2) & (z >= 6) & (z <= 8)] = 100
+
+    candidates = _mip_dog_candidates(
+        image,
+        np.ones(shape, dtype=bool),
+        detection_sbr=3.75,
+        spacing_xyz_um=SPACING,
+        min_lateral_diameter_px=5.0,
+        max_lateral_diameter_px=100.0,
+    )
+
+    assert len(candidates) == 2
+
+
+def test_connected_hollow_mip_signal_merges_multiple_dog_seeds() -> None:
+    """Two seeds on one hollow LAMP1 structure must yield one filled footprint."""
+    y, x = np.indices((101, 101), dtype=float)
+    ring = np.hypot(y - 50.0, x - 50.0)
+    image = np.zeros((15, 101, 101), dtype=np.float64)
+    image[:, (ring >= 23.0) & (ring <= 27.0)] = 10.0
+    roi = np.ones(image.shape, dtype=bool)
+    seeds = (
+        ((slice(48, 54), slice(22, 28)), np.ones((6, 6), dtype=bool)),
+        ((slice(48, 54), slice(72, 78)), np.ones((6, 6), dtype=bool)),
+    )
+
+    merged = _merge_mip_seed_footprints(image, roi, seeds)
+
+    assert len(merged) == 1
+    bounds, footprint = merged[0]
+    assert bounds == (slice(23, 78), slice(23, 78))
+    assert footprint[27, 27]
+
+
+def test_mip_match_overlay_uses_colorblind_object_status_outlines() -> None:
+    """Status rendering must distinguish matched, round-2-only, and moving-only objects."""
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import to_hex
+
+    reference = DetectionSet(
+        0.7,
+        4.0,
+        (
+            LysosomeObject((10.0, 10.0, 0.0), 1.0, 4.0, 0.9, math.nan, math.nan),
+            LysosomeObject((20.0, 10.0, 0.0), 1.0, 4.0, 0.9, math.nan, math.nan),
+        ),
+    )
+    moving = DetectionSet(
+        0.7,
+        4.0,
+        (
+            LysosomeObject((11.0, 10.0, 0.0), 1.0, 4.0, 0.9, math.nan, math.nan),
+            LysosomeObject((30.0, 10.0, 0.0), 1.0, 4.0, 0.9, math.nan, math.nan),
+        ),
+    )
+    match = ObjectMatchResult(((0, 0),), (0.1,), (0.1,), (0.0,), 1, 1, 1, 0.5, 0.5, 0.5)
+    figure, axis = plt.subplots()
+    try:
+        _draw_mip_match_status(axis, reference, moving, match, (1.0, 1.0))
+        assert len(axis.patches) == 4
+        dashed = [patch for patch in axis.patches if patch.get_linestyle() == "--"]
+        solid = [patch for patch in axis.patches if patch.get_linestyle() == "-"]
+        assert sorted(to_hex(patch.get_edgecolor()) for patch in dashed) == [
+            "#0072b2",
+            "#009e73",
+        ]
+        assert len(solid) == 2
+        assert {to_hex(patch.get_edgecolor()) for patch in solid} == {"#666666"}
+        assert len(axis.collections) == 1
+        assert to_hex(axis.collections[0].get_colors()[0]) == "#666666"
+    finally:
+        plt.close(figure)
+
+
+def test_local_region_workers_preserve_detector_results() -> None:
+    """Independent padded response regions retain fixed-grid object measurements."""
+    image = synthetic_lamp_spots()
+    roi = np.ones(image.shape, dtype=bool)
+    serial = detect_lysosomes(
+        image,
+        roi,
+        SPACING,
+        (0.70,),
+        (3.0,),
+        resolution=RESOLUTION,
+    )
+    parallel = detect_lysosomes(
+        image,
+        roi,
+        SPACING,
+        (0.70,),
+        (3.0,),
+        resolution=RESOLUTION,
+        local_workers=2,
+    )
+    assert parallel == serial
 
 
 def test_scale_normalization_uses_physical_zyx_sigma() -> None:
@@ -419,6 +629,8 @@ def test_lamp_analysis_emits_round_two_and_adjacent_comparisons_for_every_ensemb
     assert (tmp_path / "output" / "lamp1-ensemble.csv").is_file()
     assert (tmp_path / "output" / "objects.csv").is_file()
     assert (tmp_path / "output" / "matches.csv").is_file()
+    for number in (1, 3, 4, 5):
+        assert (tmp_path / "output" / f"lamp1-mip-overlay-round-{number}.png").is_file()
     with (tmp_path / "output" / "lamp1-ensemble.csv").open(
         newline="", encoding="utf-8"
     ) as handle:
@@ -429,6 +641,8 @@ def test_lamp_analysis_emits_round_two_and_adjacent_comparisons_for_every_ensemb
         newline="", encoding="utf-8"
     ) as handle:
         objects = list(csv.DictReader(handle))
+    assert objects
+    assert "mip_smoothing_sigma_um" in objects[0]
     with (tmp_path / "output" / "matches.csv").open(
         newline="", encoding="utf-8"
     ) as handle:

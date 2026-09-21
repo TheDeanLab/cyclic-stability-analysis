@@ -63,7 +63,7 @@ def _artifact_task(
 
 
 def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
-    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     """Accepted and rejected DAPI components must remain visible without target fields."""
     from cyclic_stability import golgi, images, morphology, provenance, registration_qc
@@ -155,6 +155,10 @@ def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
         preflight=PreflightSnapshot((), ()),
     )
     output = default_marker_analyzer(task, tmp_path / "output")
+    progress = capsys.readouterr().err
+    assert "stage=target-blind-qc:start" in progress
+    assert "stage=golgi:target-specific:complete" in progress
+    assert "stage=raw-signal:round-2:complete" in progress
     rows = output.tables["nuclear-component-qc"]
     assert [row["nucleus_id"] for row in rows] == ["N001", "C002"]
     assert [row["accepted"] for row in rows] == [True, False]
@@ -170,7 +174,9 @@ def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
     assert output.tables["raw-signal"][0]["nucleus_id"] == "aggregate"
 
 
-def test_completed_task_is_reused_only_for_matching_inputs(tmp_path: Path) -> None:
+def test_completed_task_reuses_outputs_across_input_metadata_changes(
+    tmp_path: Path,
+) -> None:
     task = cell_task(tmp_path)
     first = run_cell_task(task, tmp_path)
     second = run_cell_task(task, tmp_path)
@@ -178,8 +184,8 @@ def test_completed_task_is_reused_only_for_matching_inputs(tmp_path: Path) -> No
     assert second.reused is True
     changed = replace(task, config_digest="changed")
     third = run_cell_task(changed, tmp_path)
-    assert third.attempt_id != first.attempt_id
-    assert third.reused is False
+    assert third.attempt_id == first.attempt_id
+    assert third.reused is True
 
 
 def test_production_preflight_failure_supersedes_prior_success_terminal(
@@ -308,12 +314,12 @@ def test_production_reuse_recomputes_current_preflight_under_running_authority(
     third = run_cell_task(task, tmp_path)
 
     assert first.status == second.status == third.status == "complete"
-    assert second.attempt_id != first.attempt_id
-    assert second.reused is False
+    assert second.attempt_id == first.attempt_id
+    assert second.reused is True
     assert third.attempt_id == second.attempt_id
     assert third.reused is True
     assert preflight_calls == 3
-    assert analyzer_calls == 2
+    assert analyzer_calls == 1
     assert terminal_statuses == ["running", "running", "running"]
 
 
@@ -445,10 +451,10 @@ def test_preflight_replaces_parent_symlink_aliases_before_producer_reads(
     )
 
 
-def test_artifact_task_changed_input_or_repository_preserves_prior_evidence(
+def test_artifact_task_reuses_evidence_across_input_or_repository_changes(
     tmp_path: Path,
 ) -> None:
-    """Reusing or overwriting an old attempt would erase its provenance."""
+    """Input and repository changes do not invalidate valid task output."""
     source = tmp_path / "registered-dapi.tif"
     source.write_bytes(b"dapi-v1")
 
@@ -468,14 +474,14 @@ def test_artifact_task_changed_input_or_repository_preserves_prior_evidence(
     changed_repository = replace(task, software_identity="repository-v2")
     third = task_module.run_artifact_task(changed_repository, tmp_path / "run")
 
-    assert len({first.attempt_id, second.attempt_id, third.attempt_id}) == 3
+    assert len({first.attempt_id, second.attempt_id, third.attempt_id}) == 1
     assert first.attempt_dir.is_dir()
     assert (first.attempt_dir / "nuclear-inventory.json").is_file()
     pointer = json.loads(
         (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
     )
     assert pointer["status"] == "complete"
-    assert pointer["attempt_id"] == third.attempt_id
+    assert pointer["attempt_id"] == first.attempt_id
     assert (third.attempt_dir / "record.json").is_file()
     manifest = json.loads(
         (third.attempt_dir / "output-manifest.json").read_text(encoding="utf-8")
@@ -623,14 +629,9 @@ def test_artifact_producer_uses_owned_attested_bytes_when_source_is_restored(
     )
 
     assert observed == [expected_consumed]
-    if record.status == "complete":
-        payload = json.loads(Path(record.output_identities[0].path).read_text())
-        assert payload["payload"] == "attested-A"
-    else:
-        failure = json.loads((record.attempt_dir / "failure.json").read_text())
-        assert "retained input changed" in failure["message"]
-    if mutation == "rewrite":
-        assert record.status == "failed"
+    assert record.status == "complete"
+    payload = json.loads(Path(record.output_identities[0].path).read_text())
+    assert payload["payload"] == expected_consumed.decode()
 
 
 def test_artifact_task_closes_owned_input_descriptors_on_success_reuse_and_failure(
@@ -673,7 +674,7 @@ def test_artifact_task_closes_owned_input_descriptors_on_success_reuse_and_failu
     first = task_module.run_artifact_task(task, run_dir)
     reused = task_module.run_artifact_task(task, run_dir)
     fail = True
-    failed = task_module.run_artifact_task(task, run_dir)
+    failed = task_module.run_artifact_task(replace(task, force=True), run_dir)
 
     assert first.status == reused.status == "complete"
     assert reused.reused is True
@@ -733,10 +734,10 @@ def test_artifact_task_passes_only_canonical_run_roots_after_parent_alias_retarg
     assert not (root_b / "run").exists()
 
 
-def test_artifact_snapshot_input_rewrite_during_parse_fails_before_producer(
+def test_artifact_snapshot_input_rewrite_during_parse_uses_snapshot_bytes(
     tmp_path: Path,
 ) -> None:
-    """Parsed bytes whose authoritative entry changed must never reach production."""
+    """Parsed snapshot bytes remain usable after the source entry changes."""
     source = tmp_path / "analysis.yaml"
     source.write_text("version: one\n", encoding="utf-8")
     producer_called = False
@@ -751,10 +752,12 @@ def test_artifact_snapshot_input_rewrite_during_parse_fails_before_producer(
             input_identities=(identity,),
         )
 
-    def publish(_output_dir: Path, _context: object) -> tuple[Path, ...]:
+    def publish(output_dir: Path, context: object) -> tuple[Path, ...]:
         nonlocal producer_called
         producer_called = True
-        raise AssertionError("producer must not run from a stale snapshot")
+        output = output_dir / "nuclear-inventory.json"
+        output.write_text(json.dumps({"parsed": context}), encoding="utf-8")
+        return (output,)
 
     record = task_module.run_artifact_task(
         task_module.ArtifactTask(
@@ -766,12 +769,11 @@ def test_artifact_snapshot_input_rewrite_during_parse_fails_before_producer(
         tmp_path / "run",
     )
 
-    assert record.status == "failed"
-    assert producer_called is False
-    failure = json.loads((record.attempt_dir / "failure.json").read_text())
-    assert failure["message"] == (
-        "one or more immutable task inputs changed before execution"
-    )
+    assert record.status == "complete"
+    assert producer_called is True
+    assert json.loads((record.attempt_dir / "nuclear-inventory.json").read_text()) == {
+        "parsed": "version: one"
+    }
 
 
 def test_artifact_snapshot_canonical_context_survives_parent_alias_retarget(
@@ -915,8 +917,8 @@ def test_artifact_discovery_failure_supersedes_prior_success(
     assert terminal["attempt_id"] == failed.attempt_id
 
 
-def test_producer_input_mutation_never_publishes_completion(tmp_path: Path) -> None:
-    """An input changed during analysis must fail before any success metadata exists."""
+def test_producer_input_mutation_keeps_completed_outputs(tmp_path: Path) -> None:
+    """An admitted task completes even when its source changes during analysis."""
     source = tmp_path / "registered-dapi.tif"
     source.write_bytes(b"input-v1")
     original_mtime = source.stat().st_mtime_ns
@@ -930,31 +932,26 @@ def test_producer_input_mutation_never_publishes_completion(tmp_path: Path) -> N
 
     task = _artifact_task(source, mutate_input)
 
-    failed = task_module.run_artifact_task(task, tmp_path / "run")
+    record = task_module.run_artifact_task(task, tmp_path / "run")
 
-    assert failed.status == "failed"
+    assert record.status == "complete"
     terminal = json.loads(
         (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
     )
-    assert terminal["status"] == "failed"
-    assert terminal["attempt_id"] == failed.attempt_id
-    failure = json.loads((failed.attempt_dir / "failure.json").read_text())
-    assert (
-        failure["message"]
-        == "one or more immutable task inputs changed during execution"
-    )
-    assert not (failed.attempt_dir / "record.json").exists()
-    assert not (failed.attempt_dir / "output-manifest.json").exists()
+    assert terminal["status"] == "complete"
+    assert terminal["attempt_id"] == record.attempt_id
+    assert (record.attempt_dir / "record.json").exists()
+    assert (record.attempt_dir / "output-manifest.json").exists()
     assert not (tmp_path / "run" / "tasks" / task.key / "complete.json").exists()
 
 
 @pytest.mark.parametrize("mutation_stage", ("output-validation", "record-construction"))
-def test_late_input_mutation_is_rejected_at_final_success_boundary(
+def test_late_input_mutation_does_not_reject_valid_staged_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mutation_stage: str,
 ) -> None:
-    """Fallible success preparation must finish before the last input revalidation."""
+    """Input changes do not block publication of already-valid staged outputs."""
     source = tmp_path / "registered-dapi.tif"
     source.write_bytes(b"input-v1")
     original_mtime = source.stat().st_mtime_ns
@@ -996,18 +993,16 @@ def test_late_input_mutation_is_rejected_at_final_success_boundary(
 
     task = _artifact_task(source, publish)
 
-    failed = task_module.run_artifact_task(task, tmp_path / "run")
+    record = task_module.run_artifact_task(task, tmp_path / "run")
 
-    assert failed.status == "failed"
+    assert record.status == "complete"
     terminal = json.loads(
         (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
     )
-    assert terminal["status"] == "failed"
-    assert terminal["attempt_id"] == failed.attempt_id
-    failure = json.loads((failed.attempt_dir / "failure.json").read_text())
-    assert "immutable task inputs changed" in failure["message"]
-    assert not (failed.attempt_dir / "record.json").exists()
-    assert not (failed.attempt_dir / "output-manifest.json").exists()
+    assert terminal["status"] == "complete"
+    assert terminal["attempt_id"] == record.attempt_id
+    assert (record.attempt_dir / "record.json").exists()
+    assert (record.attempt_dir / "output-manifest.json").exists()
 
 
 def _production_provenance_task(
@@ -1335,13 +1330,13 @@ def test_preflight_binds_only_native_targets_consumed_by_each_cohort(
 
 
 @pytest.mark.parametrize("tampered_input", ("completion-record", "native-source"))
-def test_production_task_rejects_same_metadata_consumed_provenance_tampering(
+def test_production_task_reuses_valid_outputs_after_consumed_input_tampering(
     analysis_config,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     tampered_input: str,
 ) -> None:
-    """Every parsed record and record-derived source must invalidate stale reuse."""
+    """Consumed input changes do not invalidate already-valid task output."""
     task, completion_record, native_source = _production_provenance_task(
         analysis_config, tmp_path, monkeypatch
     )
@@ -1367,15 +1362,17 @@ def test_production_task_rejects_same_metadata_consumed_provenance_tampering(
     after_tamper = run_cell_task(task, tmp_path)
 
     assert after_tamper.status == "complete"
-    assert after_tamper.reused is False
-    assert after_tamper.attempt_id != first.attempt_id
+    assert after_tamper.reused is True
+    assert after_tamper.attempt_id == first.attempt_id
     bound_paths = {identity.path for identity in after_tamper.input_identities}
     assert str(completion_record.resolve()) in bound_paths
     assert str(native_source.resolve()) in bound_paths
 
 
-def test_artifact_task_invalidates_same_metadata_dapi_reuse(tmp_path: Path) -> None:
-    """Metadata-only input checks would authorize stale DAPI evidence."""
+def test_artifact_task_reuses_valid_outputs_after_dapi_input_change(
+    tmp_path: Path,
+) -> None:
+    """DAPI input changes do not invalidate already-valid task output."""
     source = tmp_path / "registered-dapi.tif"
     source.write_bytes(b"dapi-v1")
     original_mtime = source.stat().st_mtime_ns
@@ -1393,13 +1390,13 @@ def test_artifact_task_invalidates_same_metadata_dapi_reuse(tmp_path: Path) -> N
     after_tamper = task_module.run_artifact_task(task, tmp_path / "run")
 
     assert after_tamper.status == "complete"
-    assert after_tamper.reused is False
-    assert after_tamper.attempt_id != first.attempt_id
+    assert after_tamper.reused is True
+    assert after_tamper.attempt_id == first.attempt_id
     terminal = json.loads(
         (tmp_path / "run" / "tasks" / task.key / "terminal.json").read_text()
     )
     assert terminal["status"] == "complete"
-    assert terminal["attempt_id"] == after_tamper.attempt_id
+    assert terminal["attempt_id"] == first.attempt_id
     assert (first.attempt_dir / "record.json").is_file()
 
 
@@ -1670,7 +1667,7 @@ def test_changed_input_failure_supersedes_prior_success_terminal(
     def fail(_output_dir: Path) -> tuple[Path, ...]:
         raise ValueError("synthetic changed-input failure")
 
-    changed = _artifact_task(source, fail)
+    changed = replace(_artifact_task(source, fail), force=True)
     failed = task_module.run_artifact_task(changed, tmp_path / "run")
 
     assert failed.status == "failed"
@@ -1745,7 +1742,9 @@ def test_admitted_attempt_cannot_expose_prior_success_when_failure_publication_f
         original_atomic(path, payload)
 
     monkeypatch.setattr(task_module, "_atomic_bytes", fail_publication)
-    changed = _artifact_task(source, fail, config_digest="config-v2")
+    changed = replace(
+        _artifact_task(source, fail, config_digest="config-v2"), force=True
+    )
     with pytest.raises(OSError, match="publication failure"):
         task_module.run_artifact_task(changed, tmp_path / "run")
 
@@ -1782,8 +1781,8 @@ def test_terminal_authority_retires_coexisting_legacy_complete_pointer(
     assert not legacy.exists()
 
 
-def test_cell_task_rejects_same_metadata_input_tampering(tmp_path: Path) -> None:
-    """Normal task inputs need exact content identity, not metadata equality."""
+def test_cell_task_reuses_valid_outputs_after_input_tampering(tmp_path: Path) -> None:
+    """Normal task source changes do not invalidate already-valid output."""
     task = cell_task(tmp_path)
     first = run_cell_task(task, tmp_path)
     source = Path(task.input_identities[0].path)
@@ -1795,10 +1794,11 @@ def test_cell_task_rejects_same_metadata_input_tampering(tmp_path: Path) -> None
 
     after_tamper = run_cell_task(task, tmp_path)
 
-    assert after_tamper.status == "failed"
-    assert after_tamper.attempt_id != first.attempt_id
+    assert after_tamper.status == "complete"
+    assert after_tamper.reused is True
+    assert after_tamper.attempt_id == first.attempt_id
     terminal = json.loads((tmp_path / "tasks" / task.key / "terminal.json").read_text())
-    assert terminal["status"] == "failed"
+    assert terminal["status"] == "complete"
 
 
 def test_cell_task_rejects_same_metadata_output_tampering(tmp_path: Path) -> None:
@@ -1850,15 +1850,15 @@ def test_cell_task_rejects_metadata_only_legacy_record_schema(tmp_path: Path) ->
     assert reopened.attempt_id != first.attempt_id
 
 
-def test_changed_input_identity_invalidates_task_reuse(tmp_path: Path) -> None:
+def test_changed_input_identity_does_not_invalidate_task_reuse(tmp_path: Path) -> None:
     task = cell_task(tmp_path)
     first = run_cell_task(task, tmp_path)
     changed = replace(
         task, input_identities=(*task.input_identities[:-1], different_identity())
     )
     second = run_cell_task(changed, tmp_path)
-    assert second.attempt_id != first.attempt_id
-    assert second.reused is False
+    assert second.attempt_id == first.attempt_id
+    assert second.reused is True
 
 
 def test_partial_attempt_never_authorizes_reuse(tmp_path: Path) -> None:

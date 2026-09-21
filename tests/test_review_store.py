@@ -187,10 +187,10 @@ def test_open_rejects_unknown_state_keys(tmp_path: Path) -> None:
         ReviewStore.open(tmp_path / "review", manifest, "Reviewer", now=fixed_clock)
 
 
-def test_open_rejects_changed_dirty_repository_identity(
+def test_open_allows_changed_dirty_repository_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Resume is refused if the exact dirty-tree diff is no longer identical."""
+    """Resume does not depend on the repository identity captured at creation."""
     manifest = build_review_manifest(write_review_qc_fixture(tmp_path / "qc"), seed=7)
     first = RepositoryIdentity("a" * 40, True, "1" * 64)
     second = RepositoryIdentity("a" * 40, True, "2" * 64)
@@ -198,8 +198,11 @@ def test_open_rejects_changed_dirty_repository_identity(
     ReviewStore.create(tmp_path / "review", manifest, "Reviewer", now=fixed_clock)
     monkeypatch.setattr(review_store, "_repository_identity", lambda: second)
 
-    with pytest.raises(ValueError, match="repository identity changed"):
-        ReviewStore.open(tmp_path / "review", manifest, "Reviewer", now=fixed_clock)
+    reopened = ReviewStore.open(
+        tmp_path / "review", manifest, "Reviewer", now=fixed_clock
+    )
+
+    assert reopened.state.repository_identity == first
 
 
 def test_repository_identity_tracks_untracked_nonignored_file_content() -> None:

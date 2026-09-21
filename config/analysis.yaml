@@ -27,7 +27,7 @@ golgi:
 lysosome:
   log_sigma_um: [0.35, 0.70, 1.40]
   detection_sbr: [3.0, 4.0, 5.0]
-  match_resolution_units: 1.0
+  match_resolution_units: 2.0
 paths:
   nd2_root: /archive/bioinformatics/Danuser_lab/Dean/Seweryn/resubmission/U2OS_repeat_60x
   resubmission_root: /archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission

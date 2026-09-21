@@ -70,6 +70,11 @@ def test_qc_cli_configures_native_threads_before_scientific_imports(
                 missing = [item for item in native_variables if item not in os.environ]
                 if missing:
                     raise RuntimeError(f"scientific analyzer imported before {{missing}}")
+                incorrect = [
+                    item for item in native_variables if os.environ[item] != "4"
+                ]
+                if incorrect:
+                    raise RuntimeError(f"scientific analyzer used wrong threads: {{incorrect}}")
             return original_import(name, globals, locals, fromlist, level)
 
         builtins.__import__ = checked_import
@@ -78,6 +83,7 @@ def test_qc_cli_configures_native_threads_before_scientific_imports(
             "--analysis-config", str({str(tmp_path / "missing-analysis.yaml")!r}),
             "--correspondence", str({str(tmp_path / "missing-correspondence.csv")!r}),
             "--run-dir", str({str(tmp_path / "unused-output")!r}),
+            "--native-threads", "4",
         ]
         try:
             runpy.run_path({str(script)!r}, run_name="__main__")
@@ -294,8 +300,8 @@ def test_analyzer_reads_only_blinded_channels_and_writes_metrics_and_stages(
     backend_spacings: list[tuple[float, float, float]] = []
 
     class Backend:
-        def __init__(self, native_threads: object) -> None:
-            pass
+        def __init__(self, native_threads: object = None) -> None:
+            assert native_threads is None
 
         def read_affine(self, path: Path) -> object:
             return SimpleNamespace(

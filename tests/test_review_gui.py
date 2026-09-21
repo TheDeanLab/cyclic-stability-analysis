@@ -26,6 +26,7 @@ from cyclic_stability.review_gui import (
     ReviewController,
     ReviewViewModel,
     keyboard_action,
+    thumbnail_bounds,
 )
 from cyclic_stability.review_inventory import build_review_manifest
 from cyclic_stability.review_store import ReviewStore
@@ -289,6 +290,25 @@ def test_keyboard_shortcuts_map_to_review_actions(
 ) -> None:
     """Exact status, navigation, and common-reason keys map to pure actions."""
     assert keyboard_action(key) == expected
+
+
+def test_return_and_control_s_shortcuts_preserve_navigation_and_save_intent() -> None:
+    """Enter navigation and explicit save must not displace decision shortcuts."""
+    assert keyboard_action("Return") == ("navigate", "next")
+    assert keyboard_action("Return", shift=True) == ("navigate", "previous")
+    assert keyboard_action("s", control=True) == ("save", "current")
+    assert keyboard_action("a") == ("status", "accept")
+    assert keyboard_action("1") == ("reason", "dapi-aligned")
+
+
+def test_thumbnail_bounds_expand_with_the_available_tab_canvas() -> None:
+    """A larger review window gives every image cell more display area."""
+    small = thumbnail_bounds(720, 480)
+    large = thumbnail_bounds(1440, 960)
+
+    assert small[0] > 0 and small[1] > 0
+    assert large[0] > small[0]
+    assert large[1] > small[1]
 
 
 def test_navigation_persists_before_changing_case(

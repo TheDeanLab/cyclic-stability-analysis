@@ -124,15 +124,22 @@ def _write_review_tables(
     )
 
 
-def write_review_qc_fixture(root: Path) -> Path:
-    """Write the complete 40-case target-blind QC inventory."""
+def write_review_qc_fixture(
+    root: Path,
+    *,
+    cohorts: tuple[str, ...] = ("golgi", "lamin"),
+    cell_count: int = 5,
+) -> Path:
+    """Write a complete synthetic target-blind QC inventory."""
     import tifffile
 
+    if not cohorts or cell_count < 1:
+        raise ValueError("fixture requires at least one cohort and one cell")
     qc = root / "qc"
     qc.mkdir(parents=True)
     rows: list[dict[str, object]] = []
-    for cohort in ("golgi", "lamin"):
-        for cell_number in range(1, 6):
+    for cohort in cohorts:
+        for cell_number in range(1, cell_count + 1):
             for round_number in (1, 3, 4, 5):
                 hard_invalid = (
                     cohort == "lamin" and cell_number == 1 and round_number == 1

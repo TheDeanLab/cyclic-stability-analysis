@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +12,7 @@ import tifffile
 from cyclic_stability.models import RoundSpec
 from cyclic_stability.provenance import (
     PlaneReader,
+    attested_pretransform_channels,
     channel_tiff_paths,
     compare_nd2_export,
 )
@@ -158,6 +160,7 @@ def test_lamp1_uses_the_exported_uppercase_target_basename(
         nd2_path=fake_round.nd2_path,
         tiff_directory=fake_round.tiff_directory,
         z_start_offset=fake_round.z_start_offset,
+        producer_source_z_start_offset=fake_round.producer_source_z_start_offset,
         target_exposure_ms=fake_round.target_exposure_ms,
         target_laser_percent=fake_round.target_laser_percent,
         tubulin_exposure_ms=fake_round.tubulin_exposure_ms,
@@ -169,3 +172,41 @@ def test_lamp1_uses_the_exported_uppercase_target_basename(
     )
     paths = dict(channel_tiff_paths(lamp_round))
     assert paths["target"].name == "round_2_647_LAMP1.tif"
+
+
+def test_rotation_seed_attests_only_every_declared_moving_channel(
+    fake_round: RoundSpec,
+) -> None:
+    """A declared rotation seed is the sole exception to exact export identity."""
+    rotated = fake_round.tiff_directory / "rotated"
+    rotated.mkdir()
+    seeded = replace(
+        fake_round,
+        acquisition_round=4,
+        workflow_round=4,
+        tiff_directory=rotated,
+    )
+    for _channel, path in channel_tiff_paths(seeded):
+        tifffile.imwrite(path, np.zeros((5, 2, 2), dtype=np.uint16))
+    record = {
+        "schema_version": 1,
+        "purpose": "one-off target-blind Cell 1 round-4 tubulin XY rotation seed",
+        "rotation_xy_deg": -6.3,
+        "rotation_about": "image center",
+        "translation": "intentionally omitted; estimated by the regular Cy-ExM workflow",
+        "interpolation": "linear",
+        "fill_value": 0,
+        "source_directory": str(fake_round.tiff_directory),
+        "rotated_channels": [
+            path.name for _channel, path in channel_tiff_paths(seeded)
+        ],
+    }
+    (rotated.parent / "rotation-seed.json").write_text(json.dumps(record))
+
+    assert attested_pretransform_channels(seeded) == frozenset(
+        {"target", "tubulin", "dapi"}
+    )
+
+    record["rotated_channels"] = record["rotated_channels"][:-1]
+    (rotated.parent / "rotation-seed.json").write_text(json.dumps(record))
+    assert attested_pretransform_channels(seeded) == frozenset()

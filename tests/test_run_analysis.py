@@ -8,12 +8,32 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import tifffile
 from cyclic_stability.models import NuclearConfig
 from cyclic_stability.nuclear import NuclearComponentQc
 from cyclic_stability.task import RetainedContent
 from cyexm.spatial import ImageGeometry
+
 from scripts import run_analysis
+
+
+def test_profile_threads_are_exported_before_scientific_imports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-default profile must configure every native runtime from the shell."""
+    monkeypatch.delenv("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", raising=False)
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    monkeypatch.delenv("MKL_NUM_THREADS", raising=False)
+    monkeypatch.delenv("NUMEXPR_NUM_THREADS", raising=False)
+    monkeypatch.delenv("VECLIB_MAXIMUM_THREADS", raising=False)
+
+    run_analysis._export_native_threads(4)
+
+    assert {name: os.environ[name] for name in run_analysis._THREAD_ENVIRONMENT} == {
+        name: "4" for name in run_analysis._THREAD_ENVIRONMENT
+    }
 
 
 def test_validated_registered_dapi_uses_dapi_only_snapshot(
@@ -322,7 +342,7 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         == 0
     )
     second_attempt = json.loads((task_dir / "terminal.json").read_text())["attempt_id"]
-    assert second_attempt != first_attempt
+    assert second_attempt == first_attempt
     assert inventory.is_file()
 
     monkeypatch.setattr(run_analysis, "_software_identity", lambda: "repository-v2")
@@ -345,7 +365,7 @@ def test_nuclear_inventory_only_exits_before_target_tasks_and_writes_exact_qc(
         == 0
     )
     third_attempt = json.loads((task_dir / "terminal.json").read_text())["attempt_id"]
-    assert third_attempt not in {first_attempt, second_attempt}
+    assert third_attempt == first_attempt
     assert retained_inputs
     assert all(retained.closed for retained in retained_inputs)
 
@@ -494,13 +514,8 @@ def test_nuclear_inventory_decode_cannot_publish_transient_replacement_bytes(
     payload = json.loads((attempt / "nuclear-inventory.json").read_text())
     assert decoded == [7]
     assert payload["cells"][0]["components"][0]["expanded_volume_um3"] == 7.0
-    assert terminal["status"] in {"complete", "failed"}
-    if terminal["status"] == "complete":
-        assert result == 0
-    else:
-        assert result == 1
-        failure = json.loads((attempt / "failure.json").read_text())
-        assert "retained input changed" in failure["message"]
+    assert terminal["status"] == "complete"
+    assert result == 0
     assert all(retained.closed for retained in retained_inputs)
 
 

@@ -73,7 +73,7 @@ _STATUS_KEYS: dict[str, AssessmentStatus] = {
     "e": "exclude",
     "u": "needs-adjudication",
 }
-KeyboardAction = tuple[Literal["status", "navigate", "reason"], str]
+KeyboardAction = tuple[Literal["status", "navigate", "reason", "save"], str]
 EvidenceTokenGrid = dict[str, dict[str, dict[str, str]]]
 
 
@@ -275,9 +275,15 @@ class EvidenceResolver:
         return image
 
 
-def keyboard_action(key: str) -> KeyboardAction | None:
+def keyboard_action(
+    key: str, *, shift: bool = False, control: bool = False
+) -> KeyboardAction | None:
     """Map one Tk keysym to a widget-free visual-review action."""
     normalized = key.lower()
+    if control and normalized == "s":
+        return "save", "current"
+    if key == "Return":
+        return "navigate", "previous" if shift else "next"
     if normalized in _STATUS_KEYS:
         return "status", _STATUS_KEYS[normalized]
     if normalized == "left":
@@ -287,6 +293,13 @@ def keyboard_action(key: str) -> KeyboardAction | None:
     if key in _REASON_KEYS:
         return "reason", _REASON_KEYS[key]
     return None
+
+
+def thumbnail_bounds(tab_width: int, tab_height: int) -> tuple[int, int]:
+    """Return one responsive thumbnail bound for the compact 3-by-3 grid."""
+    if tab_width < 120 or tab_height < 120:
+        return 300, 190
+    return max(1, (tab_width - 42) // 3), max(1, (tab_height - 30) // 3)
 
 
 def _checkpoint_finalization(store: ReviewStore) -> _FinalizationCheckpoint:
@@ -638,6 +651,9 @@ class ReviewApplication(ReviewController):
         self._resolver = EvidenceResolver(store.manifest)
         self._rendering = False
         self._photo_images: dict[tuple[str, str, str], ImageTk.PhotoImage] = {}
+        self._source_images: dict[tuple[str, str, str], Image.Image] = {}
+        self._image_tabs: dict[str, ttk.Frame] = {}
+        self._resize_after_id: str | None = None
         self._viewer_images: dict[tk.Toplevel, ImageTk.PhotoImage] = {}
         self._status_variable = tk.StringVar(root)
         self._reason_variables = {
@@ -653,8 +669,8 @@ class ReviewApplication(ReviewController):
 
     def _build_widgets(self) -> None:
         self._root.title("Target-blind registration QC review")
-        self._root.minsize(1050, 780)
-        outer = ttk.Frame(self._root, padding=10)
+        self._root.minsize(920, 650)
+        outer = ttk.Frame(self._root, padding=6)
         outer.grid(row=0, column=0, sticky="nsew")
         self._root.rowconfigure(0, weight=1)
         self._root.columnconfigure(0, weight=1)
@@ -662,7 +678,7 @@ class ReviewApplication(ReviewController):
         outer.columnconfigure(0, weight=1)
 
         header = ttk.Frame(outer)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         header.columnconfigure(1, weight=1)
         ttk.Label(header, textvariable=self._opaque_variable).grid(
             row=0, column=0, sticky="w"
@@ -676,21 +692,23 @@ class ReviewApplication(ReviewController):
         self._notebook.grid(row=1, column=0, sticky="nsew")
         self._image_labels: dict[tuple[str, str, str], ttk.Label] = {}
         for channel in _CHANNELS:
-            tab = ttk.Frame(self._notebook, padding=8)
+            tab = ttk.Frame(self._notebook, padding=3)
             self._notebook.add(tab, text=channel.upper())
+            self._image_tabs[channel] = tab
+            tab.bind("<Configure>", self._queue_thumbnail_resize, add="+")
             for column, stage in enumerate(_STAGES, start=1):
-                ttk.Label(tab, text=stage.title()).grid(row=0, column=column, pady=4)
+                ttk.Label(tab, text=stage.title()).grid(row=0, column=column, pady=2)
                 tab.columnconfigure(column, weight=1)
             for row, view in enumerate(_VIEWS, start=1):
-                ttk.Label(tab, text=view.upper()).grid(row=row, column=0, padx=4)
+                ttk.Label(tab, text=view.upper()).grid(row=row, column=0, padx=2)
                 tab.rowconfigure(row, weight=1)
                 for column, stage in enumerate(_STAGES, start=1):
                     label = ttk.Label(tab, anchor="center", cursor="hand2")
                     label.grid(
                         row=row,
                         column=column,
-                        padx=4,
-                        pady=4,
+                        padx=2,
+                        pady=2,
                         sticky="nsew",
                     )
                     label.bind(
@@ -702,7 +720,7 @@ class ReviewApplication(ReviewController):
                     self._image_labels[(channel, stage, view)] = label
 
         controls = ttk.LabelFrame(outer, text="Provisional assessment", padding=8)
-        controls.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        controls.grid(row=2, column=0, sticky="ew", pady=(5, 0))
         self._assessment_controls: list[ttk.Widget] = []
         for column, status in enumerate(_STATUSES):
             button = ttk.Radiobutton(
@@ -733,11 +751,15 @@ class ReviewApplication(ReviewController):
         controls.columnconfigure(4, weight=1)
 
         actions = ttk.Frame(outer)
-        actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        ttk.Button(actions, text="Previous", command=self._previous).pack(side="left")
-        self._save_button = ttk.Button(actions, text="Save", command=self._save)
+        actions.grid(row=3, column=0, sticky="ew", pady=(5, 0))
+        ttk.Button(actions, text="Previous (Shift+↵)", command=self._previous).pack(
+            side="left"
+        )
+        self._save_button = ttk.Button(
+            actions, text="Save (Ctrl+S)", command=self._save
+        )
         self._save_button.pack(side="left", padx=5)
-        ttk.Button(actions, text="Next", command=self._next).pack(side="left")
+        ttk.Button(actions, text="Next (↵)", command=self._next).pack(side="left")
         self._reconcile_button = ttk.Button(
             actions, text="Reconcile / finalize", command=self._open_reconciliation
         )
@@ -748,15 +770,12 @@ class ReviewApplication(ReviewController):
         """Render one path-free presentation after preloading all 18 images."""
         del transition
         current = self.current
-        loaded: dict[tuple[str, str, str], ImageTk.PhotoImage] = {}
+        loaded: dict[tuple[str, str, str], Image.Image] = {}
         for channel in _CHANNELS:
             for stage in _STAGES:
                 for view in _VIEWS:
                     token = current.evidence_tokens[channel][stage][view]
-                    thumbnail = self._resolver.load_thumbnail(token, (300, 190))
-                    loaded[(channel, stage, view)] = ImageTk.PhotoImage(
-                        thumbnail, master=self._root
-                    )
+                    loaded[(channel, stage, view)] = self._resolver.load_image(token)
         self._rendering = True
         try:
             self._notes_widget.configure(state="normal")
@@ -773,9 +792,8 @@ class ReviewApplication(ReviewController):
                 variable.set(reason in reasons)
             self._notes_widget.delete("1.0", "end")
             self._notes_widget.insert("1.0", notes)
-            for descriptor, photo in loaded.items():
-                self._image_labels[descriptor].configure(image=photo)
-            self._photo_images = loaded
+            self._source_images = loaded
+            self._resize_current_thumbnails()
             self._save_variable.set("Unsaved" if self.dirty else "Saved")
             control_state = "normal" if self.mutation_controls_enabled else "disabled"
             for widget in self._assessment_controls:
@@ -791,6 +809,31 @@ class ReviewApplication(ReviewController):
             )
         finally:
             self._rendering = False
+
+    def _queue_thumbnail_resize(self, _event: tk.Event[tk.Misc]) -> None:
+        """Coalesce Tk configure bursts before redrawing responsive thumbnails."""
+        if self._resize_after_id is None:
+            self._resize_after_id = self._root.after_idle(
+                self._resize_current_thumbnails
+            )
+
+    def _resize_current_thumbnails(self) -> None:
+        """Fit each current overlay into the available tab grid without distortion."""
+        self._resize_after_id = None
+        if not self._source_images:
+            return
+        photos: dict[tuple[str, str, str], ImageTk.PhotoImage] = {}
+        for channel, tab in self._image_tabs.items():
+            bounds = thumbnail_bounds(tab.winfo_width(), tab.winfo_height())
+            for stage in _STAGES:
+                for view in _VIEWS:
+                    descriptor = (channel, stage, view)
+                    image = self._source_images[descriptor].copy()
+                    image.thumbnail(bounds, Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(image, master=self._root)
+                    self._image_labels[descriptor].configure(image=photo)
+                    photos[descriptor] = photo
+        self._photo_images = photos
 
     def _sync_draft(self) -> None:
         if self.finalized:
@@ -877,10 +920,14 @@ class ReviewApplication(ReviewController):
         self._root.destroy()
 
     def _on_key(self, event: tk.Event[tk.Misc]) -> str | None:
-        if isinstance(event.widget, (tk.Text, ttk.Entry)):
-            return None
-        action = keyboard_action(event.keysym)
+        action = keyboard_action(
+            event.keysym,
+            shift=bool(event.state & 0x0001),
+            control=bool(event.state & 0x0004),
+        )
         if action is None:
+            return None
+        if isinstance(event.widget, (tk.Text, ttk.Entry)) and action[0] != "save":
             return None
         kind, value = action
         if not self.mutation_controls_enabled and kind in {"status", "reason"}:
@@ -892,6 +939,8 @@ class ReviewApplication(ReviewController):
             variable = self._reason_variables[value]
             variable.set(not variable.get())
             self._form_changed()
+        elif kind == "save":
+            self._save()
         elif value == "previous":
             self._previous()
         else:

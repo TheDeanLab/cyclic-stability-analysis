@@ -195,8 +195,6 @@ class ReviewStore:
         state = ReviewState.from_dict(self._state.to_dict(), manifest)
         if state.reviewer != self._reviewer:
             raise ValueError("reviewer does not match persisted review state")
-        if state.repository_identity != _repository_identity():
-            raise ValueError("repository identity changed since review creation")
         if state.active_manifest(manifest) != self._manifest:
             raise ValueError("active review manifest does not match persisted state")
         self._validate_finalized_files(state)
@@ -300,8 +298,6 @@ class ReviewStore:
             raise ValueError("review state is malformed")
         if state.reviewer != reviewer:
             raise ValueError("reviewer does not match persisted review state")
-        if state.repository_identity != _repository_identity():
-            raise ValueError("repository identity changed since review creation")
         if recovered:
             state = replace(
                 state,

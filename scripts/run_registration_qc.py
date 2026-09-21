@@ -49,11 +49,16 @@ def _ordered_process_map(
         return tuple(executor.map(worker, items, chunksize=1))
 
 
-def _run_qc_job(job: tuple[Any, tuple[Any, ...], Path]) -> Any:
+def _run_qc_job(job: tuple[Any, tuple[Any, ...], Path, int]) -> Any:
     """Analyze one independently publishable marker-cell QC unit."""
+    cell, artifacts, output_dir, native_threads = job
+    from cyexm.runtime import NativeThreadConfig, configure_native_threads
+
+    configure_native_threads(
+        NativeThreadConfig(itk_threads=native_threads, blas_threads=native_threads)
+    )
     from cyclic_stability.registration_qc import analyze_registration_qc
 
-    cell, artifacts, output_dir = job
     return analyze_registration_qc(cell, artifacts, output_dir)
 
 
@@ -63,6 +68,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--correspondence", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--max-workers", type=int, default=1)
+    parser.add_argument("--native-threads", type=int, default=1)
     parser.add_argument(
         "--cohort", action="append", default=[], help="limit QC to these cohorts"
     )
@@ -75,7 +81,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     from cyexm.runtime import NativeThreadConfig, configure_native_threads
 
-    configure_native_threads(NativeThreadConfig(itk_threads=1, blas_threads=1))
+    configure_native_threads(
+        NativeThreadConfig(
+            itk_threads=args.native_threads, blas_threads=args.native_threads
+        )
+    )
 
     from cyclic_stability.config import load_analysis_config
     from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
@@ -101,12 +111,13 @@ def main(argv: list[str] | None = None) -> int:
             cell,
             artifacts,
             args.run_dir / "cells" / cell.cohort / cell.cell_id,
+            args.native_threads,
         )
         for cell, artifacts in validated
     )
     print(
         f"progress: queued registration QC for {len(jobs)} cells with "
-        f"{args.max_workers} worker(s)",
+        f"{args.max_workers} worker(s), {args.native_threads} native thread(s) each",
         file=sys.stderr,
         flush=True,
     )

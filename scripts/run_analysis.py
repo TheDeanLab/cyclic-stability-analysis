@@ -38,6 +38,24 @@ if TYPE_CHECKING:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+_THREAD_ENVIRONMENT = (
+    "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+def _export_native_threads(native_threads: int) -> None:
+    """Set native thread variables before importing scientific runtime modules."""
+    if isinstance(native_threads, bool) or native_threads < 1:
+        raise ValueError("native_threads must be a positive integer")
+    value = str(native_threads)
+    for name in _THREAD_ENVIRONMENT:
+        os.environ[name] = value
+
 
 @dataclass(frozen=True, slots=True)
 class NuclearInventoryRequest:
@@ -87,6 +105,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-index", type=int)
     parser.add_argument("--force-task", action="store_true")
     parser.add_argument("--nuclear-inventory-only", action="store_true")
+    parser.add_argument(
+        "--golgi-crop-preflight-only",
+        action="store_true",
+        help="write target-specific coarse crop evidence without running Golgi metrics",
+    )
     parser.add_argument(
         "--progress-interval-s",
         type=float,
@@ -468,9 +491,14 @@ def _software_identity() -> str:
 def main(argv: list[str] | None = None) -> int:
     """Initialize one immutable run and execute its selected deterministic task set."""
     args = _parser().parse_args(argv)
-    # These imports do not import a scientific backend.  Native threads are set
-    # immediately after profile validation and before any task analyzer is imported.
-    from cyclic_stability.config import load_analysis_config, load_execution_profile
+    # Parse the profile through the lightweight configuration module, then set the
+    # environment before runner/task imports can transitively import NumPy/SciPy.
+    from cyclic_stability.config import load_execution_profile
+
+    profile = load_execution_profile(args.execution_profile)
+    _export_native_threads(profile.native_threads)
+
+    from cyclic_stability.config import load_analysis_config
     from cyclic_stability.runner import initialize_run, run_tasks
     from cyclic_stability.task import (
         ArtifactTask,
@@ -551,7 +579,6 @@ def main(argv: list[str] | None = None) -> int:
     config = load_analysis_config(
         args.analysis_config, args.correspondence, args.qc_decisions
     )
-    profile = load_execution_profile(args.execution_profile)
     configure_native_threads(profile.native_threads)
     if profile.mode == "slurm" and args.task_index is None:
         raise ValueError("SLURM execution requires --task-index")
@@ -569,6 +596,44 @@ def main(argv: list[str] | None = None) -> int:
         raise KeyError(
             "--cell does not match a configured cell in the requested cohort"
         )
+    if args.golgi_crop_preflight_only:
+        if (
+            args.nuclear_inventory_only
+            or args.pilot_first_accepted
+            or args.task_index is not None
+        ):
+            raise ValueError(
+                "--golgi-crop-preflight-only cannot be combined with inventory, pilot, or task-index selection"
+            )
+        if cohorts != ("golgi",) or selected is None:
+            raise ValueError(
+                "--golgi-crop-preflight-only requires --cohort golgi and exactly one --cell"
+            )
+        from cyclic_stability.cyexm_artifacts import resolve_round_artifacts
+        from cyclic_stability.golgi import (
+            _golgi_crop_plan_from_artifacts,
+            _require_compact_crop,
+            _write_crop_preflight,
+        )
+        from cyclic_stability.nuclear import _accepted_rounds
+
+        artifacts = tuple(
+            resolve_round_artifacts(round_spec) for round_spec in selected.rounds
+        )
+        accepted = _accepted_rounds(selected, config)
+        plan = _golgi_crop_plan_from_artifacts(
+            {artifact.acquisition_round: artifact for artifact in artifacts},
+            accepted,
+            config,
+        )
+        preflight_dir = (args.run_dir or args.results_root) / "golgi-crop-preflight"
+        _write_crop_preflight(preflight_dir, selected, accepted, plan)
+        print(
+            "wrote Golgi crop preflight "
+            f"({plan.crop.retained_fraction:.1%} retained): {preflight_dir}"
+        )
+        _require_compact_crop(plan, preflight_dir)
+        return 0
     if args.pilot_first_accepted:
         selected = _pilot_cell(config, cohorts)
     tasks = build_tasks(

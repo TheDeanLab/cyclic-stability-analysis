@@ -15,7 +15,6 @@ from pathlib import Path
 import numpy as np
 from cyexm.metrics import read_metrics
 from cyexm.registration.backend import AntsRegistrationBackend
-from cyexm.runtime import NativeThreadConfig
 from numpy.typing import NDArray
 from scipy.linalg import polar, rq
 from scipy.spatial.transform import Rotation
@@ -579,7 +578,7 @@ def analyze_registration_qc(
         raise ValueError("cell and artifact acquisition-round inventories disagree")
     resolution = theoretical_resolution(0.640, 1.4, 1.515, 4.5)
     spacing = (0.1083, 0.1083, 0.3)
-    backend = AntsRegistrationBackend(NativeThreadConfig(itk_threads=1, blas_threads=1))
+    backend = AntsRegistrationBackend()
     registration_rows: list[dict[str, object]] = []
     deformation_rows: list[dict[str, object]] = []
     decision_requests: list[dict[str, object]] = []

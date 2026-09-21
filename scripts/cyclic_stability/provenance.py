@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar, Protocol
@@ -85,6 +87,49 @@ def channel_tiff_paths(round_spec: RoundSpec) -> tuple[tuple[str, Path], ...]:
     )
 
 
+def attested_pretransform_channels(round_spec: RoundSpec) -> frozenset[str]:
+    """Return moving channels covered by a complete explicit rotation attestation.
+
+    A one-off, target-blind pre-rotation intentionally changes TIFF pixels before
+    normal Cy-ExM registration. It is admissible only when the adjacent
+    ``rotation-seed.json`` declares every moving channel and the finite rotation
+    operation. Reference rounds and incomplete or malformed records retain the
+    ordinary exact ND2/TIFF requirement.
+    """
+    if round_spec.acquisition_round == 2:
+        return frozenset()
+    record = round_spec.tiff_directory.parent / "rotation-seed.json"
+    try:
+        payload = json.loads(record.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return frozenset()
+    expected = dict(channel_tiff_paths(round_spec))
+    declared = payload.get("rotated_channels") if isinstance(payload, dict) else None
+    angle = payload.get("rotation_xy_deg") if isinstance(payload, dict) else None
+    source_directory = (
+        payload.get("source_directory") if isinstance(payload, dict) else None
+    )
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("rotation_about") != "image center"
+        or payload.get("interpolation") != "linear"
+        or payload.get("fill_value") != 0
+        or not isinstance(angle, (int, float))
+        or isinstance(angle, bool)
+        or not math.isfinite(angle)
+        or angle == 0
+        or not isinstance(source_directory, str)
+        or not Path(source_directory).is_dir()
+        or not isinstance(declared, list)
+        or {item for item in declared if isinstance(item, str)}
+        != {path.name for path in expected.values()}
+        or len(declared) != len(expected)
+    ):
+        return frozenset()
+    return frozenset(expected)
+
+
 def _audit_planes(path: Path) -> tuple[int, ...]:
     """Select first, middle, and final TIFF planes as deterministic audit anchors."""
     try:
@@ -120,4 +165,10 @@ def compare_nd2_export(
     return tuple(matches)
 
 
-__all__ = ["ChannelMatch", "PlaneReader", "channel_tiff_paths", "compare_nd2_export"]
+__all__ = [
+    "ChannelMatch",
+    "PlaneReader",
+    "attested_pretransform_channels",
+    "channel_tiff_paths",
+    "compare_nd2_export",
+]

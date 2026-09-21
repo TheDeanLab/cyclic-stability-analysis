@@ -11,10 +11,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tifffile
-from skimage.measure import mesh_surface_area
 from cyclic_stability import nuclear
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
-from cyclic_stability.morphology import threshold_ensemble
 from cyclic_stability.models import (
     AnalysisConfig,
     CellSpec,
@@ -22,6 +20,7 @@ from cyclic_stability.models import (
     NuclearConfig,
     QcDecision,
 )
+from cyclic_stability.morphology import threshold_ensemble
 from cyclic_stability.nuclear import (
     LaminProfileRow,
     _aggregate_ensemble_rows,
@@ -34,6 +33,7 @@ from cyclic_stability.nuclear import (
     consensus_nuclear_surface,
     lamin_normal_profiles,
 )
+from skimage.measure import mesh_surface_area
 from synthetic import (
     NUCLEAR_CONFIG,
     SPACING,
@@ -957,6 +957,38 @@ def test_curvature_coverage_uses_exact_ninety_nine_percent_rule() -> None:
             "mean_curvature_p75_um_inverse",
         )
     )
+
+
+def test_surface_realization_discards_nonfinite_curvature_vertices_when_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local curvature interpolation failures must not invalidate an entire nucleus."""
+    dapi, _ = synthetic_nucleus(radius_um=5.0, shell_width_um=0.4)
+    mask = dapi > 0
+    vertices, _ = _surface_from_mask(mask, (1.0, 1.0, 1.0))
+    original = nuclear.map_coordinates
+    calls = 0
+
+    def partial_curvature(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        values = original(*args, **kwargs)
+        if calls == 4:
+            values = np.asarray(values, dtype=np.float64)
+            values[::2] = np.nan
+        return values
+
+    monkeypatch.setattr(nuclear, "map_coordinates", partial_curvature)
+    normals, _, curvature = _surface_normals_and_curvature(
+        mask, vertices, (1.0, 1.0, 1.0), allow_degenerate=True
+    )
+
+    assert np.all(np.isfinite(normals))
+    assert np.any(~np.isfinite(curvature))
+
+    calls = 0
+    with pytest.raises(ValueError, match="curvature interpolation"):
+        _surface_normals_and_curvature(mask, vertices, (1.0, 1.0, 1.0))
 
 
 def test_ridge_requires_strict_sbr_and_rejects_search_endpoints() -> None:

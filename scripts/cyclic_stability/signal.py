@@ -49,18 +49,21 @@ def raw_structure_roi(
     This shared Task 4 helper deliberately never receives a target image.  A
     per-round consensus call avoids cross-round native-grid assumptions.
     """
-    from cyclic_stability.nuclear import consensus_nuclear_surface
+    from cyclic_stability.nuclear import _segmented_dapi_foreground_mask
 
-    consensus = consensus_nuclear_surface(
+    # Raw-target retention needs a stable DAPI spatial reference, not a
+    # morphology-admissible nuclear population. Every DAPI foreground fragment
+    # is retained here; component count and geometry remain exclusive to the
+    # registered nuclear-morphology workflow and its QC output.
+    mask = _segmented_dapi_foreground_mask(
         {config.reference_acquisition_round: raw_dapi_zyx},
         config.voxel_spacing_xyz_um,
         config.nuclear,
-        config.nominal_expansion_factor,
     )
     if cohort == "lamin":
-        return consensus.mask_zyx
+        return mask
     if cohort in {"golgi", "lamp1"}:
-        return ~consensus.mask_zyx
+        return ~mask
     raise ValueError(f"unsupported cohort for raw signal ROI: {cohort}")
 
 

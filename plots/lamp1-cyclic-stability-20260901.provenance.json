@@ -1,0 +1,56 @@
+{
+  "run_dirs": [
+    "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/20260831-v1"
+  ],
+  "cell_ids": [
+    "LAMP1-verified-alpha",
+    "LAMP1-verified-beta",
+    "LAMP1-verified-delta",
+    "LAMP1-verified-epsilon",
+    "LAMP1-verified-gamma"
+  ],
+  "cell_count": 5,
+  "within_cell_ensemble_summary": "median",
+  "ensemble_coordinates": {
+    "smoothing_sigma_um": [
+      0.35,
+      0.7,
+      1.4
+    ],
+    "detection_sbr": [
+      3.0,
+      4.0,
+      5.0
+    ]
+  },
+  "summary_statistic": "mean across five cells",
+  "confidence_interval": {
+    "method": "percentile bootstrap over biological cells per round",
+    "level": 0.95,
+    "replicates": 10000,
+    "seed": 20260830
+  },
+  "comparison_rounds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "morphology_rounds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "round_2_role": "fixed reference and morphology-normalization baseline",
+  "panels": [
+    "matched fraction",
+    "lost and new fractions",
+    "median normalized displacement",
+    "object count relative to round 2",
+    "median volume relative to round 2",
+    "median equivalent diameter relative to round 2"
+  ]
+}

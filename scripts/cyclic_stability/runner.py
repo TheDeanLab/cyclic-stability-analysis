@@ -215,7 +215,7 @@ def initialize_run(
     config_digest: str,
     results_root: Path | None = None,
 ) -> None:
-    """Snapshot immutable run configuration and atomically publish latest pointer."""
+    """Record run configuration and atomically publish the latest-run pointer."""
     copies = {
         "analysis.yaml": analysis_config,
         "correspondence.csv": correspondence,
@@ -257,8 +257,8 @@ def initialize_run_from_bytes(
     Raises
     ------
     ValueError
-        If names are incomplete, an existing uninitialized root contains anything
-        other than the current task scaffold, or frozen state does not match.
+        If names are incomplete or an existing uninitialized root contains
+        anything other than the current task scaffold.
     """
     expected_names = {
         "analysis.yaml",
@@ -279,37 +279,9 @@ def initialize_run_from_bytes(
     with lock_path.open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if (run_dir / "run.json").exists():
-            try:
-                existing = json.loads(
-                    (run_dir / "run.json").read_text(encoding="utf-8")
-                )
-            except (OSError, json.JSONDecodeError) as error:
-                raise ValueError(
-                    "existing run has no valid immutable run record"
-                ) from error
-            if (
-                set(existing)
-                != {
-                    "config_digest",
-                    "config_sha256",
-                    "cyexm_commit",
-                    "initialized_at",
-                    "output_schema_version",
-                }
-                or existing.get("config_digest") != config_digest
-                or existing.get("config_sha256") != digests
-                or existing.get("cyexm_commit")
-                != "f6e0de36cd7f6b5e85f093884c2cf224225f4ec2"
-                or existing.get("output_schema_version") != OUTPUT_SCHEMA_VERSION
-                or any(
-                    not (config_dir / name).is_file()
-                    or _sha256_bytes((config_dir / name).read_bytes()) != digest
-                    for name, digest in digests.items()
-                )
-            ):
-                raise ValueError(
-                    "existing frozen run identity does not match immutable inputs"
-                )
+            # Existing run metadata is informational. Task-level output validation,
+            # not a historical configuration snapshot, determines whether work can
+            # resume after unrelated repository or configuration edits.
             return
         if run_dir.exists():
             entries = {path.name for path in run_dir.iterdir()}

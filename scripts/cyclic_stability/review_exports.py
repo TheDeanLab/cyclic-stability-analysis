@@ -18,6 +18,7 @@ from cyclic_stability.review_models import (
     Adjudication,
     Assessment,
     CaseHistory,
+    CaseKey,
     CaseRevision,
     EvidenceIdentity,
     Presentation,
@@ -52,12 +53,6 @@ FINAL_COLUMNS = (
     "reasons",
     "reviewer",
     "reviewed_at",
-)
-_EXPECTED_CASE_KEYS = frozenset(
-    (cohort, f"Cell{cell_number}", acquisition_round)
-    for cohort in ("golgi", "lamin")
-    for cell_number in range(1, 6)
-    for acquisition_round in (1, 3, 4, 5)
 )
 _TECHNICAL_AFFINE_REFLECTION_REASONS = frozenset(
     {
@@ -509,8 +504,9 @@ def _final_rows(state: ReviewState, active: ReviewManifest) -> list[dict[str, ob
     histories = tuple(
         sorted(state.case_histories.values(), key=lambda item: item.case_key)
     )
-    if len(histories) != 40 or len({item.case_key for item in histories}) != 40:
-        raise ValueError("review must contain exactly 40 original cases")
+    expected_case_keys = {item.case_key for item in active.case_revisions}
+    if {item.case_key for item in histories} != expected_case_keys:
+        raise ValueError("review case histories do not match the active manifest")
     presentations = {item.opaque_id: item for item in active.visual_presentations}
     if any(
         assessment_history[-1].status == "needs-registration-improvement"
@@ -552,7 +548,9 @@ def _validate_initial_repeats(manifest: ReviewManifest) -> None:
 
 
 def _read_final_csv(
-    path: Path, expected: Sequence[Mapping[str, object]] | None = None
+    path: Path,
+    expected: Sequence[Mapping[str, object]] | None = None,
+    expected_case_keys: set[CaseKey] | None = None,
 ) -> list[dict[str, str]]:
     try:
         with path.open(newline="", encoding="utf-8") as handle:
@@ -584,8 +582,13 @@ def _read_final_csv(
         ):
             raise ValueError("final decision CSV contains invalid decisions")
         keys.add(key)
-    if keys != _EXPECTED_CASE_KEYS:
-        raise ValueError("final decision CSV must contain 40 unique cases")
+    if expected_case_keys is not None:
+        expected_keys = {
+            (item.cohort, item.cell_id, item.acquisition_round)
+            for item in expected_case_keys
+        }
+        if keys != expected_keys:
+            raise ValueError("final decision CSV does not match the active manifest")
     if expected is not None:
         expected_rows = [
             {column: str(row[column]) for column in FINAL_COLUMNS} for row in expected
@@ -608,14 +611,15 @@ def finalize_decisions(
     active = state.active_manifest(manifest)
     _validate_current_evidence(active)
     rows = _final_rows(state, active)
+    expected_case_keys = {item.case_key for item in active.case_revisions}
     write_operational_exports(state, manifest, review_dir)
     output = review_dir / "qc-decisions.csv"
     previous = review_dir / "qc-decisions.previous.csv"
     if output.exists():
-        _read_final_csv(output)
+        _read_final_csv(output, expected_case_keys=expected_case_keys)
         _atomic_bytes(previous, output.read_bytes())
     _atomic_csv(output, FINAL_COLUMNS, rows)
-    _read_final_csv(output, rows)
+    _read_final_csv(output, rows, expected_case_keys)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     store.record_export(digest)
     return output

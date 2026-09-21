@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+from cyclic_stability import morphology
 from cyclic_stability.models import AnalysisConfig
 from cyclic_stability.morphology import (
     SurfaceMetrics,
@@ -130,6 +131,43 @@ def test_identical_nonempty_surfaces_have_exact_agreement() -> None:
     assert result.normalized_distance_p95 == 0.0
     assert result.surface_dice == {1.0: 1.0}
     assert result.jaccard == 1.0
+
+
+def test_surface_metrics_use_fixed_grid_distances_without_mesh_nearest_neighbors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Large production masks must not construct mesh vertices or a k-d tree."""
+    fixed = single_voxel((9, 9, 9), (4, 4, 4))
+    moving = single_voxel((9, 9, 9), (4, 4, 6))
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("mesh nearest-neighbor path must not run")
+
+    monkeypatch.setattr(morphology, "cKDTree", forbidden, raising=False)
+
+    result = resolution_surface_metrics(fixed, moving, SPACING, RESOLUTION, 1.0)
+
+    assert result.normalized_distance_p95 == pytest.approx(0.7172131)
+
+
+def test_surface_metrics_do_not_duplicate_large_directed_distance_vectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pooled p95 must not concatenate two potentially huge surface vectors."""
+    fixed = single_voxel((9, 9, 9), (4, 4, 4))
+    moving = single_voxel((9, 9, 9), (4, 4, 6))
+
+    original = morphology.np.concatenate
+
+    def forbid_large_vectors(values, *args, **kwargs):
+        if sum(np.asarray(value).size for value in values) > 5:
+            raise AssertionError("surface distances must not be concatenated")
+        return original(values, *args, **kwargs)
+
+    monkeypatch.setattr(morphology.np, "concatenate", forbid_large_vectors)
+    result = resolution_surface_metrics(fixed, moving, SPACING, RESOLUTION, 1.0)
+
+    assert result.normalized_distance_p95 == pytest.approx(0.7172131)
 
 
 @pytest.mark.parametrize("invalid_value", (np.nan, np.inf, -1.0, 0.5, 2.0))

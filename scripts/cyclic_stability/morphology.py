@@ -11,9 +11,7 @@ from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import gaussian_filter
-from scipy.spatial import cKDTree
-from skimage.measure import marching_cubes
+from scipy.ndimage import binary_erosion, distance_transform_edt, gaussian_filter
 
 from cyclic_stability.images import BackgroundSummary, robust_background
 from cyclic_stability.units import ResolutionReference
@@ -168,18 +166,11 @@ def threshold_ensemble(
     return tuple(members)
 
 
-def _surface_vertices_xyz(
-    mask_zyx: NDArray[np.bool_], spacing_xyz_um: tuple[float, float, float]
-) -> NDArray[np.float64]:
-    """Return padded binary-mask marching-cubes vertices in physical XYZ order."""
-    mask = validated_binary_mask(mask_zyx, "surface mask")
-    if mask.ndim != 3:
-        raise ValueError("surface masks must be 3D ZYX volumes")
-    sx, sy, sz = spacing_xyz_um
-    padded = np.pad(mask.astype(np.float32), 1)
-    vertices_zyx, _, _, _ = marching_cubes(padded, level=0.5, spacing=(sz, sy, sx))
-    vertices_zyx -= np.array((sz, sy, sx))
-    return vertices_zyx[:, ::-1]
+def _surface_voxels(mask_zyx: NDArray[np.bool_]) -> NDArray[np.bool_]:
+    """Return the 26-connected exterior boundary voxels of one binary mask."""
+    return mask_zyx & ~binary_erosion(
+        mask_zyx, structure=np.ones((3, 3, 3), dtype=bool), border_value=0
+    )
 
 
 def _tolerances(tolerance_units: float | tuple[float, ...]) -> tuple[float, ...]:
@@ -231,8 +222,15 @@ def resolution_surface_metrics(
             jaccard=0.0,
             comparison_status="fixed-empty" if fixed_empty else "moving-empty",
         )
-    fixed_xyz = _surface_vertices_xyz(fixed, spacing)
-    moving_xyz = _surface_vertices_xyz(moving, spacing)
+    if np.array_equal(fixed, moving):
+        return SurfaceMetrics(
+            fixed_to_moving_normalized_distance_p95=0.0,
+            moving_to_fixed_normalized_distance_p95=0.0,
+            normalized_distance_p95=0.0,
+            surface_dice=MappingProxyType({tolerance: 1.0 for tolerance in tolerances}),
+            jaccard=1.0,
+            comparison_status="both-nonempty",
+        )
     reference_xyz = np.array(
         (
             resolution.lateral_expanded_um,
@@ -243,11 +241,22 @@ def resolution_surface_metrics(
     )
     if not np.all(np.isfinite(reference_xyz)) or np.any(reference_xyz <= 0.0):
         raise ValueError("resolution reference must be finite and positive")
-    fixed_normalized = fixed_xyz / reference_xyz
-    moving_normalized = moving_xyz / reference_xyz
-    fixed_to_moving = cKDTree(moving_normalized).query(fixed_normalized, k=1)[0]
-    moving_to_fixed = cKDTree(fixed_normalized).query(moving_normalized, k=1)[0]
-    distances = np.concatenate((fixed_to_moving, moving_to_fixed))
+    fixed_surface = _surface_voxels(fixed)
+    moving_surface = _surface_voxels(moving)
+    sx, sy, sz = spacing
+    normalized_sampling_zyx = (
+        sz / reference_xyz[2],
+        sy / reference_xyz[1],
+        sx / reference_xyz[0],
+    )
+    fixed_to_moving = distance_transform_edt(
+        ~moving_surface, sampling=normalized_sampling_zyx
+    )[fixed_surface]
+    moving_to_fixed = distance_transform_edt(
+        ~fixed_surface, sampling=normalized_sampling_zyx
+    )[moving_surface]
+    fixed_p95 = float(np.percentile(fixed_to_moving, 95.0))
+    moving_p95 = float(np.percentile(moving_to_fixed, 95.0))
     dice = {
         tolerance: float(
             (
@@ -260,13 +269,11 @@ def resolution_surface_metrics(
     }
     union = np.logical_or(fixed, moving).sum()
     return SurfaceMetrics(
-        fixed_to_moving_normalized_distance_p95=float(
-            np.percentile(fixed_to_moving, 95.0)
-        ),
-        moving_to_fixed_normalized_distance_p95=float(
-            np.percentile(moving_to_fixed, 95.0)
-        ),
-        normalized_distance_p95=float(np.percentile(distances, 95.0)),
+        fixed_to_moving_normalized_distance_p95=fixed_p95,
+        moving_to_fixed_normalized_distance_p95=moving_p95,
+        # The conservative worst directed p95 avoids materializing a second,
+        # pooled surface-distance vector for very large fixed-grid masks.
+        normalized_distance_p95=max(fixed_p95, moving_p95),
         surface_dice=MappingProxyType(dice),
         jaccard=float(np.logical_and(fixed, moving).sum() / union),
         comparison_status="both-nonempty",

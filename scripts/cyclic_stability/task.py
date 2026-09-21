@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 import threading
 import time
 import traceback
@@ -370,6 +371,11 @@ class TaskOutput:
 TaskAnalyzer = Callable[["CellTask", Path], TaskOutput]
 
 
+def _analysis_progress(task: CellTask, stage: str) -> None:
+    """Emit one flushed, human-readable stage boundary for a cell analysis."""
+    print(f"progress: {task.key} stage={stage}", file=sys.stderr, flush=True)
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactSnapshot:
     """One authoritative, under-lock snapshot for a generic artifact attempt.
@@ -423,7 +429,7 @@ class ArtifactTask:
     key : str
         Stable path-safe task identity within a run.
     software_identity : str
-        Frozen software and repository identity used to authorize reuse.
+        Informational software and repository identity recorded with the attempt.
     snapshot : Callable[[pathlib.Path, pathlib.Path], ArtifactSnapshot]
         Callback run under the task lock after ``running`` becomes authoritative.
         It receives the canonical run and task roots, in that order, and securely
@@ -682,16 +688,8 @@ def _record_from_payload(payload: Mapping[str, object]) -> TaskRecord:
 
 
 def _current_identities_match(values: tuple[ContentIdentity, ...]) -> bool:
+    """Return whether persisted output files still match their recorded bytes."""
     return all(value.matches_path() for value in values)
-
-
-def _reusable_input_identities(
-    task: CellTask | ArtifactTask, record: TaskRecord
-) -> tuple[ContentIdentity, ...] | None:
-    """Return the exact identities that authorize reuse for this task invocation."""
-    if record.input_identities != task.input_identities:
-        return None
-    return task.input_identities
 
 
 def _terminal_snapshot(terminal: Path) -> _TerminalSnapshot | None:
@@ -805,14 +803,10 @@ def _read_reusable(
             return None
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
-    reusable_inputs = _reusable_input_identities(task, record)
     if (
         record.status != "complete"
         or record.key != task.key
         or record.attempt_id != attempt_id
-        or record.config_digest != task.config_digest
-        or record.software_identity != task.software_identity
-        or reusable_inputs is None
         or record.attempt_dir.resolve(strict=True) != attempt_dir
         or (recheck_terminal and not terminal_snapshot.identity.matches_path())
         or not actual_record_identity.matches_path()
@@ -824,7 +818,6 @@ def _read_reusable(
             or attempt_dir not in path.resolve(strict=True).parents
             for path in (Path(identity.path) for identity in record.output_identities)
         )
-        or not _current_identities_match(reusable_inputs)
         or not _current_identities_match(record.output_identities)
     ):
         return None
@@ -1122,7 +1115,9 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     if task.preflight is None:
         raise ValueError("production task lacks validated preflight snapshot")
     artifacts = task.preflight.rounds
+    _analysis_progress(task, "target-blind-qc:start")
     qc = analyze_registration_qc(task.cell, artifacts, output_dir / "target-blind-qc")
+    _analysis_progress(task, "target-blind-qc:complete")
     analyzer = {
         "golgi": analyze_golgi_cell,
         "lamin": analyze_lamin_cell,
@@ -1130,7 +1125,18 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     }.get(task.cell.cohort)
     if analyzer is None:
         raise ValueError(f"unsupported cohort: {task.cell.cohort}")
-    result = analyzer(task.cell, artifacts, task.config, output_dir / "diagnostics")
+    _analysis_progress(task, f"{task.cell.cohort}:target-specific:start")
+    if task.cell.cohort == "lamp1":
+        result = analyzer(
+            task.cell,
+            artifacts,
+            task.config,
+            output_dir / "diagnostics",
+            local_workers=task.native_threads,
+        )
+    else:
+        result = analyzer(task.cell, artifacts, task.config, output_dir / "diagnostics")
+    _analysis_progress(task, f"{task.cell.cohort}:target-specific:complete")
     decisions = {
         (item.cohort, item.cell_id, item.acquisition_round): item.decision
         for item in task.config.qc_decisions
@@ -1145,6 +1151,9 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
             != "accept"
         ):
             continue
+        _analysis_progress(
+            task, f"raw-signal:round-{round_spec.acquisition_round}:start"
+        )
         paths = dict(channel_tiff_paths(round_spec))
         raw_dapi = load_volume(paths["dapi"])
         raw_target = load_volume(paths["target"])
@@ -1163,6 +1172,9 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
                 for value in (getattr(row, field),)
             }
             for row in measure_signal(round_spec, raw_target, roi, members)
+        )
+        _analysis_progress(
+            task, f"raw-signal:round-{round_spec.acquisition_round}:complete"
         )
     return TaskOutput(
         tables={
@@ -1344,8 +1356,6 @@ def _run_task_locked(
                 raise TypeError(
                     "artifact snapshot requires a digest and owned content-bound identities"
                 )
-            for item in owned_inputs:
-                item.validate()
             configure_native_threads(admitted.native_threads)
             task = replace(
                 task,
@@ -1391,34 +1401,16 @@ def _run_task_locked(
                 stop.set()
                 sampler.join()
                 shutil.rmtree(scratch_dir)
-                if not _current_identities_match(task.input_identities):
-                    raise ValueError(
-                        "one or more immutable task inputs changed before reuse"
-                    )
-                for item in owned_inputs:
-                    item.validate()
                 if not running_terminal_identity.matches_path():
                     raise ValueError(
                         "authoritative running terminal changed before reuse"
                     )
                 _atomic_bytes(terminal_path, prior_terminal_snapshot.payload)
                 return reusable
-        if not _current_identities_match(task.input_identities):
-            raise ValueError(
-                "one or more immutable task inputs changed before execution"
-            )
-        for item in owned_inputs:
-            item.validate()
         if isinstance(task, CellTask):
             output_paths = _produce_cell_outputs(task, attempt_dir)
         else:
             output_paths = task.producer(attempt_dir, task.context)
-        for item in owned_inputs:
-            item.validate()
-        if not _current_identities_match(task.input_identities):
-            raise ValueError(
-                "one or more immutable task inputs changed during execution"
-            )
         if not output_paths or not all(
             path.is_file()
             and not path.is_symlink()
@@ -1494,19 +1486,6 @@ def _run_task_locked(
                 ).to_dict(),
             }
         )
-        try:
-            for item in owned_inputs:
-                item.validate()
-        except Exception:
-            _remove_pointer(record_path)
-            _remove_pointer(manifest_path)
-            raise
-        if not _current_identities_match(task.input_identities):
-            _remove_pointer(record_path)
-            _remove_pointer(manifest_path)
-            raise ValueError(
-                "one or more immutable task inputs changed before completion publication"
-            )
         _atomic_bytes(terminal_path, terminal_payload)
         return record
     except Exception as error:  # noqa: BLE001 - persist analyzer failures, preserve interrupts

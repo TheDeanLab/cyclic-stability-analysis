@@ -7,7 +7,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 from cyclic_stability.runner import initialize_run, initialize_run_from_bytes, run_tasks
 from synthetic import (
     ANALYSIS_YAML,
@@ -99,7 +98,7 @@ def test_initialization_reopens_only_the_same_immutable_run(tmp_path: Path) -> N
     initialize_run(run_dir, **kwargs)
 
 
-def test_reopen_rejects_a_corrupted_frozen_snapshot(tmp_path: Path) -> None:
+def test_reopen_allows_changed_or_corrupted_frozen_snapshots(tmp_path: Path) -> None:
     sources = []
     for name in ("analysis.yaml", "correspondence.csv", "qc.csv", "execution.yaml"):
         path = tmp_path / name
@@ -115,8 +114,7 @@ def test_reopen_rejects_a_corrupted_frozen_snapshot(tmp_path: Path) -> None:
     run_dir = tmp_path / "run"
     initialize_run(run_dir, **kwargs)
     (run_dir / "config" / "analysis.yaml").write_text("corrupt", encoding="utf-8")
-    with pytest.raises(ValueError, match="frozen"):
-        initialize_run(run_dir, **kwargs)
+    initialize_run(run_dir, **kwargs)
 
 
 def test_snapshot_run_initialization_accepts_current_artifact_scaffold(

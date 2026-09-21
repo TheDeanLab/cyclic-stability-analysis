@@ -98,6 +98,14 @@ def test_analysis_config_parses_multinuclear_bounds(
     assert config.nuclear.maximum_face_contact_fraction == 0.10
 
 
+def test_checked_in_lamp1_matching_radius_is_two_resolution_units() -> None:
+    """The approved LAMP1 workflow must use the visually reviewed matching gate."""
+    analysis = Path(__file__).parents[1] / "config" / "analysis.yaml"
+    payload = yaml.safe_load(analysis.read_text(encoding="utf-8"))
+
+    assert payload["lysosome"]["match_resolution_units"] == 2.0
+
+
 def test_analysis_config_uses_exact_registered_grid_and_digest(
     config_files: tuple[Path, ...],
 ) -> None:

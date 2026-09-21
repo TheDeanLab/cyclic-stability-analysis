@@ -148,6 +148,29 @@ def test_final_csv_has_one_binary_row_per_biological_case(tmp_path: Path) -> Non
     assert {row["decision"] for row in rows} <= {"accept", "exclude"}
 
 
+def test_lamp1_final_csv_uses_its_four_case_manifest(tmp_path: Path) -> None:
+    """A complete LAMP1 moving-round review is not a truncated 40-case cohort."""
+    qc_root = write_review_qc_fixture(
+        tmp_path / "lamp1-qc", cohorts=("lamp1",), cell_count=1
+    )
+    manifest = build_review_manifest(qc_root, seed=7)
+    store = ReviewStore.create(
+        tmp_path / "lamp1-review", manifest, "Reviewer", now=fixed_clock
+    )
+    _complete_visual_assessments(store, manifest)
+
+    output = finalize_decisions(store, manifest, tmp_path / "lamp1-review")
+
+    rows = _read_rows(output)
+    assert len(rows) == 4
+    assert {(row["cohort"], int(row["acquisition_round"])) for row in rows} == {
+        ("lamp1", 1),
+        ("lamp1", 3),
+        ("lamp1", 4),
+        ("lamp1", 5),
+    }
+
+
 def test_operational_exports_are_deterministic_unblinded_and_latest_only(
     tmp_path: Path,
 ) -> None:
@@ -688,10 +711,10 @@ def test_finalization_rejects_overlay_symlink_without_reading_target(
     assert target_reads == []
 
 
-def test_finalization_revalidates_repository_identity(
+def test_finalization_allows_repository_identity_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Repository drift after review creation blocks a provenance-bound export."""
+    """Repository drift after review creation does not block export."""
     store, manifest = completed_review_store(tmp_path)
     monkeypatch.setattr(
         review_store,
@@ -699,8 +722,9 @@ def test_finalization_revalidates_repository_identity(
         lambda: RepositoryIdentity("a" * 40, False, None),
     )
 
-    with pytest.raises(ValueError, match="repository identity changed"):
-        finalize_decisions(store, manifest, tmp_path / "review")
+    decision_path = finalize_decisions(store, manifest, tmp_path / "review")
+
+    assert decision_path.exists()
 
 
 def test_finalization_cannot_write_outside_the_owned_review_directory(
@@ -805,7 +829,7 @@ def test_reopened_csv_requires_the_exact_biological_case_set(
         original(path, columns, materialized)
 
     monkeypatch.setattr(review_exports, "_atomic_csv", substitute_case)
-    with pytest.raises(ValueError, match="40 unique cases"):
+    with pytest.raises(ValueError, match="does not match the active manifest"):
         finalize_decisions(store, manifest, tmp_path / "review")
 
     assert store.state.export_history == ()

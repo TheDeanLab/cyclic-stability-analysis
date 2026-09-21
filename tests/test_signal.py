@@ -10,7 +10,7 @@ from cyclic_stability.models import AnalysisConfig
 from cyclic_stability.morphology import threshold_ensemble
 from cyclic_stability.signal import measure_signal, raw_structure_roi
 from scipy.ndimage import gaussian_filter
-from synthetic import ellipsoid_dapi, synthetic_roi, synthetic_target
+from synthetic import ellipsoid_dapi, separated_nuclei, synthetic_roi, synthetic_target
 
 
 def _ensemble(config: AnalysisConfig):
@@ -60,6 +60,79 @@ def test_raw_signal_roi_uses_the_union_of_every_accepted_nucleus(
     assert np.any(lamin_roi[:, :, 28:])
     assert np.array_equal(golgi_roi, ~lamin_roi)
     assert np.array_equal(lamp_roi, ~lamin_roi)
+
+
+def test_raw_signal_roi_does_not_require_surface_metric_realization(
+    analysis_config: AnalysisConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raw target masking must survive a failure isolated to surface metrics."""
+    from cyclic_stability import nuclear
+
+    dapi = ellipsoid_dapi(
+        ((6.0, 6.0, 6.0),),
+        ((4.0, 4.0, 4.0),),
+        (0.5, 0.5, 0.5),
+        (28, 28, 28),
+    )
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=(0.5, 0.5, 0.5),
+        nominal_expansion_factor=1.0,
+    )
+
+    def fail_surface_metrics(*_args, **_kwargs):
+        raise ValueError("synthetic curvature interpolation failure")
+
+    monkeypatch.setattr(nuclear, "realize_nuclear_surfaces", fail_surface_metrics)
+
+    roi = raw_structure_roi("lamin", dapi, config)
+
+    assert roi.dtype == bool
+    assert roi.shape == dapi.shape
+    assert np.any(roi)
+
+
+def test_raw_signal_roi_keeps_small_and_edge_contacting_dapi_components(
+    analysis_config: AnalysisConfig,
+) -> None:
+    """Raw Golgi intensity must not inherit nuclear morphology exclusions."""
+    dapi = ellipsoid_dapi(
+        ((1.0, 1.0, 1.0),),
+        ((2.0, 2.0, 2.0),),
+        (0.5, 0.5, 0.5),
+        (20, 20, 20),
+    )
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=(0.5, 0.5, 0.5),
+        nominal_expansion_factor=1.0,
+        nuclear=replace(
+            analysis_config.nuclear,
+            nominal_volume_um3=(10_000.0, 20_000.0),
+            maximum_face_contact_fraction=0.0,
+        ),
+    )
+
+    roi = raw_structure_roi("golgi", dapi, config)
+
+    assert np.any(~roi)
+
+
+def test_raw_signal_roi_accepts_a_crowded_dapi_field(
+    analysis_config: AnalysisConfig,
+) -> None:
+    """Raw target retention has no nuclear component-count admission limit."""
+    dapi = separated_nuclei(7, (0.5, 0.5, 0.5))
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=(0.5, 0.5, 0.5),
+        nominal_expansion_factor=1.0,
+    )
+
+    roi = raw_structure_roi("golgi", dapi, config)
+
+    assert np.any(~roi)
 
 
 def test_raw_signal_rows_serialize_explicit_aggregate_nucleus_id(

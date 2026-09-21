@@ -40,6 +40,7 @@ from cyexm.workflow.status import inspect_workflow_status
 from cyclic_stability.models import AnalysisConfig, CellSpec, RoundSpec
 from cyclic_stability.provenance import (
     ChannelMatch,
+    attested_pretransform_channels,
     channel_tiff_paths,
     compare_nd2_export,
 )
@@ -870,10 +871,19 @@ def resolve_round_artifacts(
 
 def validate_cell_inputs(cell: CellSpec) -> CellValidationReport:
     """Validate exact source correspondence and Cy-ExM provenance for one cell."""
-    source_matches = tuple(
-        match for round_spec in cell.rounds for match in compare_nd2_export(round_spec)
+    per_round = tuple(
+        (round_spec, compare_nd2_export(round_spec)) for round_spec in cell.rounds
     )
-    mismatched = [match.channel for match in source_matches if not match.exact]
+    source_matches = tuple(
+        match for _round_spec, matches in per_round for match in matches
+    )
+    mismatched = [
+        match.channel
+        for round_spec, matches in per_round
+        for match in matches
+        if not match.exact
+        and match.channel not in attested_pretransform_channels(round_spec)
+    ]
     if mismatched:
         raise InputValidationError(
             f"ND2/TIFF exact source correspondence failed for: {', '.join(mismatched)}"

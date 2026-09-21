@@ -653,9 +653,55 @@ def _surface_normals_and_curvature(
     centroid = foreground_zyx.mean(axis=0)[::-1] * np.array((sx, sy, sz))
     curvature = map_coordinates(divergence, sample_zyx, order=1)
     curvature[~valid] = np.nan
-    if not np.all(np.isfinite(curvature)):
+    if not np.all(np.isfinite(curvature)) and not allow_degenerate:
         raise ValueError("surface curvature interpolation is non-finite")
     return normals, centroid, curvature
+
+
+def _segmented_dapi_foreground_mask(
+    dapi_rounds: Mapping[int, NDArray[np.generic]],
+    spacing_xyz_um: tuple[float, float, float],
+    config: NuclearConfig,
+) -> NDArray[np.bool_]:
+    """Segment the shared DAPI foreground without component adjudication.
+
+    This internal primitive supplies the same target-independent DAPI
+    segmentation to both strict nuclear morphology and permissive raw-signal
+    ROI construction.  It deliberately makes no decision about component
+    count, geometry, or edge contact.
+    """
+    spacing = _spacing(spacing_xyz_um)
+    if REFERENCE_ROUND not in dapi_rounds:
+        raise ValueError("consensus nuclear surface requires acquisition round 2")
+    if not dapi_rounds:
+        raise ValueError("consensus nuclear surface requires at least one DAPI round")
+    volumes = {
+        int(round_number): _volume(image, "DAPI")
+        for round_number, image in dapi_rounds.items()
+    }
+    shapes = {volume.shape for volume in volumes.values()}
+    if len(shapes) != 1:
+        raise ValueError("QC-accepted DAPI rounds must share one registered geometry")
+    median = np.median(
+        np.stack([_normalized_dapi(volume) for volume in volumes.values()]), axis=0
+    )
+    smoothed = gaussian_filter(
+        median, sigma=gaussian_sigma_zyx(config.consensus_smoothing_um, spacing)
+    )
+    if not np.any(np.isfinite(smoothed)) or float(smoothed.max()) <= float(
+        smoothed.min()
+    ):
+        raise ValueError("consensus DAPI intensity is degenerate")
+    threshold_mask = smoothed > threshold_otsu(smoothed)
+    filled = binary_fill_holes(threshold_mask)
+    mask = (
+        binary_closing(
+            filled, structure=_physical_ball(_DAPI_LATERAL_RESOLUTION_UM, spacing)
+        )
+        | filled
+    )
+    mask.setflags(write=False)
+    return mask
 
 
 def adjudicate_nuclear_components(
@@ -697,41 +743,13 @@ def adjudicate_nuclear_components(
     expansion = float(nominal_expansion_factor)
     if not math.isfinite(expansion) or expansion <= 0.0:
         raise ValueError("nominal_expansion_factor must be finite and positive")
-    if REFERENCE_ROUND not in dapi_rounds:
-        raise ValueError("consensus nuclear surface requires acquisition round 2")
-    if not dapi_rounds:
-        raise ValueError("consensus nuclear surface requires at least one DAPI round")
-    volumes = {
-        int(round_number): _volume(image, "DAPI")
-        for round_number, image in dapi_rounds.items()
-    }
-    shapes = {volume.shape for volume in volumes.values()}
-    if len(shapes) != 1:
-        raise ValueError("QC-accepted DAPI rounds must share one registered geometry")
-    median = np.median(
-        np.stack([_normalized_dapi(volume) for volume in volumes.values()]), axis=0
-    )
-    smoothed = gaussian_filter(
-        median, sigma=gaussian_sigma_zyx(config.consensus_smoothing_um, spacing)
-    )
-    if not np.any(np.isfinite(smoothed)) or float(smoothed.max()) <= float(
-        smoothed.min()
-    ):
-        raise ValueError("consensus DAPI intensity is degenerate")
-    threshold_mask = smoothed > threshold_otsu(smoothed)
-    filled = binary_fill_holes(threshold_mask)
-    mask = (
-        binary_closing(
-            filled, structure=_physical_ball(_DAPI_LATERAL_RESOLUTION_UM, spacing)
-        )
-        | filled
-    )
+    mask = _segmented_dapi_foreground_mask(dapi_rounds, spacing, config)
     candidate_labels, candidate_count = label(
         mask, structure=np.ones((3, 3, 3), dtype=bool)
     )
     full_shape_zyx = mask.shape
     component_regions = find_objects(candidate_labels, max_label=candidate_count)
-    del filled, mask, median, smoothed, threshold_mask, volumes
+    del mask
     sx, sy, sz = spacing
     voxel_volume_um3 = sx * sy * sz
     minimum_volume, maximum_volume = config.nominal_volume_um3
@@ -841,6 +859,93 @@ def adjudicate_nuclear_components(
     )
 
 
+def _accepted_nuclear_components(
+    adjudication: NuclearComponentAdjudication,
+    config: NuclearConfig,
+) -> tuple[tuple[_NuclearCandidate, NuclearComponentQc], ...]:
+    """Validate and return accepted target-blind components in stable order."""
+    if config != adjudication._config:
+        raise ValueError("surface realization requires the adjudication configuration")
+    candidates = adjudication._candidates
+    component_qc = adjudication.component_qc
+    accepted_count = sum(item.accepted for item in candidates)
+    minimum_count, maximum_count = config.accepted_component_count
+    if not minimum_count <= accepted_count <= maximum_count:
+        rejected_reasons = sorted(
+            {
+                reason
+                for candidate in candidates
+                for reason in candidate.rejection_reasons
+            }
+        )
+        reason_suffix = (
+            f"; rejected component reasons: {', '.join(rejected_reasons)}"
+            if rejected_reasons
+            else ""
+        )
+        raise ValueError(
+            "accepted nuclear component count "
+            f"{accepted_count} is outside configured range "
+            f"[{minimum_count}, {maximum_count}]{reason_suffix}"
+        )
+    return tuple(
+        (candidate, qc)
+        for candidate, qc in zip(candidates, component_qc, strict=True)
+        if candidate.accepted
+    )
+
+
+def consensus_nuclear_mask(
+    dapi_rounds: Mapping[int, NDArray[np.generic]],
+    spacing_xyz_um: tuple[float, float, float],
+    config: NuclearConfig,
+    nominal_expansion_factor: float,
+) -> NDArray[np.bool_]:
+    """Return the accepted target-blind nuclear union mask without surface metrics.
+
+    Parameters
+    ----------
+    dapi_rounds : Mapping[int, numpy.ndarray]
+        Registered or native DAPI volumes keyed by acquisition round. Volumes use
+        ``(z, y, x)`` order and are used only for target-independent component
+        adjudication.
+    spacing_xyz_um : tuple[float, float, float]
+        Physical voxel spacing in public ``(x, y, z)`` micrometers.
+    config : NuclearConfig
+        Frozen segmentation and component-adjudication policy.
+    nominal_expansion_factor : float
+        Positive linear expansion factor for nominal-volume conversion.
+
+    Returns
+    -------
+    numpy.ndarray
+        Read-only boolean union mask of all accepted components in ``(z, y, x)``
+        order.
+
+    Raises
+    ------
+    ValueError
+        If component adjudication fails or the accepted count is outside the
+        configured range.
+
+    Notes
+    -----
+    This function deliberately does not realize normals or curvature. Consumers
+    that require surface metrics must use :func:`consensus_nuclear_surface`.
+    """
+    adjudication = adjudicate_nuclear_components(
+        dapi_rounds, spacing_xyz_um, config, nominal_expansion_factor
+    )
+    union_mask = np.zeros(adjudication._full_shape_zyx, dtype=bool)
+    for candidate, _qc in _accepted_nuclear_components(adjudication, config):
+        geometry = candidate.accepted_geometry
+        if geometry is None:
+            raise RuntimeError("accepted DAPI component has no bounded geometry")
+        union_mask[geometry.region_zyx] |= geometry.mask_zyx
+    union_mask.setflags(write=False)
+    return union_mask
+
+
 def realize_nuclear_surfaces(
     adjudication: NuclearComponentAdjudication,
     config: NuclearConfig,
@@ -866,41 +971,15 @@ def realize_nuclear_surfaces(
         range, or any accepted component cannot satisfy strict surface-normal or
         curvature realization.
     """
-    if config != adjudication._config:
-        raise ValueError("surface realization requires the adjudication configuration")
-    candidates = adjudication._candidates
     component_qc = adjudication.component_qc
-    accepted_count = sum(item.accepted for item in candidates)
-    minimum_count, maximum_count = config.accepted_component_count
-    if not minimum_count <= accepted_count <= maximum_count:
-        rejected_reasons = sorted(
-            {
-                reason
-                for candidate in candidates
-                for reason in candidate.rejection_reasons
-            }
-        )
-        reason_suffix = (
-            f"; rejected component reasons: {', '.join(rejected_reasons)}"
-            if rejected_reasons
-            else ""
-        )
-        raise ValueError(
-            "accepted nuclear component count "
-            f"{accepted_count} is outside configured range "
-            f"[{minimum_count}, {maximum_count}]{reason_suffix}"
-        )
-
     spacing = adjudication.spacing_xyz_um
     sx, sy, sz = spacing
     full_shape_zyx = adjudication._full_shape_zyx
     accepted_labels = np.zeros(full_shape_zyx, dtype=np.uint16)
     nuclei: list[NuclearSurface] = []
-    accepted_index = 0
-    for candidate, qc in zip(candidates, component_qc, strict=True):
-        if not candidate.accepted:
-            continue
-        accepted_index += 1
+    for accepted_index, (candidate, qc) in enumerate(
+        _accepted_nuclear_components(adjudication, config), start=1
+    ):
         geometry = candidate.accepted_geometry
         if geometry is None:
             raise RuntimeError("accepted DAPI component has no bounded geometry")
@@ -2106,6 +2185,7 @@ __all__ = [
     "NuclearSurface",
     "adjudicate_nuclear_components",
     "analyze_lamin_cell",
+    "consensus_nuclear_mask",
     "consensus_nuclear_surface",
     "lamin_normal_profiles",
     "realize_nuclear_surfaces",

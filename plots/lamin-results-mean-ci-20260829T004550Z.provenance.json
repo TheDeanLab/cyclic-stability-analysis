@@ -1,0 +1,26 @@
+{
+  "run_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/full-lamin-20260827/20260829T004550Z-d44d439cb118",
+  "source_task_table": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/full-lamin-20260827/20260829T004550Z-d44d439cb118/compact-tasks.csv",
+  "completed_cells": [
+    "Cell1",
+    "Cell2",
+    "Cell3",
+    "Cell4",
+    "Cell5"
+  ],
+  "failed_cells": [],
+  "quantitative_comparison_set": "matched-settings",
+  "quantitative_endpoints": [
+    "lamin_surface_coverage",
+    "lamin_continuity",
+    "lamin_fwhm_median",
+    "lamin_integrated_ridge_intensity_median"
+  ],
+  "summary_statistic": "mean",
+  "confidence_interval": {
+    "method": "percentile bootstrap over QC-included nuclei per round",
+    "level": 0.95,
+    "replicates": 10000,
+    "seed": 20260829
+  }
+}

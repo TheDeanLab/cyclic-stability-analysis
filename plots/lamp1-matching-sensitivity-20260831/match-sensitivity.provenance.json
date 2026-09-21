@@ -1,0 +1,251 @@
+{
+  "cells": [
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell1-xyseed-20260830-v3/tasks/lamp1-LAMP1-verified-alpha/attempts/46b78a2863164170a22443193c01317e",
+      "cell_id": "LAMP1-verified-alpha",
+      "match_resolution_units": 1.0,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-1/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-1/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-1/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-1/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell1-xyseed-20260830-v3/tasks/lamp1-LAMP1-verified-alpha/attempts/46b78a2863164170a22443193c01317e",
+      "cell_id": "LAMP1-verified-alpha",
+      "match_resolution_units": 1.5,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-1.5/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-1.5/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-1.5/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-1.5/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell1-xyseed-20260830-v3/tasks/lamp1-LAMP1-verified-alpha/attempts/46b78a2863164170a22443193c01317e",
+      "cell_id": "LAMP1-verified-alpha",
+      "match_resolution_units": 2.0,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-2/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-2/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-2/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-alpha/match-units-2/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell2-20260830/tasks/lamp1-LAMP1-verified-beta/attempts/d9471acbf1184cf698a3decd86f75836",
+      "cell_id": "LAMP1-verified-beta",
+      "match_resolution_units": 1.0,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-1/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-1/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-1/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-1/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell2-20260830/tasks/lamp1-LAMP1-verified-beta/attempts/d9471acbf1184cf698a3decd86f75836",
+      "cell_id": "LAMP1-verified-beta",
+      "match_resolution_units": 1.5,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-1.5/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-1.5/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-1.5/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-1.5/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell2-20260830/tasks/lamp1-LAMP1-verified-beta/attempts/d9471acbf1184cf698a3decd86f75836",
+      "cell_id": "LAMP1-verified-beta",
+      "match_resolution_units": 2.0,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-2/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-2/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-2/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-beta/match-units-2/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell3-20260830/tasks/lamp1-LAMP1-verified-gamma/attempts/e6c479d0d11241e1a593b46768cb3d91",
+      "cell_id": "LAMP1-verified-gamma",
+      "match_resolution_units": 1.0,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-1/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-1/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-1/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-1/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell3-20260830/tasks/lamp1-LAMP1-verified-gamma/attempts/e6c479d0d11241e1a593b46768cb3d91",
+      "cell_id": "LAMP1-verified-gamma",
+      "match_resolution_units": 1.5,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-1.5/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-1.5/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-1.5/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-1.5/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell3-20260830/tasks/lamp1-LAMP1-verified-gamma/attempts/e6c479d0d11241e1a593b46768cb3d91",
+      "cell_id": "LAMP1-verified-gamma",
+      "match_resolution_units": 2.0,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-2/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-2/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-2/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-gamma/match-units-2/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell4-20260830/tasks/lamp1-LAMP1-verified-delta/attempts/9822fedc989a410da736fc7099850dd8",
+      "cell_id": "LAMP1-verified-delta",
+      "match_resolution_units": 1.0,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-1/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-1/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-1/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-1/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell4-20260830/tasks/lamp1-LAMP1-verified-delta/attempts/9822fedc989a410da736fc7099850dd8",
+      "cell_id": "LAMP1-verified-delta",
+      "match_resolution_units": 1.5,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-1.5/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-1.5/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-1.5/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-1.5/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell4-20260830/tasks/lamp1-LAMP1-verified-delta/attempts/9822fedc989a410da736fc7099850dd8",
+      "cell_id": "LAMP1-verified-delta",
+      "match_resolution_units": 2.0,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-2/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-2/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-2/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-delta/match-units-2/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell5-20260830/tasks/lamp1-LAMP1-verified-epsilon/attempts/70ab32f6bb364fec9780bdf818fdbd73",
+      "cell_id": "LAMP1-verified-epsilon",
+      "match_resolution_units": 1.0,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-1/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-1/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-1/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-1/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell5-20260830/tasks/lamp1-LAMP1-verified-epsilon/attempts/70ab32f6bb364fec9780bdf818fdbd73",
+      "cell_id": "LAMP1-verified-epsilon",
+      "match_resolution_units": 1.5,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-1.5/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-1.5/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-1.5/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-1.5/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    },
+    {
+      "attempt_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/lamp1-cell5-20260830/tasks/lamp1-LAMP1-verified-epsilon/attempts/70ab32f6bb364fec9780bdf818fdbd73",
+      "cell_id": "LAMP1-verified-epsilon",
+      "match_resolution_units": 2.0,
+      "overlay_paths": [
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-2/lamp1-mip-overlay-round-1.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-2/lamp1-mip-overlay-round-3.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-2/lamp1-mip-overlay-round-4.png",
+        "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/lamp1-matching-sensitivity-20260831/LAMP1-verified-epsilon/match-units-2/lamp1-mip-overlay-round-5.png"
+      ],
+      "resolution_reference": {
+        "axial_expanded_um": 0.9893877551020408,
+        "kind": "theoretical",
+        "lateral_expanded_um": 0.2788571428571429
+      }
+    }
+  ],
+  "match_units": [
+    1.0,
+    1.5,
+    2.0
+  ],
+  "purpose": "visual-only matching-radius sensitivity; persisted detections and measurements unchanged",
+  "reference_round": 2
+}
