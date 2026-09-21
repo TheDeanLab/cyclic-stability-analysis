@@ -30,7 +30,12 @@ class EnsembleConfig:
 
 @dataclass(frozen=True, slots=True)
 class NuclearConfig:
-    """DAPI consensus and normal-profile settings."""
+    """DAPI consensus and normal-profile settings.
+
+    ``watershed_seed_prominence_um`` is optional distance-peak prominence in
+    expanded XYZ micrometers; ``None`` preserves connected-component labeling.
+    Foreground construction and component QC are unchanged by this setting.
+    """
 
     consensus_smoothing_um: float
     normal_half_window_um: float
@@ -40,6 +45,7 @@ class NuclearConfig:
     nominal_volume_um3: tuple[float, float]
     minimum_sphericity: float
     maximum_face_contact_fraction: float
+    watershed_seed_prominence_um: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +172,23 @@ class MarkerResult:
 
 
 @dataclass(frozen=True, slots=True)
+class LaminNuclearExclusion:
+    """One spatially identified Lamin component excluded before measurement.
+
+    The point is in expanded physical XYZ coordinates on the registered grid.
+    Exactly one otherwise accepted component must contain its nearest voxel and
+    have ``expected_voxel_count`` foreground voxels, or analysis fails closed.
+    The reason is retained in nuclear QC and diagnostic rows. IDs can change
+    after watershed splitting, so an ordinal nucleus ID is not a selector.
+    """
+
+    cell_id: str
+    point_xyz_um: tuple[float, float, float]
+    expected_voxel_count: int
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class AnalysisConfig:
     """Fully validated scientific configuration and audited cell inventory."""
 
@@ -180,6 +203,7 @@ class AnalysisConfig:
     cells: tuple[CellSpec, ...]
     qc_decisions: tuple[QcDecision, ...]
     config_digest: str
+    lamin_nuclear_exclusions: tuple[LaminNuclearExclusion, ...] = ()
 
     def cell(self, cohort: str, cell_id: str) -> CellSpec:
         """Return the unique validated cell matching ``cohort`` and ``cell_id``."""

@@ -162,3 +162,46 @@ target-blind QC evidence, restart-safe cell tasks, compact tables, figures,
 `report.md`, and `run.json`. Generated results, smoke crops, and partial writes are
 ignored by Git so this repository retains the exact source code and scientific inputs
 needed to reproduce an analysis identity.
+
+## Lamin watershed revision (2026-09-21)
+
+`config/analysis-lamin-watershed.yaml` enables physical-distance watershed with
+2 µm peak prominence on the original DAPI foreground. Distances use the expanded
+image coordinates and recorded XYZ spacing; seed prominence is not minimum seed
+separation. Omit `nuclear.watershed_seed_prominence_um` to retain legacy connected
+components. The production Golgi and LAMP1 configurations are unchanged.
+
+The revised Lamin configuration records one `lamin_nuclear_exclusions` entry for
+the unresolved original Cell4/N003 object. Each entry identifies a cell and a
+physical XYZ point, guards the match with an exact `expected_voxel_count`, and
+records a reason. A missing, duplicate, or changed match stops that task. The
+excluded object remains in nuclear QC and diagnostic evidence; ordinal IDs are
+not used to select exclusions because watershed splitting can renumber nuclei.
+
+Run all five fields with the original frozen correspondence and registration QC,
+a new result root, and the bounded local execution profile:
+
+```bash
+export UV_CACHE_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/.cache
+export UV_PYTHON_INSTALL_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/python
+uv run --script scripts/run_analysis.py \
+  --analysis-config config/analysis-lamin-watershed.yaml \
+  --correspondence results/full-lamin-20260827/20260829T004550Z-d44d439cb118/config/correspondence.csv \
+  --qc-decisions results/full-lamin-20260827/20260829T004550Z-d44d439cb118/config/qc-decisions.csv \
+  --execution-profile config/execution-local.yaml \
+  --results-root results/full-lamin-watershed-20260921 --cohort lamin
+```
+
+Use the completed run directory printed by the runner as `--run-dir` for
+`scripts/plot_lamin_run.py`, and choose a new `--output-stem` under `plots/`.
+The plot reads terminal-selected attempts and excludes `aggregate` rows from
+nucleus trajectories and bootstrap statistics. Earlier figures counted those
+five field summaries as additional nuclei (19 entries versus 14 actual nuclei).
+The bootstrap remains a descriptive nucleus-level interval, not an estimate of
+independent biological replication across fields.
+
+Each completed field now retains `diagnostics/consensus-nuclear-labels.npz` with
+`labels_zyx`, `spacing_xyz_um`, and `nucleus_ids`: label value `i + 1` maps to
+`nucleus_ids[i]`. This records exact accepted masks and supports parent-to-daughter
+correspondence; rejected and explicitly excluded candidates remain in
+`nuclear-component-qc.csv` and the component-inventory diagnostics.

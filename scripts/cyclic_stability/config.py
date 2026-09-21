@@ -20,6 +20,7 @@ from cyclic_stability.models import (
     EnsembleConfig,
     ExecutionProfile,
     GolgiConfig,
+    LaminNuclearExclusion,
     LysosomeConfig,
     NuclearConfig,
     OpticsConfig,
@@ -62,11 +63,17 @@ QC_COLUMNS = (
 T = TypeVar("T")
 
 
-def _mapping(value: object, name: str, keys: set[str]) -> Mapping[str, Any]:
+def _mapping(
+    value: object,
+    name: str,
+    keys: set[str],
+    *,
+    optional_keys: frozenset[str] = frozenset(),
+) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{name} must be a mapping")  # noqa: TRY004
     actual = set(value)
-    unknown = actual - keys
+    unknown = actual - keys - optional_keys
     missing = keys - actual
     if unknown:
         raise ValueError(f"{name} has unknown keys: {sorted(unknown)}")
@@ -206,6 +213,7 @@ def _load_yaml_bytes(payload: bytes, path: Path) -> Mapping[str, Any]:
             "lysosome",
             "paths",
         },
+        optional_keys=frozenset({"lamin_nuclear_exclusions"}),
     )
 
 
@@ -268,6 +276,7 @@ def _parse_scientific_config(
             "minimum_sphericity",
             "maximum_face_contact_fraction",
         },
+        optional_keys=frozenset({"watershed_seed_prominence_um"}),
     )
     golgi_data = _mapping(data["golgi"], "golgi", {"perinuclear_outer_distance_um"})
     lysosome_data = _mapping(
@@ -309,6 +318,14 @@ def _parse_scientific_config(
             ),
         ),
         NuclearConfig(
+            watershed_seed_prominence_um=(
+                _number(
+                    nuclear_data["watershed_seed_prominence_um"],
+                    "nuclear.watershed_seed_prominence_um",
+                )
+                if "watershed_seed_prominence_um" in nuclear_data
+                else None
+            ),
             consensus_smoothing_um=_number(
                 nuclear_data["consensus_smoothing_um"],
                 "nuclear.consensus_smoothing_um",
@@ -628,6 +645,61 @@ def _digest(
     ).hexdigest()
 
 
+def _parse_lamin_nuclear_exclusions(
+    value: object,
+    cells: tuple[CellSpec, ...],
+) -> tuple[LaminNuclearExclusion, ...]:
+    """Parse exact, cell-specific exclusions owned by the scientific manifest."""
+    if not isinstance(value, list):
+        raise ValueError("lamin_nuclear_exclusions must be a list")  # noqa: TRY004
+    valid_cells = {cell.cell_id for cell in cells if cell.cohort == "lamin"}
+    result = []
+    seen = set()
+    for entry in value:
+        row = _mapping(
+            entry,
+            "Lamin nuclear exclusion",
+            {"cell_id", "point_xyz_um", "expected_voxel_count", "reason"},
+        )
+        cell_id = row["cell_id"]
+        if not isinstance(cell_id, str) or cell_id not in valid_cells:
+            raise ValueError("Lamin nuclear exclusion cell_id is not in the cohort")
+        point = row["point_xyz_um"]
+        if (
+            not isinstance(point, (tuple, list))
+            or len(point) != 3
+            or any(
+                isinstance(v, bool)
+                or not isinstance(v, (int, float))
+                or not math.isfinite(v)
+                or v < 0
+                for v in point
+            )
+        ):
+            raise ValueError(
+                "exclusion point_xyz_um must have three finite nonnegative coordinates"
+            )
+        xyz = cast(tuple[float, float, float], tuple(float(v) for v in point))
+        key = (cell_id, xyz)
+        if key in seen:
+            raise ValueError("duplicate Lamin nuclear exclusion point")
+        seen.add(key)
+        reason = row["reason"]
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("Lamin nuclear exclusion reason must be nonempty")
+        result.append(
+            LaminNuclearExclusion(
+                cell_id,
+                xyz,
+                _positive_int(
+                    row["expected_voxel_count"], "exclusion expected_voxel_count"
+                ),
+                reason.strip(),
+            )
+        )
+    return tuple(result)
+
+
 def load_analysis_config(
     path: Path, correspondence_path: Path, qc_path: Path
 ) -> AnalysisConfig:
@@ -711,6 +783,9 @@ def load_analysis_config_bytes(
         cells,
         decisions,
         _digest(data, correspondence, decisions),
+        _parse_lamin_nuclear_exclusions(
+            data.get("lamin_nuclear_exclusions", []), cells
+        ),
     )
 
 

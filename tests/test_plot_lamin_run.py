@@ -59,3 +59,33 @@ def test_bootstrap_mean_ci_collapses_for_identical_nuclei() -> None:
 if __name__ == "__main__":
     test_completed_run_annotations_do_not_report_historical_failures()
     test_bootstrap_mean_ci_collapses_for_identical_nuclei()
+
+
+def test_plot_uses_terminal_attempt_and_never_counts_aggregate(tmp_path):
+    import json
+
+    task = tmp_path / "tasks/lamin-Cell1"
+    for name, value in (("obsolete", 99.0), ("selected", 1.0)):
+        attempt = task / "attempts" / name
+        attempt.mkdir(parents=True)
+        pd.DataFrame(
+            [
+                {
+                    "cell_id": "Cell1",
+                    "nucleus_id": nucleus_id,
+                    "acquisition_round": 2,
+                    "endpoint": "lamin_fwhm_median",
+                    "value": value,
+                    "qc_included": True,
+                    "comparison_set": "matched-settings",
+                }
+                for nucleus_id in ("N001", "aggregate")
+            ]
+        ).to_csv(attempt / "summary.csv", index=False)
+    (task / "terminal.json").write_text(
+        json.dumps({"status": "complete", "attempt_id": "selected"})
+    )
+    tasks = pd.DataFrame([{"key": "lamin-Cell1", "status": "complete"}])
+    result = plot_lamin_run.completed_summary(tmp_path, tasks)
+    assert result.nucleus_id.tolist() == ["N001"]
+    assert result.value.tolist() == [1.0]

@@ -68,10 +68,18 @@ def cohort_scope_note(tasks: pd.DataFrame) -> str:
 def completed_summary(run_dir: Path, tasks: pd.DataFrame) -> pd.DataFrame:
     tables: list[pd.DataFrame] = []
     for row in tasks.loc[tasks["status"].eq("complete")].itertuples():
-        attempts = sorted((run_dir / "tasks" / row.key / "attempts").iterdir())
-        if len(attempts) != 1:
-            raise ValueError(f"expected one retained attempt for {row.key}")
-        summary_path = attempts[0] / "summary.csv"
+        task_dir = run_dir / "tasks" / row.key
+        terminal = json.loads((task_dir / "terminal.json").read_text())
+        attempt_id = terminal.get("attempt_id")
+        if (
+            terminal.get("status") != "complete"
+            or not isinstance(attempt_id, str)
+            or not attempt_id
+            or Path(attempt_id).name != attempt_id
+            or attempt_id in {".", ".."}
+        ):
+            raise ValueError(f"invalid completed terminal record for {row.key}")
+        summary_path = task_dir / "attempts" / attempt_id / "summary.csv"
         if not summary_path.is_file():
             raise FileNotFoundError(summary_path)
         tables.append(pd.read_csv(summary_path))
@@ -82,6 +90,7 @@ def completed_summary(run_dir: Path, tasks: pd.DataFrame) -> pd.DataFrame:
         summary["qc_included"].eq(True)
         & summary["comparison_set"].eq("matched-settings")
         & summary["endpoint"].isin([value[0] for value in ENDPOINTS])
+        & summary["nucleus_id"].str.fullmatch(r"N[0-9]+", na=False)
     ].copy()
 
 
@@ -285,6 +294,8 @@ def render(run_dir: Path, output_stem: Path) -> None:
         "quantitative_comparison_set": "matched-settings",
         "quantitative_endpoints": [item[0] for item in ENDPOINTS],
         "summary_statistic": "mean",
+        "aggregate_rows_excluded": True,
+        "included_nuclei": included.to_dict(orient="records"),
         "confidence_interval": {
             "method": "percentile bootstrap over QC-included nuclei per round",
             "level": 0.95,

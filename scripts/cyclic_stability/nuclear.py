@@ -26,6 +26,8 @@ from scipy.ndimage import (
 )
 from skimage.filters import threshold_otsu
 from skimage.measure import find_contours, marching_cubes, mesh_surface_area
+from skimage.morphology import h_maxima
+from skimage.segmentation import watershed
 
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
 from cyclic_stability.images import BackgroundSummary, load_volume, robust_background
@@ -33,6 +35,7 @@ from cyclic_stability.models import (
     AnalysisConfig,
     CellSpec,
     EnsembleRow,
+    LaminNuclearExclusion,
     MarkerResult,
     MetricRow,
     NuclearConfig,
@@ -281,6 +284,9 @@ def _validate_config(config: NuclearConfig) -> None:
     )
     if any(not math.isfinite(value) or value <= 0.0 for value in values):
         raise ValueError("nuclear configuration values must be finite and positive")
+    h = config.watershed_seed_prominence_um
+    if h is not None and (isinstance(h, bool) or not math.isfinite(h) or h <= 0):
+        raise ValueError("watershed_seed_prominence_um must be finite and positive")
     quotient = config.normal_half_window_um / config.normal_step_um
     if not math.isclose(quotient, round(quotient), rel_tol=0.0, abs_tol=1e-9):
         raise ValueError("normal_half_window_um must be divisible by normal_step_um")
@@ -704,6 +710,59 @@ def _segmented_dapi_foreground_mask(
     return mask
 
 
+def _watershed_nuclear_labels(
+    foreground_mask: NDArray[np.bool_],
+    spacing_xyz_um: tuple[float, float, float],
+    seed_prominence_um: float,
+) -> tuple[NDArray[np.uint16], int]:
+    """Split touching DAPI foreground while preserving its exact outer union."""
+    mask = np.asarray(foreground_mask, dtype=bool)
+    source_labels, source_count = label(mask, structure=np.ones((3, 3, 3), dtype=bool))
+    source_regions = find_objects(source_labels, max_label=source_count)
+    partition = np.zeros(mask.shape, dtype=np.uint16)
+    marker_count = 0
+    for component_index in range(1, source_count + 1):
+        region = source_regions[component_index - 1]
+        if region is None:
+            raise RuntimeError("connected DAPI component has no bounding slice")
+        component = source_labels[region] == component_index
+        padded_component = np.pad(component, 1)
+        distance = distance_transform_edt(
+            padded_component, sampling=spacing_xyz_um[::-1]
+        )[1:-1, 1:-1, 1:-1].astype(np.float32)
+        prominent = h_maxima(distance, seed_prominence_um) & component
+        local_markers, local_count = label(
+            prominent, structure=np.ones((3, 3, 3), dtype=bool)
+        )
+        if local_count == 0:
+            masked_distance = np.where(component, distance, -np.inf)
+            peak_index = np.unravel_index(
+                int(np.argmax(masked_distance)), masked_distance.shape
+            )
+            local_markers = np.zeros(component.shape, dtype=np.int32)
+            local_markers[peak_index] = 1
+            local_count = 1
+        watershed_markers = np.zeros(local_markers.shape, dtype=np.int32)
+        for local_index in range(1, local_count + 1):
+            marker_count += 1
+            if marker_count > np.iinfo(np.uint16).max:
+                raise ValueError("nuclear watershed produced too many markers")
+            watershed_markers[local_markers == local_index] = marker_count
+        local_partition = np.asarray(
+            watershed(
+                -distance,
+                markers=watershed_markers,
+                mask=component,
+                connectivity=np.ones((3, 3, 3), dtype=bool),
+            ),
+            dtype=np.uint16,
+        )
+        partition[region][component] = local_partition[component]
+    if not np.array_equal(partition > 0, mask):
+        raise RuntimeError("nuclear watershed did not preserve the DAPI foreground")
+    return partition, marker_count
+
+
 def adjudicate_nuclear_components(
     dapi_rounds: Mapping[int, NDArray[np.generic]],
     spacing_xyz_um: tuple[float, float, float],
@@ -744,9 +803,14 @@ def adjudicate_nuclear_components(
     if not math.isfinite(expansion) or expansion <= 0.0:
         raise ValueError("nominal_expansion_factor must be finite and positive")
     mask = _segmented_dapi_foreground_mask(dapi_rounds, spacing, config)
-    candidate_labels, candidate_count = label(
-        mask, structure=np.ones((3, 3, 3), dtype=bool)
-    )
+    if config.watershed_seed_prominence_um is None:
+        candidate_labels, candidate_count = label(
+            mask, structure=np.ones((3, 3, 3), dtype=bool)
+        )
+    else:
+        candidate_labels, candidate_count = _watershed_nuclear_labels(
+            mask, spacing, config.watershed_seed_prominence_um
+        )
     full_shape_zyx = mask.shape
     component_regions = find_objects(candidate_labels, max_label=candidate_count)
     del mask
@@ -1028,7 +1092,7 @@ def realize_nuclear_surfaces(
                 qc.nucleus_id,
                 component_mask,
                 vertices,
-                geometry.faces,
+                faces,
                 normals,
                 centroid,
                 curvature,
@@ -1981,6 +2045,65 @@ def _aggregate_ensemble_rows(
     return tuple(aggregated)
 
 
+def _apply_lamin_nuclear_exclusions(
+    adjudication: NuclearComponentAdjudication,
+    exclusions: tuple[LaminNuclearExclusion, ...],
+) -> NuclearComponentAdjudication:
+    """Retain explicit spatial QC rejections before strict surface realization.
+
+    Exclusions must already be restricted to this field. Matching uses the
+    nearest grid voxel and an exact foreground-count guard. Missing, repeated,
+    or changed matches raise ValueError; the input adjudication is not mutated.
+    """
+    candidates = list(adjudication._candidates)
+    rows = list(adjudication.component_qc)
+    diagnostics = list(adjudication.component_diagnostics)
+    spacing = np.asarray(adjudication.spacing_xyz_um)
+    for rule in exclusions:
+        point = np.asarray(rule.point_xyz_um, dtype=float)
+        if point.shape != (3,) or not np.all(np.isfinite(point)) or np.any(point < 0):
+            raise ValueError("exclusion point must be finite nonnegative XYZ")
+        index = np.rint(point / spacing).astype(np.int64)[::-1]
+        matches = []
+        for i, candidate in enumerate(candidates):
+            geometry = candidate.accepted_geometry
+            if not candidate.accepted or geometry is None:
+                continue
+            local = index - np.array([s.start for s in geometry.region_zyx])
+            if (
+                np.all(local >= 0)
+                and np.all(local < geometry.mask_zyx.shape)
+                and geometry.mask_zyx[tuple(local)]
+            ):
+                matches.append(i)
+        if len(matches) != 1:
+            raise ValueError(
+                "Lamin nuclear exclusion must match one accepted component"
+            )
+        i = matches[0]
+        geometry = candidates[i].accepted_geometry
+        assert geometry is not None
+        if int(geometry.mask_zyx.sum()) != rule.expected_voxel_count:
+            raise ValueError("Lamin nuclear exclusion voxel count changed")
+        reasons = (*candidates[i].rejection_reasons, f"explicit-qc:{rule.reason}")
+        candidates[i] = replace(
+            candidates[i],
+            accepted=False,
+            rejection_reasons=reasons,
+            accepted_geometry=None,
+        )
+        rows[i] = replace(rows[i], accepted=False, rejection_reasons=reasons)
+        diagnostics[i] = replace(
+            diagnostics[i], accepted=False, rejection_reasons=reasons
+        )
+    return replace(
+        adjudication,
+        _candidates=tuple(candidates),
+        component_qc=tuple(rows),
+        component_diagnostics=tuple(diagnostics),
+    )
+
+
 def analyze_lamin_cell(
     cell: CellSpec,
     artifacts: tuple[RoundArtifacts, ...],
@@ -2004,12 +2127,22 @@ def analyze_lamin_cell(
         round_number: load_volume(by_round[round_number].registered_target)
         for round_number in accepted
     }
-    consensus = consensus_nuclear_surface(
+    adjudication = adjudicate_nuclear_components(
         dapi,
         config.voxel_spacing_xyz_um,
         config.nuclear,
         config.nominal_expansion_factor,
     )
+    adjudication = _apply_lamin_nuclear_exclusions(
+        adjudication,
+        tuple(
+            rule
+            for rule in config.lamin_nuclear_exclusions
+            if rule.cell_id == cell.cell_id
+        ),
+    )
+    consensus = realize_nuclear_surfaces(adjudication, config.nuclear)
+    del adjudication
     backgrounds = {
         round_number: robust_background(image) for round_number, image in lamin.items()
     }
@@ -2143,6 +2276,16 @@ def analyze_lamin_cell(
         paths: list[Path] = [
             write_nuclear_component_diagnostic(staged, cell.cell_id, dapi, consensus)
         ]
+        label_path = staged / "consensus-nuclear-labels.npz"
+        np.savez_compressed(
+            label_path,
+            labels_zyx=consensus.labels_zyx,
+            spacing_xyz_um=consensus.spacing_xyz_um,
+            nucleus_ids=np.asarray(
+                [surface.nucleus_id for surface in consensus.nuclei]
+            ),
+        )
+        paths.append(label_path)
         for surface in consensus.nuclei:
             paths.extend(
                 _write_profile_diagnostics(

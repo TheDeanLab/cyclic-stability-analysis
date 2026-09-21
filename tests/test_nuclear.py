@@ -611,6 +611,10 @@ def test_per_nucleus_lamin_profiles_and_metrics_isolate_local_ridges(
         for row in result.ensemble_rows
     )
     assert (tmp_path / "out" / "nuclear-component-inventory.pdf").is_file()
+    with np.load(tmp_path / "out" / "consensus-nuclear-labels.npz") as labels:
+        assert labels["nucleus_ids"].tolist() == ["N001", "N002"]
+        assert set(np.unique(labels["labels_zyx"])) == {0, 1, 2}
+        assert np.array_equal(labels["spacing_xyz_um"], spacing)
     volume_rows = {
         row.nucleus_id: row.value
         for row in result.ensemble_rows

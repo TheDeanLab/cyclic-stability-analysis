@@ -378,6 +378,7 @@ def _nuclear_inventory_payload(
     """Build complete DAPI component evidence without opening a target channel."""
     from cyclic_stability.images import load_volume
     from cyclic_stability.nuclear import (
+        _apply_lamin_nuclear_exclusions,
         adjudicate_nuclear_components,
         realize_nuclear_surfaces,
     )
@@ -403,6 +404,13 @@ def _nuclear_inventory_payload(
             config.nuclear,
             config.nominal_expansion_factor,
         )
+        exclusions = tuple(
+            rule
+            for rule in getattr(config, "lamin_nuclear_exclusions", ())
+            if cell.cohort == "lamin" and rule.cell_id == cell.cell_id
+        )
+        if exclusions:
+            adjudication = _apply_lamin_nuclear_exclusions(adjudication, exclusions)
         components = tuple(asdict(item) for item in adjudication.component_qc)
         accepted_ids = [
             str(item["nucleus_id"]) for item in components if item["accepted"] is True
