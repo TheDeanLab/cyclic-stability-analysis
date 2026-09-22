@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 from cyclic_stability.runner import initialize_run, initialize_run_from_bytes, run_tasks
@@ -75,9 +76,13 @@ def test_cli_rejects_run_directory_and_results_root_together(tmp_path: Path) -> 
     assert "not allowed with argument" in result.stderr
 
 
-def test_production_cli_declares_the_direct_nd2_runtime_pin() -> None:
-    text = Path("scripts/run_analysis.py").read_text(encoding="utf-8")
-    assert '"nd2==0.11.3"' in text
+def test_production_project_declares_the_direct_nd2_runtime_pin() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    assert "nd2==0.11.3" in project["project"]["dependencies"]
+    lock = tomllib.loads(Path("uv.lock").read_text(encoding="utf-8"))
+    nd2 = [package for package in lock["package"] if package["name"] == "nd2"]
+    assert len(nd2) == 1
+    assert nd2[0]["version"] == "0.11.3"
 
 
 def test_initialization_reopens_only_the_same_immutable_run(tmp_path: Path) -> None:

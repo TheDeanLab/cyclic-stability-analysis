@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 from dataclasses import asdict
 from pathlib import Path
 
@@ -343,18 +345,25 @@ def test_config_accepts_documented_lamp1_round_two_tubulin_exposure_exception(
         "LAMP1-verified-delta",
         "LAMP1-verified-epsilon",
     )
-    rows = "".join(_lamp_rows(cell_id) for cell_id in lamp_cells)
-    rows = rows.replace(
-        "round2/DAPI_tubulin_lamp1_001.nd2,Lysosomes/LAMP1-verified-alpha,"
-        "0,647_lamp1,200,50,200,50,200,75,",
-        "round2/DAPI_tubulin_lamp_001.nd2,Lysosomes/LAMP1-verified-alpha,"
-        "0,647_lamp1,200,50,300,50,200,75,",
-        1,
-    )
-    valid.write_text(
-        correspondence.read_text(encoding="utf-8") + rows,
-        encoding="utf-8",
-    )
+    text = correspondence.read_text(encoding="utf-8")
+    text += "".join(_lamp_rows(cell_id) for cell_id in lamp_cells)
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    matching = [
+        row
+        for row in rows
+        if row["cohort"] == "lamp1"
+        and row["cell_id"] == "LAMP1-verified-alpha"
+        and row["acquisition_round"] == "2"
+    ]
+    assert len(matching) == 1
+    matching[0]["nd2_relative"] = "round2/DAPI_tubulin_lamp_001.nd2"
+    matching[0]["tubulin_exposure_ms"] = "300"
+    assert reader.fieldnames is not None
+    with valid.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=reader.fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
     config = load_analysis_config(analysis, valid, decisions)
     alpha_round_two = next(
         item

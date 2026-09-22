@@ -3,8 +3,9 @@
 This standalone, publication-local analysis evaluates cyclic imaging evidence without
 writing to the source ND2/TIFF data or Cy-ExM registration artifacts. The frozen
 scientific configuration is `config/analysis.yaml`; the audited Golgi and Lamin
-ND2-to-TIFF correspondence is `config/correspondence.csv`. LAMP1 is intentionally
-absent until image-based cross-round identities have been audited and recorded.
+ND2-to-TIFF correspondence is `config/correspondence.csv`. LAMP1 analysis uses
+the image-verified cell identities recorded in that same correspondence file.
+The revised Lamin configuration and correspondence are described below.
 
 ## Data and quality-control boundary
 
@@ -24,29 +25,99 @@ the reviewer records accept/exclude decisions for the non-reference rounds in
 `config/qc-decisions.csv`. An empty decision file is the required initial state and
 pauses target-specific analysis rather than inventing eligibility.
 
-## Commands
+## Setup and development
 
-Use the PEP 723 test bridge with its dependencies isolated outside this repository:
+This repository uses a shared, non-packaged uv project. `pyproject.toml` declares
+Python 3.12 and the runtime/development dependencies; `uv.lock` fixes their exact
+versions. `.python-version` selects 3.12.11, matching the completed Lamin run.
+The initial lock preserves all 60 packages in that run's test/runtime environment,
+including the pinned Cy-ExM commit. Dependency upgrades should be deliberate and
+validated separately from changes to analysis methods.
+
+Clone the private repository using a GitHub account with access to both this
+repository and `TheDeanLab/Cy-ExM`:
+
+```bash
+gh auth login
+gh auth setup-git
+gh repo clone TheDeanLab/cyclic-stability-analysis
+cd cyclic-stability-analysis
+```
+
+Use uv 0.7.13 or newer (CI uses 0.7.13). On BioHPC, export these paths **before
+any uv command** to keep environments and caches on `/project`, even when the
+checkout is on `/archive`. Collaborators should select their own writable
+`/project` locations rather than another user's environment.
 
 ```bash
 export UV_CACHE_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/.cache
 export UV_PYTHON_INSTALL_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/python
-uv run --script scripts/run_tests.py tests/test_config.py -q
+export UV_PROJECT_ENVIRONMENT=/project/bioinformatics/Danuser_lab/Dean/dean/uv/environments/cyclic-stability-analysis
 ```
 
-The same two exports are required before every later `uv` command. The execution
-profiles deliberately keep machine resources separate from frozen scientific inputs;
-the local profile is sequential with conservative pre-pilot values and the optional
-SLURM profile requests one process per array element.
+On a workstation, omit those BioHPC-specific exports to use a local `.venv`.
+Install the locked environment and run the portable checks from the repo root:
+
+```bash
+uv sync --locked --group dev
+uv run --locked pytest tests/test_config.py -q
+uv run --locked pytest -q
+uv run --locked ruff check .
+uv run --locked ruff format --check .
+```
+
+Tests use synthetic inputs and temporary directories; they do not launch
+registration or require lab datasets. `scripts/run_tests.py` remains a compatible
+entry point (`uv run --locked python scripts/run_tests.py tests/test_config.py -q`)
+and respects explicit test selections. pytest's import paths are configured in
+`pyproject.toml`; no manual `PYTHONPATH` is needed.
+
+## Commands
+
+Use `uv run --locked python scripts/NAME.py ...` for analysis and review commands.
+The explicit `python` makes the shared project environment authoritative, including
+for plotting scripts that also support standalone execution. For example:
+
+```bash
+uv run --locked python scripts/run_analysis.py --help
+uv run --locked python scripts/plot_lamin_run.py --help
+```
+
+The three `plot_*` scripts also retain PEP 723 metadata and adjacent `.py.lock`
+files for independent use: `uv run --locked --script scripts/plot_lamin_run.py ...`.
+That mode uses the script lock rather than `uv.lock`. Their initial versions match
+the project lock. Keep both execution modes validated when updating dependencies.
+Other entry points use only the shared project environment.
+
+The execution profiles keep machine resources separate from scientific inputs.
+The local profile uses two process workers with four native threads each; the
+optional SLURM profile requests one process per array element. Real analyses also
+require the configured archive data, registration outputs, and QC decisions.
+
+## Continuous integration
+
+GitHub Actions runs Ruff independently of private dependencies and runs the full
+synthetic suite plus CLI help checks in the locked Python 3.12 environment.
+Because Cy-ExM is private, configure an Actions secret named `CYEXM_READ_TOKEN`
+with read-only contents access to `TheDeanLab/Cy-ExM`. An organization secret must
+be made available to this repository. Enter credentials in GitHub's secret settings,
+never in this repository or a command pasted into chat. The test job fails with a
+clear setup message if the secret is missing; it does not silently skip tests.
+
+The workflow uses read-only repository permissions, disables persisted checkout
+credentials, and supplies the dependency credential only during environment sync.
+It does not contact BioHPC, launch jobs, open a GUI, or read archived images.
 
 For a validated SLURM profile, submit one immutable task index per array element;
 the Python runner never submits jobs itself.  After determining the task count from
-the validated configuration, use the profile's array concurrency and resources, for
-example:
+the validated configuration, use the profile's array concurrency and resources.
+This example matches the checked-in SLURM profile and five Golgi fields. The
+64 GiB setting is a template, not a validated full-field Lamin allocation; the
+completed Lamin workflow used the bounded local profile described above:
 
 ```bash
-sbatch --array=0-24%3 --cpus-per-task=4 --mem=32G --time=12:00:00 \
-  --wrap='uv run --script scripts/run_analysis.py \
+sbatch --array=0-4%2 --cpus-per-task=1 --mem=64G --time=12:00:00 \
+  --wrap='uv run --locked python scripts/run_analysis.py \
     --analysis-config config/analysis.yaml --correspondence config/correspondence.csv \
     --qc-decisions config/qc-decisions.csv --execution-profile config/execution-slurm.yaml \
     --run-dir results/20260816-example --cohort golgi --task-index "$SLURM_ARRAY_TASK_ID"'
@@ -68,7 +139,7 @@ disposable and is deliberately different from the actual review directory:
 ```bash
 export UV_CACHE_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/.cache
 export UV_PYTHON_INSTALL_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/python
-uv run --script scripts/review_registration_qc.py \
+uv run --locked python scripts/review_registration_qc.py \
   --qc-root results/qc-only \
   --review-dir results/qc-review-preflight \
   --reviewer "preflight" \
@@ -86,7 +157,7 @@ Inside the operator's already running GUI-enabled VNC session, start the actual
 review in its own empty, non-final directory:
 
 ```bash
-uv run --script scripts/review_registration_qc.py \
+uv run --locked python scripts/review_registration_qc.py \
   --qc-root results/qc-only \
   --review-dir results/qc-review-actual \
   --reviewer "REVIEWER NAME" \
@@ -96,11 +167,15 @@ uv run --script scripts/review_registration_qc.py \
 The script does not configure VNC, a display server, browser, scheduler, or
 registration.  It requires the existing GUI-enabled VNC session and Tkinter 8.6;
 outside such a session it exits with concise guidance rather than opening a GUI.
+`launch_review.sh` uses the existing Tk-enabled conda interpreter with its own
+locked environment on `/project`; it does not replace the headless project
+environment. Set `CYCLIC_REVIEW_PYTHON` to select another Tk-enabled interpreter and
+`CYCLIC_REVIEW_ENVIRONMENT` to override that GUI environment path.
 After the first launch, resume without `--seed` (and normally without
 `--qc-root`), retaining the same review directory and reviewer:
 
 ```bash
-uv run --script scripts/review_registration_qc.py \
+uv run --locked python scripts/review_registration_qc.py \
   --review-dir results/qc-review-actual \
   --reviewer "REVIEWER NAME"
 ```
@@ -133,7 +208,7 @@ this application under a new root (for example, `results/qc-only-revision-1`), t
 attach it to the existing review state and continue reviewing the appended revision:
 
 ```bash
-uv run --script scripts/review_registration_qc.py \
+uv run --locked python scripts/review_registration_qc.py \
   --review-dir results/qc-review-actual \
   --reviewer "REVIEWER NAME" \
   --add-revision-root results/qc-only-revision-1
@@ -186,7 +261,7 @@ were verified against their original SHA-256 identities:
 ```bash
 export UV_CACHE_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/.cache
 export UV_PYTHON_INSTALL_DIR=/project/bioinformatics/Danuser_lab/Dean/dean/uv/python
-uv run --script scripts/run_analysis.py \
+uv run --locked python scripts/run_analysis.py \
   --analysis-config config/analysis-lamin-watershed.yaml \
   --correspondence config/correspondence-lamin-watershed.csv \
   --qc-decisions results/full-lamin-20260827/20260829T004550Z-d44d439cb118/config/qc-decisions.csv \

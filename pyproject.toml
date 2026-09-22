@@ -1,0 +1,48 @@
+[project]
+name = "cyclic-stability-analysis"
+version = "0.1.0"
+description = "Reproducible cyclic imaging stability analysis for Lamin, Golgi, and lysosomes"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "cy-exm[workflow] @ git+https://github.com/TheDeanLab/Cy-ExM.git@f6e0de36cd7f6b5e85f093884c2cf224225f4ec2",
+    "nd2==0.11.3",
+    "numpy>=1.26,<3",
+    "scipy>=1.12,<2",
+    "scikit-image>=0.22,<1",
+    "tifffile>=2025.1.10",
+    "PyYAML>=6,<7",
+    "pandas>=2.2,<3",
+    "matplotlib>=3.8,<4",
+    "seaborn>=0.13,<1",
+    "Jinja2>=3.1,<4",
+    "psutil>=5.9,<8",
+    "Pillow>=10,<13",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<9", "ruff==0.16.5"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+pythonpath = [".", "scripts", "tests"]
+addopts = "--strict-config --strict-markers"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+src = ["."]
+include = ["*.py", "*.pyi"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Existing script entry points add scripts/ to sys.path before local imports.
+"scripts/*.py" = ["E402"]
+# Preserve the existing local callable used by the bounded thread mapper.
+"scripts/cyclic_stability/lysosome.py" = ["E731"]

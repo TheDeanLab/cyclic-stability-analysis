@@ -90,7 +90,7 @@ def test_component_adjudication_survives_strict_surface_failure(
     """Moving normal realization back into adjudication would hide valid QC."""
     dapi = separated_nuclei(1, SPACING)
 
-    def fail_normals(*_args):
+    def fail_normals(*_args, **_kwargs):
         raise ValueError("synthetic strict-normal failure")
 
     monkeypatch.setattr(nuclear, "_surface_normals_and_curvature", fail_normals)

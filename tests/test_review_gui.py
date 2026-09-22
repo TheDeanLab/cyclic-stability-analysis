@@ -637,19 +637,24 @@ def test_validate_only_creates_and_resumes_without_tk(
 
 
 def test_hpc_launcher_selects_dynamic_tk_python(tmp_path: Path) -> None:
-    """The GUI launcher avoids uv's static-Tk standalone interpreter."""
+    """The portable launcher test selects a Tk interpreter and isolated lock env."""
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_uv = fake_bin / "uv"
     fake_uv.write_text(
-        "#!/bin/sh\nprintf '%s\\n' \"$@\"\n",
+        '#!/bin/sh\nprintf \'%s\\n\' "$UV_PROJECT_ENVIRONMENT" "$PWD" "$@"\n',
         encoding="utf-8",
     )
     fake_uv.chmod(0o755)
+    fake_python = fake_bin / "python3.12"
+    fake_python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_python.chmod(0o755)
     launcher = Path(__file__).resolve().parents[1] / "launch_review.sh"
     environment = os.environ.copy()
     environment["PATH"] = f"{fake_bin}:/usr/bin:/bin"
     environment["USER"] = "Reviewer"
+    environment["CYCLIC_REVIEW_PYTHON"] = str(fake_python)
+    environment["CYCLIC_REVIEW_ENVIRONMENT"] = str(tmp_path / "review-env")
 
     result = subprocess.run(
         ("bash", str(launcher)),
@@ -657,19 +662,19 @@ def test_hpc_launcher_selects_dynamic_tk_python(tmp_path: Path) -> None:
         capture_output=True,
         text=True,
         env=environment,
+        cwd=tmp_path,
     )
 
     assert result.returncode == 0, result.stderr
-    arguments = result.stdout.splitlines()
-    expected_python = (
-        "/project/bioinformatics/Danuser_lab/Dean/dean/conda-envs/"
-        "cyclic-review-gui-py312/bin/python3.12"
-    )
-    assert arguments[:4] == [
+    output = result.stdout.splitlines()
+    assert output[:2] == [str(tmp_path / "review-env"), str(launcher.parent)]
+    assert output[2:8] == [
         "run",
+        "--locked",
         "--python",
-        expected_python,
-        "--script",
+        str(fake_python),
+        "python",
+        "scripts/review_registration_qc.py",
     ]
 
 

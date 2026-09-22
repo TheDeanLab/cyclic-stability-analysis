@@ -554,9 +554,7 @@ def _merge_mip_seed_footprints(
             continue
         y_bounds = slice(int(y_coordinates.min()), int(y_coordinates.max()) + 1)
         x_bounds = slice(int(x_coordinates.min()), int(x_coordinates.max()) + 1)
-        result.append(
-            ((y_bounds, x_bounds), filled[y_bounds, x_bounds])
-        )
+        result.append(((y_bounds, x_bounds), filled[y_bounds, x_bounds]))
     return tuple(result)
 
 

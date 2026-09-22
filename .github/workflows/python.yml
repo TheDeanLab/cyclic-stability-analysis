@@ -1,0 +1,72 @@
+name: Python checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OPENBLAS_NUM_THREADS: '1'
+  OMP_NUM_THREADS: '1'
+  ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS: '1'
+  MPLBACKEND: Agg
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.7.13'
+          enable-cache: true
+      - name: Install locked development tools
+        run: uv sync --frozen --only-group dev
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.7.13'
+          enable-cache: true
+      - name: Install locked analysis environment
+        env:
+          GH_TOKEN: ${{ secrets.CYEXM_READ_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo '::error::Set CYEXM_READ_TOKEN to a read-only credential for TheDeanLab/Cy-ExM.'
+            exit 1
+          fi
+          gh auth setup-git
+          uv sync --locked --group dev
+      - run: uv run --no-sync pytest -q
+      - name: Check command entry points
+        run: |
+          for script in scripts/*.py; do
+            if [ "$script" != scripts/run_tests.py ]; then
+              uv run --no-sync python "$script" --help > /dev/null
+            fi
+          done
+      - name: Check standalone plot entry points
+        run: |
+          for script in scripts/plot_*.py; do
+            uv lock --check --script "$script"
+            uv run --locked --script "$script" --help > /dev/null
+          done
