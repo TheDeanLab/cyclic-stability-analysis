@@ -1495,28 +1495,47 @@ def write_nuclear_component_diagnostic(
     dapi_rounds: Mapping[int, NDArray[np.generic]],
     consensus: NuclearConsensus,
 ) -> Path:
-    """Write target-blind orthogonal component outlines and compact QC evidence."""
-    import matplotlib
-    import matplotlib.pyplot as plt
+    """Write an orthogonal overview followed by paginated component QC tables.
 
-    matplotlib.rcParams["pdf.fonttype"] = 42
-    matplotlib.rcParams["ps.fonttype"] = 42
+    Overview panels retain physical aspect ratios and fixed layout allocations.
+    All accepted and rejected components remain visible, with short ID labels;
+    full rejection reasons and measurements appear on subsequent table pages.
+    Every page uses the same 12-by-8-inch canvas.
+    """
     median_dapi = np.median(
         np.stack(
             [_normalized_dapi(_volume(image, "DAPI")) for image in dapi_rounds.values()]
         ),
         axis=0,
     )
-    sx, sy, sz = consensus.spacing_xyz_um
-    output_dir.mkdir(parents=True, exist_ok=True)
-    colors = (
-        "#0072B2",
-        "#E69F00",
-        "#009E73",
-        "#CC79A7",
-        "#56B4E9",
-        "#D55E00",
+    return _write_nuclear_component_inventory(
+        output_dir,
+        cell_id,
+        {
+            plane: median_dapi.max(axis=axis)
+            for plane, axis in (("XY", 0), ("XZ", 1), ("YZ", 2))
+        },
+        consensus,
     )
+
+
+def _write_nuclear_component_inventory(
+    output_dir: Path,
+    cell_id: str,
+    images: Mapping[str, NDArray[np.generic]],
+    consensus: NuclearConsensus,
+) -> Path:
+    """Render existing projections and component evidence without remeasurement."""
+    import textwrap
+
+    import matplotlib
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    matplotlib.rcParams["pdf.fonttype"] = 42
+    matplotlib.rcParams["ps.fonttype"] = 42
+    output_dir.mkdir(parents=True, exist_ok=True)
+    colors = ("#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9", "#D55E00")
     accepted = [item for item in consensus.component_diagnostics if item.accepted]
     color_by_id = {
         item.nucleus_id: colors[index % len(colors)]
@@ -1527,121 +1546,207 @@ def write_nuclear_component_diagnostic(
     }
     if set(diagnostic_by_id) != {item.nucleus_id for item in consensus.component_qc}:
         raise ValueError("component diagnostics do not match DAPI component QC")
+    sx, sy, sz = consensus.spacing_xyz_um
     projections = (
-        ("XY", 0, (0, 1), (sx, sy)),
-        ("XZ", 1, (0, 2), (sx, sz)),
-        ("YZ", 2, (1, 2), (sy, sz)),
+        ("XY", (0, 1), (sx, sy)),
+        ("XZ", (0, 2), (sx, sz)),
+        ("YZ", (1, 2), (sy, sz)),
     )
-    figure = plt.figure(figsize=(12, 8), layout="constrained")
-    grid = figure.add_gridspec(2, 3, height_ratios=(2.2, 1.0))
-    for column, (plane, projection_axis, centroid_axes, plot_spacing) in enumerate(
-        projections
-    ):
-        axis = figure.add_subplot(grid[0, column])
-        projection = median_dapi.max(axis=projection_axis)
-        horizontal_extent = (projection.shape[1] - 1) * plot_spacing[0]
-        vertical_extent = (projection.shape[0] - 1) * plot_spacing[1]
-        extent = (0.0, horizontal_extent, 0.0, vertical_extent)
-        axis.imshow(projection, cmap="gray", origin="lower", extent=extent)
-        for component in consensus.component_qc:
-            diagnostic = diagnostic_by_id[component.nucleus_id]
-            projected = next(
-                value for value in diagnostic.projections if value.plane == plane
-            )
-            color = color_by_id.get(component.nucleus_id, "#7F7F7F")
-            for outline in projected.outlines_ab_um:
-                axis.plot(
-                    outline[:, 0],
-                    outline[:, 1],
-                    color=color,
-                    linewidth=1.2 if component.accepted else 1.0,
-                    linestyle="-" if component.accepted else "--",
-                    zorder=2,
-                )
-            point = (
-                component.centroid_xyz_um[centroid_axes[0]],
-                component.centroid_xyz_um[centroid_axes[1]],
-            )
-            touches_boundary = max(component.face_contact_fractions) > 0.0
-            axis.scatter(
-                *point,
-                color=color,
-                edgecolor="#D62728" if touches_boundary else "white",
-                linewidth=1.2,
-                marker="o" if component.accepted else "s",
-                s=22,
-                zorder=3,
-            )
-            rejection = (
-                ""
-                if component.accepted
-                else f" ({','.join(component.rejection_reasons)})"
-            )
-            axis.annotate(
-                f"{component.nucleus_id}{rejection}",
-                point,
-                xytext=(3, 3),
-                textcoords="offset points",
-                color=color,
-                fontsize=7,
-            )
-        axis.set(
-            title=f"DAPI {plane} maximum projection",
-            xlabel=f"{plane[0]} (um)",
-            ylabel=f"{plane[1]} (um)",
-            aspect="equal",
-        )
-    table_axis = figure.add_subplot(grid[1, :])
-    table_axis.axis("off")
-    column_labels = (
-        "ID",
-        "accepted",
-        "expanded volume (um3)",
-        "nominal volume (um3)",
-        "sphericity",
-        "centroid XYZ (um)",
-        "max face contact",
-        "rejection code(s)",
-        "outline points",
-    )
-    table_values = [
-        (
-            component.nucleus_id,
-            str(component.accepted),
-            f"{component.expanded_volume_um3:.3f}",
-            f"{component.nominal_volume_um3:.3f}",
-            f"{component.sphericity:.4f}",
-            ", ".join(f"{value:.3f}" for value in component.centroid_xyz_um),
-            f"{max(component.face_contact_fractions):.5f}",
-            ",".join(component.rejection_reasons) or "accepted",
-            "/".join(
-                str(projection.retained_point_count)
-                for projection in diagnostic_by_id[component.nucleus_id].projections
-            ),
-        )
-        for component in consensus.component_qc
-    ]
-    table = table_axis.table(
-        cellText=table_values,
-        colLabels=column_labels,
-        loc="center",
-        cellLoc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(7)
-    table.scale(1.0, 1.25)
-    figure.suptitle(f"{cell_id}: target-blind DAPI component inventory")
-    figure.text(
-        0.5,
-        0.01,
+    footer = (
         "Diagnostic-only orthogonal outlines; deterministically capped at "
-        f"{_DIAGNOSTIC_MAX_POINTS_PER_PROJECTION} points per component/projection.",
-        ha="center",
-        fontsize=7,
+        f"{_DIAGNOSTIC_MAX_POINTS_PER_PROJECTION} points per component/projection."
     )
     path = output_dir / "nuclear-component-inventory.pdf"
-    figure.savefig(path)
-    plt.close(figure)
+    with PdfPages(path) as pdf:
+        # Fixed allocations deliberately exclude annotations and tables from layout.
+        figure = plt.figure(figsize=(12, 8))
+        try:
+            grid = figure.add_gridspec(
+                1, 3, left=0.06, right=0.98, bottom=0.20, top=0.80, wspace=0.24
+            )
+            for column, (plane, centroid_axes, plot_spacing) in enumerate(projections):
+                axis = figure.add_subplot(grid[0, column])
+                projection = images[plane]
+                extent = (
+                    0.0,
+                    (projection.shape[1] - 1) * plot_spacing[0],
+                    0.0,
+                    (projection.shape[0] - 1) * plot_spacing[1],
+                )
+                axis.imshow(projection, cmap="gray", origin="lower", extent=extent)
+                axis.set(
+                    xlim=extent[:2],
+                    ylim=extent[2:],
+                    xlabel=f"{plane[0]} (um)",
+                    ylabel=f"{plane[1]} (um)",
+                    aspect="equal",
+                )
+                figure.canvas.draw()
+                height_points = axis.get_window_extent().height * 72 / figure.dpi
+                ordered = sorted(
+                    consensus.component_qc,
+                    key=lambda item: (
+                        item.centroid_xyz_um[centroid_axes[0]],
+                        item.nucleus_id,
+                    ),
+                )
+                slots = min(8, max(1, len(ordered)))
+                for index, component in enumerate(ordered):
+                    diagnostic = diagnostic_by_id[component.nucleus_id]
+                    projected = next(
+                        value
+                        for value in diagnostic.projections
+                        if value.plane == plane
+                    )
+                    color = color_by_id.get(component.nucleus_id, "#7F7F7F")
+                    for outline in projected.outlines_ab_um:
+                        axis.plot(
+                            outline[:, 0],
+                            outline[:, 1],
+                            color=color,
+                            linewidth=1.2 if component.accepted else 1.0,
+                            linestyle="-" if component.accepted else "--",
+                            zorder=2,
+                        )
+                    point = tuple(
+                        component.centroid_xyz_um[dim] for dim in centroid_axes
+                    )
+                    axis.scatter(
+                        *point,
+                        color=color,
+                        edgecolor="#D62728"
+                        if max(component.face_contact_fractions) > 0.0
+                        else "white",
+                        linewidth=1.2,
+                        marker="o" if component.accepted else "s",
+                        s=22,
+                        zorder=3,
+                    )
+                    label = axis.annotate(
+                        component.nucleus_id,
+                        point,
+                        xytext=(
+                            (index % slots + 0.5) / slots,
+                            1 + (8 + 12 * (index // slots)) / height_points,
+                        ),
+                        textcoords="axes fraction",
+                        ha="center",
+                        va="bottom",
+                        color=color,
+                        fontsize=7,
+                        arrowprops={
+                            "arrowstyle": "-",
+                            "color": color,
+                            "linewidth": 0.5,
+                        },
+                        annotation_clip=False,
+                    )
+                    label.set_in_layout(False)
+                position = axis.get_position(original=True)
+                figure.text(
+                    position.x0 + position.width / 2,
+                    0.89,
+                    f"DAPI {plane} maximum projection",
+                    ha="center",
+                    fontsize=11,
+                )
+            figure.suptitle(f"{cell_id}: target-blind DAPI component inventory", y=0.97)
+            figure.text(
+                0.5,
+                0.13,
+                f"{len(accepted)} accepted; {len(consensus.component_qc) - len(accepted)} rejected. Full component QC follows on subsequent pages.",
+                ha="center",
+                fontsize=10,
+            )
+            figure.text(
+                0.5,
+                0.09,
+                "Accepted: colored solid outlines / circles. Rejected: gray dashed outlines / squares. Red marker edge: boundary contact.",
+                ha="center",
+                fontsize=8,
+            )
+            figure.text(0.5, 0.035, footer, ha="center", fontsize=7)
+            pdf.savefig(figure)
+        finally:
+            plt.close(figure)
+
+        columns = (
+            "ID",
+            "accepted",
+            "expanded volume\n(um3)",
+            "nominal volume\n(um3)",
+            "sphericity",
+            "centroid XYZ\n(um)",
+            "max face\ncontact",
+            "rejection code(s)",
+            "outline points\nXY / XZ / YZ",
+        )
+        widths = (0.055, 0.065, 0.105, 0.095, 0.07, 0.10, 0.08, 0.31, 0.12)
+        rows = []
+        for component in consensus.component_qc:
+            values = (
+                component.nucleus_id,
+                str(component.accepted),
+                f"{component.expanded_volume_um3:.3f}",
+                f"{component.nominal_volume_um3:.3f}",
+                f"{component.sphericity:.4f}",
+                "\n".join(f"{value:.3f}" for value in component.centroid_xyz_um),
+                f"{max(component.face_contact_fractions):.5f}",
+                "\n".join(
+                    textwrap.fill(
+                        reason, width=38, break_long_words=True, break_on_hyphens=True
+                    )
+                    for reason in component.rejection_reasons
+                )
+                or "accepted",
+                " / ".join(
+                    str(value.retained_point_count)
+                    for value in diagnostic_by_id[component.nucleus_id].projections
+                ),
+            )
+            # Heights are physical page fractions, independent of the row count.
+            height = (max(value.count("\n") + 1 for value in values) * 11 + 10) / 576
+            rows.append((values, height))
+        pages = []
+        current = []
+        used = 0.0
+        for row in rows:
+            if current and used + row[1] > 0.72:
+                pages.append(current)
+                current, used = [], 0.0
+            current.append(row)
+            used += row[1]
+        if current:
+            pages.append(current)
+        for number, page_rows in enumerate(pages, start=1):
+            figure = plt.figure(figsize=(12, 8))
+            try:
+                axis = figure.add_axes((0.035, 0.0, 0.93, 1.0))
+                axis.axis("off")
+                table_height = 0.07 + sum(height for _, height in page_rows)
+                table = axis.table(
+                    cellText=[values for values, _ in page_rows],
+                    colLabels=columns,
+                    colWidths=widths,
+                    cellLoc="center",
+                    bbox=(0, 0.86 - table_height, 1, table_height),
+                )
+                table.auto_set_font_size(False)
+                table.set_fontsize(8)
+                for (row_index, _), cell in table.get_celld().items():
+                    cell.set_height(
+                        0.07 if row_index == 0 else page_rows[row_index - 1][1]
+                    )
+                    if row_index == 0:
+                        cell.set_facecolor("#EAEAEA")
+                figure.suptitle(
+                    f"{cell_id}: DAPI component QC — table {number}/{len(pages)}",
+                    y=0.97,
+                )
+                figure.text(0.5, 0.035, footer, ha="center", fontsize=7)
+                pdf.savefig(figure)
+            finally:
+                plt.close(figure)
     return path
 
 

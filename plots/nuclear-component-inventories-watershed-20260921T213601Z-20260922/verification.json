@@ -1,0 +1,153 @@
+{
+  "status": "verified",
+  "source_run": "full-lamin-watershed-20260921/20260921T213601Z",
+  "all_five_inventory_pdfs_complete": true,
+  "fixed_projection_widths_verified": true,
+  "checks": [
+    {
+      "cell_id": "Cell1",
+      "pdf": "/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/nuclear-component-inventories-watershed-20260921T213601Z-20260922/Cell1/nuclear-component-inventory.pdf",
+      "pages": 2,
+      "components": 1,
+      "accepted": 1,
+      "all_ids_on_each_projection": true,
+      "full_qc_table_retained": true,
+      "uniform_page_size_points": [
+        864,
+        576
+      ],
+      "image_sizes": [
+        [
+          317,
+          318
+        ],
+        [
+          318,
+          30
+        ],
+        [
+          317,
+          30
+        ]
+      ],
+      "source_record_and_pdf_unchanged": true,
+      "pdf_sha256": "21979dec8f0aa74699ac095f6d155924adab53020667ccd4f11b4bc6f35590d3"
+    },
+    {
+      "cell_id": "Cell2",
+      "pdf": "/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/nuclear-component-inventories-watershed-20260921T213601Z-20260922/Cell2/nuclear-component-inventory.pdf",
+      "pages": 2,
+      "components": 4,
+      "accepted": 4,
+      "all_ids_on_each_projection": true,
+      "full_qc_table_retained": true,
+      "uniform_page_size_points": [
+        864,
+        576
+      ],
+      "image_sizes": [
+        [
+          317,
+          318
+        ],
+        [
+          318,
+          40
+        ],
+        [
+          317,
+          40
+        ]
+      ],
+      "source_record_and_pdf_unchanged": true,
+      "pdf_sha256": "a307140f31225df7b72b7ebe44ba174e373426012c86989a48e4b7b35c4f241b"
+    },
+    {
+      "cell_id": "Cell3",
+      "pdf": "/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/nuclear-component-inventories-watershed-20260921T213601Z-20260922/Cell3/nuclear-component-inventory.pdf",
+      "pages": 2,
+      "components": 3,
+      "accepted": 3,
+      "all_ids_on_each_projection": true,
+      "full_qc_table_retained": true,
+      "uniform_page_size_points": [
+        864,
+        576
+      ],
+      "image_sizes": [
+        [
+          317,
+          318
+        ],
+        [
+          318,
+          32
+        ],
+        [
+          317,
+          32
+        ]
+      ],
+      "source_record_and_pdf_unchanged": true,
+      "pdf_sha256": "b660be7bdc7a33c80de402d8d08ce6895b8cd5577af299e4b3361966bb5308b4"
+    },
+    {
+      "cell_id": "Cell4",
+      "pdf": "/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/nuclear-component-inventories-watershed-20260921T213601Z-20260922/Cell4/nuclear-component-inventory.pdf",
+      "pages": 3,
+      "components": 12,
+      "accepted": 3,
+      "all_ids_on_each_projection": true,
+      "full_qc_table_retained": true,
+      "uniform_page_size_points": [
+        864,
+        576
+      ],
+      "image_sizes": [
+        [
+          317,
+          318
+        ],
+        [
+          318,
+          34
+        ],
+        [
+          317,
+          34
+        ]
+      ],
+      "source_record_and_pdf_unchanged": true,
+      "pdf_sha256": "2a8b5e6f0a68a593e9eea1a1e22803eaa954afa15a43d1e5bd48e5d5200f436b"
+    },
+    {
+      "cell_id": "Cell5",
+      "pdf": "/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/nuclear-component-inventories-watershed-20260921T213601Z-20260922/Cell5/nuclear-component-inventory.pdf",
+      "pages": 2,
+      "components": 4,
+      "accepted": 4,
+      "all_ids_on_each_projection": true,
+      "full_qc_table_retained": true,
+      "uniform_page_size_points": [
+        864,
+        576
+      ],
+      "image_sizes": [
+        [
+          317,
+          318
+        ],
+        [
+          318,
+          32
+        ],
+        [
+          317,
+          32
+        ]
+      ],
+      "source_record_and_pdf_unchanged": true,
+      "pdf_sha256": "a4b34478f58d5b8123cf65d501ed8ae8da27e4295c09c0466b88fdfa98745b02"
+    }
+  ]
+}

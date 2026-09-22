@@ -1,0 +1,165 @@
+{
+  "cell_id": "Cell2",
+  "source_attempt": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/full-lamin-watershed-20260921/20260921T213601Z/tasks/lamin-Cell2/attempts/98725a3c423243c4a529559369cf4c3d",
+  "source_record_sha256": "aa8742ff506e0a36d2a48b0a747b24e91d404d44875b025f2780dcbf1d3a72e6",
+  "source_pdf_sha256": "ffcbc3449d96d2671ed3d6ef748c7cbbd5d1f8ffc479d8f615f896cf69388d0b",
+  "source_qc_sha256": "9f36a87d31f1c7f8ef8a038f65ab9e33d958ec7abb54914f6a5fe8ec49dde563",
+  "source_labels_sha256": "4e18695eb546cd84b4782e92b2a634f49fd7370e44ed08b27f1d001b9c9a4542",
+  "input_identities": [
+    {
+      "path": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/u2os_lamin/outputs/20260815-u2os-lamin-cell2/rounds/round-001/channels/round_1_405_DAPI.tif",
+      "sha256": "0df71ce431ef6f5aeb9cc1c20b7e7d7c9f144ca1c4db779e74e1a01fcff663bc",
+      "st_mtime_ns": 1786832980420258228,
+      "st_size": 1022642128
+    },
+    {
+      "path": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/u2os_lamin/outputs/20260815-u2os-lamin-cell2/rounds/round-002/channels/round_2_405_DAPI.tif",
+      "sha256": "58def533b9f0868c75ba1ebfc48dec362ec827eeef636cd90ff95d4449dae524",
+      "st_mtime_ns": 1786794861721717656,
+      "st_size": 1022642128
+    },
+    {
+      "path": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/u2os_lamin/outputs/20260815-u2os-lamin-cell2/rounds/round-003/channels/round_3_405_DAPI.tif",
+      "sha256": "c813b656df009527b6d3e61295f62e1b6e02dea43944b39b5728182254c7615b",
+      "st_mtime_ns": 1786835385399099171,
+      "st_size": 1022642128
+    },
+    {
+      "path": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/u2os_lamin/outputs/20260815-u2os-lamin-cell2/rounds/round-004/channels/round_4_405_DAPI.tif",
+      "sha256": "4462f5f0e765881931f5d5c3a13ca5e54da036c783774591a9b8a00e557cff77",
+      "st_mtime_ns": 1786834409638158184,
+      "st_size": 1022642128
+    },
+    {
+      "path": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/u2os_lamin/outputs/20260815-u2os-lamin-cell2/rounds/round-005/channels/round_5_405_DAPI.tif",
+      "sha256": "ae5c0f8e7bf985d273140c660413944d7cc183a30945c586e08ee09bb6fa6b3d",
+      "st_mtime_ns": 1786834558900106771,
+      "st_size": 1022642128
+    }
+  ],
+  "input_identity_check": "recorded size and mtime; original recorded SHA256 retained",
+  "accepted_rounds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "outline_replay": "Outlines reconstructed directly from saved accepted labels; QC table reused verbatim",
+  "component_count": 4,
+  "accepted_count": 4,
+  "component_qc": [
+    {
+      "nucleus_id": "N001",
+      "accepted": true,
+      "rejection_reasons": [],
+      "expanded_volume_um3": 48174.822891738,
+      "nominal_volume_um3": 528.6674665759999,
+      "sphericity": 0.5392461813142203,
+      "centroid_xyz_um": [
+        87.4959163425902,
+        144.58209102244695,
+        12.505505969010489
+      ],
+      "face_contact_fractions": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "nucleus_id": "N002",
+      "accepted": true,
+      "rejection_reasons": [],
+      "expanded_volume_um3": 37106.183777841,
+      "nominal_volume_um3": 407.2009193727407,
+      "sphericity": 0.561796657951459,
+      "centroid_xyz_um": [
+        108.3283024546625,
+        59.995836722616794,
+        12.990169752604968
+      ],
+      "face_contact_fractions": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "nucleus_id": "N003",
+      "accepted": true,
+      "rejection_reasons": [],
+      "expanded_volume_um3": 34870.28905669499,
+      "nominal_volume_um3": 382.66435178814805,
+      "sphericity": 0.41683437571216553,
+      "centroid_xyz_um": [
+        142.8478136211344,
+        178.90437441930115,
+        12.774670519980402
+      ],
+      "face_contact_fractions": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "nucleus_id": "N004",
+      "accepted": true,
+      "rejection_reasons": [],
+      "expanded_volume_um3": 72718.689895515,
+      "nominal_volume_um3": 798.010314354074,
+      "sphericity": 0.5916893677402645,
+      "centroid_xyz_um": [
+        165.8863133311059,
+        89.31803789979409,
+        14.41208381952571
+      ],
+      "face_contact_fractions": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "outline_point_counts": {
+    "N001": {
+      "XY": 2048,
+      "XZ": 1541,
+      "YZ": 1489
+    },
+    "N002": {
+      "XY": 2048,
+      "XZ": 1469,
+      "YZ": 1709
+    },
+    "N003": {
+      "XY": 2048,
+      "XZ": 1519,
+      "YZ": 1681
+    },
+    "N004": {
+      "XY": 2048,
+      "XZ": 1689,
+      "YZ": 1623
+    }
+  },
+  "original_attempt_files_unchanged": 105,
+  "renderer_sha256": "34134ecd29b59cace3cdffd16ba59fa36105cc1417ac6360c5ae426687a05a66",
+  "regeneration_script_sha256": "e4f8ad6adce6dcb582dd2aeb2aef8f3cec3a50e2377c91140264814f7a9cff44",
+  "pdf": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/plots/nuclear-component-inventories-watershed-20260921T213601Z-20260922/Cell2/nuclear-component-inventory.pdf",
+  "pdf_sha256": "a307140f31225df7b72b7ebe44ba174e373426012c86989a48e4b7b35c4f241b",
+  "completed_at": "2026-09-22T17:17:58.448174+00:00"
+}

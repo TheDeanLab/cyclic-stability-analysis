@@ -282,3 +282,10 @@ Each completed field now retains `diagnostics/consensus-nuclear-labels.npz` with
 `nucleus_ids[i]`. This records exact accepted masks and supports parent-to-daughter
 correspondence; rejected and explicitly excluded candidates remain in
 `nuclear-component-qc.csv` and the component-inventory diagnostics.
+
+`diagnostics/nuclear-component-inventory.pdf` uses a fixed 12-by-8-inch overview
+with physical XY/XZ/YZ projections, short component IDs, and accepted/rejected
+outlines. Subsequent pages contain the complete QC table with wrapped rejection
+reasons and repeated headers. Larger inventories add table pages without
+shrinking the images. Presentation-only redraws of completed runs belong in a
+separate output directory so the original artifact checksums remain valid.
