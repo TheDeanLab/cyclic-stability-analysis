@@ -1,0 +1,89 @@
+{
+  "run_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/full-lamin-watershed-20260921/20260921T213601Z",
+  "source_task_table": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/full-lamin-watershed-20260921/20260921T213601Z/compact-tasks.csv",
+  "completed_cells": [
+    "Cell1",
+    "Cell2",
+    "Cell3",
+    "Cell4",
+    "Cell5"
+  ],
+  "failed_cells": [],
+  "quantitative_comparison_set": "matched-settings",
+  "quantitative_endpoints": [
+    "lamin_surface_coverage",
+    "lamin_continuity",
+    "lamin_fwhm_median",
+    "lamin_integrated_ridge_intensity_median"
+  ],
+  "summary_statistic": "mean",
+  "aggregate_rows_excluded": true,
+  "included_nuclei": [
+    {
+      "cell_id": "Cell1",
+      "nucleus_id": "N001"
+    },
+    {
+      "cell_id": "Cell2",
+      "nucleus_id": "N001"
+    },
+    {
+      "cell_id": "Cell2",
+      "nucleus_id": "N002"
+    },
+    {
+      "cell_id": "Cell2",
+      "nucleus_id": "N003"
+    },
+    {
+      "cell_id": "Cell2",
+      "nucleus_id": "N004"
+    },
+    {
+      "cell_id": "Cell3",
+      "nucleus_id": "N001"
+    },
+    {
+      "cell_id": "Cell3",
+      "nucleus_id": "N002"
+    },
+    {
+      "cell_id": "Cell3",
+      "nucleus_id": "N003"
+    },
+    {
+      "cell_id": "Cell4",
+      "nucleus_id": "N001"
+    },
+    {
+      "cell_id": "Cell4",
+      "nucleus_id": "N002"
+    },
+    {
+      "cell_id": "Cell4",
+      "nucleus_id": "N003"
+    },
+    {
+      "cell_id": "Cell5",
+      "nucleus_id": "N001"
+    },
+    {
+      "cell_id": "Cell5",
+      "nucleus_id": "N002"
+    },
+    {
+      "cell_id": "Cell5",
+      "nucleus_id": "N003"
+    },
+    {
+      "cell_id": "Cell5",
+      "nucleus_id": "N004"
+    }
+  ],
+  "confidence_interval": {
+    "method": "percentile bootstrap over QC-included nuclei per round",
+    "level": 0.95,
+    "replicates": 10000,
+    "seed": 20260829
+  }
+}

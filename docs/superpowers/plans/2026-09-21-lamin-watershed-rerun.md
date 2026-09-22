@@ -46,11 +46,11 @@ voxel-count-guarded exclusion in the run configuration before surface realizatio
 - [x] Run targeted and relevant broader tests; distinguish the two documented
   baseline failures from new failures. Format/lint changed files, review diff,
   and commit the implementation locally with this reuse analysis.
-- [ ] Run a bounded real-data Cell3 smoke test using the new settings and the frozen
+- [x] Run a bounded real-data Cell3 smoke test using the new settings and the frozen
   validated mask, inspect daughter surfaces and sampled round-2 Lamin profiles,
   and only then run the five-field workflow. Historical full fields require
   53-119 minutes each; the bounded smoke is not a production measurement.
-- [ ] Verify terminal records and all required artifacts, map original parent IDs
+- [x] Verify terminal records and all required artifacts, map original parent IDs
   to revised nuclei/exclusion, regenerate PNG/PDF/provenance with
   `scripts/plot_lamin_run.py`, inspect the plot, and commit the publication outputs
   and run report. Report artifact completion separately from scientific limits.
@@ -80,3 +80,15 @@ voxel-count-guarded exclusion in the run configuration before surface realizatio
   matches exactly 7,248,164 voxels. Smoke samples are not production results.
 - The DAPI-only inventory now applies the same explicit exclusions as Lamin
   measurement; its regression and existing entry-point tests pass.
+
+## Completed run
+
+- Run `20260921T213601Z`: all five fields completed; plotting completed at
+  2026-09-22 00:49:52 UTC and the full audit passed at 00:50:55 UTC.
+- Accepted counts: 1, 4, 3, 3, 4 (15 total). Both expected pairs split; the
+  original Cell4/N003 is excluded, and every original parent is accounted for.
+- The audit verified 482 content identities and 240 plotted measurement rows.
+  At final review all recorded sizes/mtimes remained unchanged, and all five
+  terminal-selected records still matched their recorded SHA-256 digests.
+- The final overview PNG was visually inspected. Figure, provenance, parent/daughter
+  mapping, plotted measurements, comparison table, and report are saved under `plots/`.
