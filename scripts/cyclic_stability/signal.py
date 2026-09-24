@@ -10,6 +10,7 @@ from typing import Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from cyclic_stability.golgi_segmentation import corrected_mask_values
 from cyclic_stability.models import AnalysisConfig, RoundSpec
 from cyclic_stability.morphology import MaskMember, validated_binary_mask
 
@@ -28,7 +29,7 @@ class SignalRow:
     comparison_set: str
     exposure_normalized: bool
     sigma_um: float
-    threshold_sbr: float
+    threshold_sbr: float | None
     measurement_status: Literal["measured", "empty-mask"]
     integrated_per_ms: float | None
     signal_to_background_ratio: float | None
@@ -36,6 +37,9 @@ class SignalRow:
     raw_percentiles: Mapping[int, float]
     corrected_percentiles: Mapping[int, float]
     nucleus_id: str = "aggregate"
+    threshold_method: str = "sbr"
+    threshold_value: float | None = None
+    minimum_component_volume_um3: float | None = None
 
 
 PERCENTILES = (10, 25, 50, 75, 90, 95, 99)
@@ -87,7 +91,7 @@ def measure_signal(
 ) -> tuple[SignalRow, ...]:
     """Measure raw unregistered target signal within a target-independent ROI.
 
-    Each member's smoothed threshold mask is intersected with the independently
+    Each member's threshold mask is intersected with the independently
     supplied structure ROI. Correction and integration always use the original
     target intensities, never the image used to construct a threshold mask. Empty
     intersections emit an explicit unmeasured row so no configured curve member is
@@ -136,18 +140,29 @@ def measure_signal(
                     positive_volume_um3=None,
                     raw_percentiles=MappingProxyType({}),
                     corrected_percentiles=MappingProxyType({}),
+                    threshold_method=member.threshold_method,
+                    threshold_value=member.threshold_value,
+                    minimum_component_volume_um3=member.minimum_component_volume_um3,
                 )
             )
             continue
-        corrected = np.clip(target_float - member.background.median, 0.0, None)
-        corrected_values = corrected[mask]
+        corrected_values = corrected_mask_values(target_float, member, mask)
         raw_percentiles = _percentiles(raw)
         corrected_percentiles = _percentiles(corrected_values)
         integrated_per_ms = float(
             corrected_values.sum() / round_spec.target_exposure_ms
         )
-        sbr = float(
-            (np.median(raw) - member.background.median) / member.background.scale
+        sbr = (
+            float(
+                (
+                    np.median(corrected_values)
+                    if member.plane_background is not None
+                    else np.median(raw) - member.background.median
+                )
+                / member.background.scale
+            )
+            if member.background.scale > 0
+            else None
         )
         positive_volume_um3 = float(mask.sum() * np.prod(member.spacing_xyz_um))
         rows.append(
@@ -165,6 +180,9 @@ def measure_signal(
                 positive_volume_um3=positive_volume_um3,
                 raw_percentiles=raw_percentiles,
                 corrected_percentiles=corrected_percentiles,
+                threshold_method=member.threshold_method,
+                threshold_value=member.threshold_value,
+                minimum_component_volume_um3=member.minimum_component_volume_um3,
             )
         )
     return tuple(rows)

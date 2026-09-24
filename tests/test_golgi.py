@@ -876,8 +876,9 @@ def test_cell_entry_requires_explicit_common_support_and_publishes_overlays(
         )
 
 
+@pytest.mark.parametrize("otsu", [False, True])
 def test_golgi_cell_publishes_target_blind_component_diagnostic(
-    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, otsu
 ) -> None:
     """Golgi output must include the same renderer fed only registered DAPI."""
     round_two = next(
@@ -915,10 +916,15 @@ def test_golgi_cell_publishes_target_blind_component_diagnostic(
     )
     monkeypatch.setattr("cyclic_stability.golgi._MAX_RETAINED_GOLGI_CROP_FRACTION", 1.0)
 
+    config = _small_nucleus_config(analysis_config)
+    if otsu:
+        config = replace(
+            config, golgi=replace(config.golgi, segmentation_method="plane-median-otsu")
+        )
     result = analyze_golgi_cell(
         cell,
         (artifact,),
-        _small_nucleus_config(analysis_config),
+        config,
         tmp_path / "out",
     )
 
@@ -928,6 +934,17 @@ def test_golgi_cell_publishes_target_blind_component_diagnostic(
     with np.load(tmp_path / "out" / "golgi-registered-overlays.npz") as overlay:
         np.testing.assert_array_equal(overlay["crop_start_zyx"], (0, 0, 0))
         np.testing.assert_array_equal(overlay["full_shape_zyx"], dapi.shape)
+        if otsu:
+            assert not np.any(
+                overlay["round_2_otsu_threshold_mask_zyx"]
+                & overlay["nuclear_exclusion_mask_zyx"]
+            )
+            metadata = json.loads(
+                (tmp_path / "out" / "golgi-segmentation-qc.json").read_text()
+            )
+            assert metadata[0]["nuclear_overlap_voxels"] == 0
+            assert metadata[0]["method"] == "plane-median-otsu"
+            assert all(row.threshold_sbr is None for row in result.ensemble_rows)
 
 
 def test_atomic_golgi_diagnostic_publisher_restores_previous_tree_on_failure(

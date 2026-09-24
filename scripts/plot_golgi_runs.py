@@ -105,7 +105,7 @@ def _completed_tasks(run_dir: Path) -> list[tuple[str, Path]]:
 
 
 def _raw_signal_summary(raw_signal: pd.DataFrame) -> pd.DataFrame:
-    """Collapse the nine segmentation settings to one raw-signal value per cell/round."""
+    """Collapse the configured segmentation settings to one raw-signal value per cell/round."""
     measured = raw_signal.loc[
         raw_signal["measurement_status"].eq("measured")
         & raw_signal["nucleus_id"].eq("aggregate")
@@ -194,7 +194,7 @@ def normalize_to_reference_round(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def bootstrap_mean_ci(table: pd.DataFrame) -> pd.DataFrame:
-    """Return a percentile-bootstrap 95% CI across biological cells per round."""
+    """Return a percentile-bootstrap 95% CI across acquisition fields per round."""
     rng = np.random.default_rng(BOOTSTRAP_SEED)
     records: list[dict[str, float | int]] = []
     for acquisition_round, group in table.groupby("acquisition_round", sort=True):
@@ -252,7 +252,7 @@ def render(run_dirs: list[Path], output_stem: Path) -> None:
         left=0.08, right=0.98, bottom=0.10, top=0.84, hspace=0.55, wspace=0.34
     )
     figure.suptitle(
-        "Cyclic Golgi stability: five-cell cohort",
+        "Cyclic Golgi stability: five-field cohort",
         x=0.08,
         ha="left",
         fontsize=17,
@@ -261,7 +261,7 @@ def render(run_dirs: list[Path], output_stem: Path) -> None:
     figure.text(
         0.08,
         0.935,
-        "Points and pale lines: individual cells. Indigo line and band: mean ± bootstrap 95% CI. "
+        "Points and pale lines: individual fields. Indigo line and band: mean ± bootstrap 95% CI. "
         "Round 1 is an exposure-sensitivity condition.",
         ha="left",
         color="#3f3f46",
@@ -320,9 +320,9 @@ def render(run_dirs: list[Path], output_stem: Path) -> None:
     provenance = {
         "run_dirs": [str(path.resolve()) for path in run_dirs],
         "cell_ids": sorted(data["cell_id"].unique().tolist()),
-        "summary_statistic": "mean across five cells",
+        "summary_statistic": "mean across five acquisition fields",
         "confidence_interval": {
-            "method": "percentile bootstrap over biological cells per round",
+            "method": "percentile bootstrap over acquisition fields per round",
             "level": 0.95,
             "replicates": BOOTSTRAP_REPLICATES,
             "seed": BOOTSTRAP_SEED,

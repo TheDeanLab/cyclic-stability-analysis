@@ -97,8 +97,9 @@ def test_build_tasks_requires_registered_tiffs_but_not_original_nd2(
     assert len(tasks) == 1
 
 
+@pytest.mark.parametrize("otsu", [False, True])
 def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
-    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, otsu
 ) -> None:
     """Accepted and rejected DAPI components must remain visible without target fields."""
     from cyclic_stability import golgi, images, morphology, provenance, registration_qc
@@ -118,6 +119,10 @@ def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
         for number in (1, 3, 4, 5)
     )
     config = replace(analysis_config, qc_decisions=decisions)
+    if otsu:
+        config = replace(
+            config, golgi=replace(config.golgi, segmentation_method="plane-median-otsu")
+        )
     component_qc_rows = (
         NuclearComponentQc(
             "N001",
@@ -190,6 +195,18 @@ def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
         preflight=PreflightSnapshot((), ()),
     )
     output = default_marker_analyzer(task, tmp_path / "output")
+    if otsu:
+        paths = [
+            path
+            for path in output.diagnostics
+            if path.parent.name == "native-signal-diagnostics"
+        ]
+        assert len(paths) == 10
+        with np.load(
+            tmp_path / "output/native-signal-diagnostics/round-2-segmentation.npz"
+        ) as saved:
+            np.testing.assert_array_equal(saved["background_by_plane"], [1.0, 1.0, 1.0])
+            assert not saved["retained_mask_zyx"].any()
     progress = capsys.readouterr().err
     assert "stage=target-blind-qc:start" in progress
     assert "stage=golgi:target-specific:complete" in progress

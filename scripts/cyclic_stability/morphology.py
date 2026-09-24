@@ -23,10 +23,16 @@ class MaskMember:
 
     mask_zyx: NDArray[np.bool_]
     sigma_um: float
-    threshold_sbr: float
+    threshold_sbr: float | None
     background: BackgroundSummary
     spacing_xyz_um: tuple[float, float, float]
     mask_status: Literal["nonempty", "empty"]
+    threshold_method: str = "sbr"
+    threshold_value: float | None = None
+    minimum_component_volume_um3: float | None = None
+    plane_background: NDArray[np.float64] | None = None
+    rejected_mask_zyx: NDArray[np.bool_] | None = None
+    component_sizes_voxels: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

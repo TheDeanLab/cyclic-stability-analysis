@@ -276,9 +276,27 @@ def _parse_scientific_config(
             "minimum_sphericity",
             "maximum_face_contact_fraction",
         },
-        optional_keys=frozenset({"watershed_seed_prominence_um"}),
+        optional_keys=frozenset(
+            {"watershed_seed_prominence_um", "plane_background_percentile"}
+        ),
     )
-    golgi_data = _mapping(data["golgi"], "golgi", {"perinuclear_outer_distance_um"})
+    golgi_data = _mapping(
+        data["golgi"],
+        "golgi",
+        {"perinuclear_outer_distance_um"},
+        optional_keys=frozenset(
+            {"segmentation_method", "minimum_component_volume_um3"}
+        ),
+    )
+    if golgi_data.get("segmentation_method", "sbr") not in {"sbr", "plane-median-otsu"}:
+        raise ValueError("golgi.segmentation_method must be sbr or plane-median-otsu")
+    plane_percentile = nuclear_data.get("plane_background_percentile")
+    if plane_percentile is not None:
+        plane_percentile = _number(
+            plane_percentile, "nuclear.plane_background_percentile"
+        )
+        if plane_percentile >= 50:
+            raise ValueError("nuclear.plane_background_percentile must be below 50")
     lysosome_data = _mapping(
         data["lysosome"],
         "lysosome",
@@ -318,6 +336,7 @@ def _parse_scientific_config(
             ),
         ),
         NuclearConfig(
+            plane_background_percentile=plane_percentile,
             watershed_seed_prominence_um=(
                 _number(
                     nuclear_data["watershed_seed_prominence_um"],
@@ -360,7 +379,12 @@ def _parse_scientific_config(
             _number(
                 golgi_data["perinuclear_outer_distance_um"],
                 "golgi.perinuclear_outer_distance_um",
-            )
+            ),
+            segmentation_method=golgi_data.get("segmentation_method", "sbr"),
+            minimum_component_volume_um3=_number(
+                golgi_data.get("minimum_component_volume_um3", 0.1),
+                "golgi.minimum_component_volume_um3",
+            ),
         ),
         LysosomeConfig(
             _sequence_numbers(lysosome_data["log_sigma_um"], "lysosome.log_sigma_um"),

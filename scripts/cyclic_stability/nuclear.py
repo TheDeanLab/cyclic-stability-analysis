@@ -115,6 +115,8 @@ class NuclearConsensus:
     component_diagnostics: tuple[NuclearComponentDiagnostic, ...]
     spacing_xyz_um: tuple[float, float, float]
     nominal_expansion_factor: float
+    foreground_mask_zyx: NDArray[np.bool_] | None = None
+    plane_background_percentile: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +233,7 @@ class NuclearComponentAdjudication:
     _candidates: tuple[_NuclearCandidate, ...]
     _full_shape_zyx: tuple[int, int, int]
     _config: NuclearConfig
+    _foreground_mask_zyx: NDArray[np.bool_] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,9 +416,23 @@ def _build_lamin_reference_masks(
     return _LaminReferenceMasks(source.shape, members)
 
 
-def _normalized_dapi(image: NDArray[np.float64]) -> NDArray[np.float64]:
-    background = robust_background(image)
-    corrected = np.clip(image - background.median, 0.0, None)
+def _normalized_dapi(
+    image: NDArray[np.float64], plane_background_percentile: float | None = None
+) -> NDArray[np.float64]:
+    if plane_background_percentile is None:
+        background = robust_background(image).median
+    else:
+        if (
+            not math.isfinite(plane_background_percentile)
+            or not 0 < plane_background_percentile < 50
+        ):
+            raise ValueError(
+                "DAPI plane background percentile must be between 0 and 50"
+            )
+        background = np.percentile(image, plane_background_percentile, axis=(1, 2))[
+            :, None, None
+        ]
+    corrected = np.clip(image - background, 0.0, None)
     positive = corrected[corrected > 0.0]
     if positive.size == 0:
         raise ValueError("DAPI has no positive background-corrected support")
@@ -689,7 +706,13 @@ def _segmented_dapi_foreground_mask(
     if len(shapes) != 1:
         raise ValueError("QC-accepted DAPI rounds must share one registered geometry")
     median = np.median(
-        np.stack([_normalized_dapi(volume) for volume in volumes.values()]), axis=0
+        np.stack(
+            [
+                _normalized_dapi(volume, config.plane_background_percentile)
+                for volume in volumes.values()
+            ]
+        ),
+        axis=0,
     )
     smoothed = gaussian_filter(
         median, sigma=gaussian_sigma_zyx(config.consensus_smoothing_um, spacing)
@@ -813,7 +836,6 @@ def adjudicate_nuclear_components(
         )
     full_shape_zyx = mask.shape
     component_regions = find_objects(candidate_labels, max_label=candidate_count)
-    del mask
     sx, sy, sz = spacing
     voxel_volume_um3 = sx * sy * sz
     minimum_volume, maximum_volume = config.nominal_volume_um3
@@ -920,6 +942,7 @@ def adjudicate_nuclear_components(
         tuple(candidates),
         full_shape_zyx,
         config,
+        mask,
     )
 
 
@@ -1110,6 +1133,8 @@ def realize_nuclear_surfaces(
         adjudication.component_diagnostics,
         spacing,
         adjudication.nominal_expansion_factor,
+        adjudication._foreground_mask_zyx,
+        config.plane_background_percentile,
     )
 
 
@@ -1504,7 +1529,12 @@ def write_nuclear_component_diagnostic(
     """
     median_dapi = np.median(
         np.stack(
-            [_normalized_dapi(_volume(image, "DAPI")) for image in dapi_rounds.values()]
+            [
+                _normalized_dapi(
+                    _volume(image, "DAPI"), consensus.plane_background_percentile
+                )
+                for image in dapi_rounds.values()
+            ]
         ),
         axis=0,
     )

@@ -20,6 +20,10 @@ from scipy.ndimage import binary_erosion, distance_transform_edt, gaussian_filte
 from scipy.spatial import cKDTree
 
 from cyclic_stability.cyexm_artifacts import RoundArtifacts
+from cyclic_stability.golgi_segmentation import (
+    corrected_mask_values,
+    otsu_component_member,
+)
 from cyclic_stability.images import BackgroundSummary, load_volume, robust_background
 from cyclic_stability.models import (
     AnalysisConfig,
@@ -781,6 +785,15 @@ def _support_threshold_ensemble(
     config: AnalysisConfig,
 ) -> tuple[MaskMember, ...]:
     """Build the frozen Golgi mask grid using only common-valid source support."""
+    if config.golgi.segmentation_method == "plane-median-otsu":
+        return (
+            otsu_component_member(
+                image,
+                roi & validity_mask,
+                config.voxel_spacing_xyz_um,
+                config.golgi.minimum_component_volume_um3,
+            ),
+        )
     background = _support_background(image, validity_mask)
     members: list[MaskMember] = []
     for sigma_um in config.ensembles.gaussian_sigma_um:
@@ -1021,23 +1034,29 @@ def _ensemble_row(
     round_number: int,
     endpoint: str,
     sigma_um: float,
-    threshold_sbr: float,
+    threshold_sbr: float | None,
     value: float,
     units: str,
     config: AnalysisConfig,
     *,
     surface_tolerance_resolution_units: float | None = None,
+    member: MaskMember | None = None,
 ) -> EnsembleRow:
+    otsu = member is not None and member.threshold_method == "plane-median-otsu"
     return EnsembleRow(
         cohort="golgi",
         cell_id="array",
         acquisition_round=round_number,
         endpoint=endpoint,
-        ensemble_name=f"sigma={sigma_um:g};sbr={threshold_sbr:g}",
+        ensemble_name=(
+            f"plane-median-otsu;min_volume_um3={member.minimum_component_volume_um3:g}"
+            if otsu
+            else f"sigma={sigma_um:g};sbr={threshold_sbr:g}"
+        ),
         ensemble_value=(
             surface_tolerance_resolution_units
             if surface_tolerance_resolution_units is not None
-            else threshold_sbr
+            else (member.minimum_component_volume_um3 if otsu else threshold_sbr)
         ),
         sigma_um=sigma_um,
         threshold_sbr=threshold_sbr,
@@ -1045,6 +1064,11 @@ def _ensemble_row(
         value=value,
         units=units,
         source_task_identity=config.config_digest,
+        threshold_method=member.threshold_method if member is not None else "sbr",
+        threshold_value=member.threshold_value if member is not None else None,
+        minimum_component_volume_um3=member.minimum_component_volume_um3
+        if member is not None
+        else None,
     )
 
 
@@ -1125,6 +1149,13 @@ def _analyze_golgi_arrays(
         config.nominal_expansion_factor,
     )
     roi = _perinuclear_roi(consensus.mask_zyx, common_validity, config)
+    if config.golgi.segmentation_method == "plane-median-otsu":
+        if consensus.foreground_mask_zyx is None:
+            raise RuntimeError("Golgi exclusion requires the complete DAPI foreground")
+        roi = roi & ~consensus.foreground_mask_zyx
+        if not np.any(roi):
+            raise ValueError("Golgi ROI is empty after complete DAPI exclusion")
+        roi.setflags(write=False)
     reference = rounds[REFERENCE_ROUND]
     ensemble_by_round = {
         round_number: _support_threshold_ensemble(
@@ -1197,11 +1228,10 @@ def _analyze_golgi_arrays(
                 config.voxel_spacing_xyz_um,
                 distance_field_zyx=nuclear_distance_field,
             )
-            background = member.background
             corrected_signal = float(
-                np.clip(rounds[round_number] - background.median, 0.0, None)[
-                    member.mask_zyx
-                ].sum()
+                corrected_mask_values(
+                    rounds[round_number], member, member.mask_zyx
+                ).sum()
             )
             values = {
                 "absolute_background_corrected_signal": corrected_signal,
@@ -1233,6 +1263,7 @@ def _analyze_golgi_arrays(
                         units[endpoint],
                         config,
                         surface_tolerance_resolution_units=tolerance,
+                        member=member,
                     )
                 )
                 if math.isfinite(value):
@@ -1328,6 +1359,21 @@ def _write_diagnostics(
             staged, result.cell_id, dapi_rounds, consensus
         )
         overlay = staged / "golgi-registered-overlays.npz"
+        otsu = (
+            threshold_masks[REFERENCE_ROUND][0].threshold_method == "plane-median-otsu"
+        )
+        extra_arrays = {}
+        if otsu:
+            extra_arrays["nuclear_exclusion_mask_zyx"] = consensus.foreground_mask_zyx
+            extra_arrays["accepted_nuclear_labels_zyx"] = consensus.labels_zyx
+            for number, members in threshold_masks.items():
+                member = members[0]
+                extra_arrays[f"round_{number}_removed_small_components_zyx"] = (
+                    member.rejected_mask_zyx
+                )
+                extra_arrays[f"round_{number}_plane_background"] = (
+                    member.plane_background
+                )
         np.savez_compressed(
             overlay,
             consensus_nuclear_mask_zyx=consensus.mask_zyx,
@@ -1337,11 +1383,56 @@ def _write_diagnostics(
             full_shape_zyx=np.asarray(crop.full_shape_zyx, dtype=np.int64),
             **{f"round_{number}_target_zyx": image for number, image in rounds.items()},
             **{
-                f"round_{number}_sigma_{member.sigma_um:g}_sbr_{member.threshold_sbr:g}_threshold_mask_zyx": member.mask_zyx
+                (
+                    f"round_{number}_otsu_threshold_mask_zyx"
+                    if otsu
+                    else f"round_{number}_sigma_{member.sigma_um:g}_sbr_{member.threshold_sbr:g}_threshold_mask_zyx"
+                ): member.mask_zyx
                 for number, members in threshold_masks.items()
                 for member in members
             },
+            **extra_arrays,
         )
+        segmentation_paths = []
+        if otsu:
+            metadata = []
+            for number, members in sorted(threshold_masks.items()):
+                member = members[0]
+                sizes = np.asarray(member.component_sizes_voxels)
+                minimum_voxels = math.ceil(
+                    member.minimum_component_volume_um3
+                    / math.prod(member.spacing_xyz_um)
+                )
+                metadata.append(
+                    {
+                        "round": number,
+                        "method": member.threshold_method,
+                        "threshold_above_plane_background": member.threshold_value,
+                        "background_by_plane": member.plane_background.tolist(),
+                        "robust_noise_scale": member.background.scale,
+                        "minimum_threshold_noise_scales": 3.0,
+                        "minimum_component_volume_expanded_um3": member.minimum_component_volume_um3,
+                        "minimum_component_voxels": minimum_voxels,
+                        "components_before_filter": int(sizes.size),
+                        "components_retained": int(
+                            np.count_nonzero(sizes >= minimum_voxels)
+                        ),
+                        "component_sizes_voxels": sizes.tolist(),
+                        "retained_voxels": int(member.mask_zyx.sum()),
+                        "removed_voxels": int(member.rejected_mask_zyx.sum()),
+                        "nuclear_overlap_voxels": int(
+                            np.count_nonzero(
+                                member.mask_zyx & consensus.foreground_mask_zyx
+                            )
+                        ),
+                        "smoothing": "none",
+                        "connectivity": 26,
+                        "summary_policy": "single prespecified mask; no mask union or parameter median",
+                    }
+                )
+            metadata_path = staged / "golgi-segmentation-qc.json"
+            metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
+            segmentation_paths.append(metadata_path)
         curves = staged / "golgi-threshold-robustness.csv"
         with curves.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
@@ -1362,6 +1453,17 @@ def _write_diagnostics(
             for number, members in threshold_masks.items()
         }
         for round_number, image in sorted(rounds.items()):
+            if otsu:
+                path = staged / f"golgi-overlay-round-{round_number}.png"
+                _write_otsu_overlay(
+                    path,
+                    round_number,
+                    rounds,
+                    threshold_masks,
+                    consensus.foreground_mask_zyx,
+                )
+                figure_paths.append(path)
+                continue
             figure, axes = plt.subplots(1, 2, figsize=(8, 4), layout="constrained")
             for axis, title, mip, mask in (
                 (
@@ -1391,11 +1493,74 @@ def _write_diagnostics(
             figure.savefig(path, dpi=200)
             plt.close(figure)
             figure_paths.append(path)
-        staged_paths = (component_diagnostic, overlay, curves, *figure_paths)
+        staged_paths = (
+            component_diagnostic,
+            overlay,
+            curves,
+            *segmentation_paths,
+            *figure_paths,
+        )
 
     _atomic_publish_directory(output_dir, populate)
     assert staging_root is not None
     return tuple(output_dir / path.relative_to(staging_root) for path in staged_paths)
+
+
+def _write_otsu_overlay(path, round_number, rounds, members, exclusion):
+    """Show the actual retained/removed masks and a shared physical Z plane."""
+    import matplotlib.pyplot as plt
+
+    reference_mask = members[REFERENCE_ROUND][0].mask_zyx
+    z = int(
+        np.argmax(np.where(reference_mask, rounds[REFERENCE_ROUND], 0).sum(axis=(1, 2)))
+    )
+    figure, axes = plt.subplots(2, 4, figsize=(14, 7), layout="constrained")
+    for row, number in enumerate((REFERENCE_ROUND, round_number)):
+        image = rounds[number]
+        member = members[number][0]
+        mip = image.max(axis=0)
+        low, high = np.percentile(mip, (1, 99.5))
+        axes[row, 0].imshow(mip, cmap="magma", vmin=low, vmax=high)
+        axes[row, 1].imshow(
+            member.mask_zyx.max(axis=0),
+            cmap="gray",
+            vmin=0,
+            vmax=1,
+            interpolation="nearest",
+        )
+        axes[row, 2].imshow(
+            member.rejected_mask_zyx.max(axis=0),
+            cmap="gray",
+            vmin=0,
+            vmax=1,
+            interpolation="nearest",
+        )
+        low, high = np.percentile(image[z], (1, 99.5))
+        axes[row, 3].imshow(image[z], cmap="magma", vmin=low, vmax=high)
+        if member.mask_zyx[z].any():
+            axes[row, 3].contour(
+                member.mask_zyx[z], levels=(0.5,), colors="lime", linewidths=0.65
+            )
+        for col, title in enumerate(
+            (
+                "Golgi signal MIP",
+                "Retained Golgi MIP (white)",
+                "Removed small components MIP",
+                f"Same Z plane {z}: retained outline",
+            )
+        ):
+            nuclear_plane = exclusion.max(axis=0) if col < 3 else exclusion[z]
+            if nuclear_plane.any():
+                axes[row, col].contour(
+                    nuclear_plane, levels=(0.5,), colors="cyan", linewidths=0.5
+                )
+            axes[row, col].set_title(f"Round {number}: {title}", fontsize=9)
+            axes[row, col].set_axis_off()
+    figure.suptitle(
+        "Plane-background-corrected 3D Otsu + physical component filter\nCyan: DAPI exclusion. Projection overlap can occur at different Z; same-plane masks never overlap nuclei."
+    )
+    figure.savefig(path, dpi=160)
+    plt.close(figure)
 
 
 def _write_crop_preflight(

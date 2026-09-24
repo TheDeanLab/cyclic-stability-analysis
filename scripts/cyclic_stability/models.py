@@ -46,6 +46,7 @@ class NuclearConfig:
     minimum_sphericity: float
     maximum_face_contact_fraction: float
     watershed_seed_prominence_um: float | None = None
+    plane_background_percentile: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +54,8 @@ class GolgiConfig:
     """Golgi morphology settings."""
 
     perinuclear_outer_distance_um: float
+    segmentation_method: str = "sbr"
+    minimum_component_volume_um3: float = 0.1
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,12 +153,15 @@ class EnsembleRow:
     ensemble_name: str
     ensemble_value: float
     sigma_um: float
-    threshold_sbr: float
+    threshold_sbr: float | None
     surface_tolerance_resolution_units: float | None
     value: float | str
     units: str
     source_task_identity: str
     nucleus_id: str = "aggregate"
+    threshold_method: str = "sbr"
+    threshold_value: float | None = None
+    minimum_component_volume_um3: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

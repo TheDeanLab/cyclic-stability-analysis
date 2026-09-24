@@ -1140,6 +1140,7 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
         for item in task.config.qc_decisions
     }
     signal_rows: list[Mapping[str, object]] = []
+    signal_diagnostics: list[Path] = []
     for round_spec in task.cell.rounds:
         if (
             round_spec.acquisition_round != task.config.reference_acquisition_round
@@ -1156,13 +1157,39 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
         raw_dapi = load_volume(paths["dapi"])
         raw_target = load_volume(paths["target"])
         roi = raw_structure_roi(round_spec.cohort, raw_dapi, task.config)
-        members = threshold_ensemble(
-            raw_target,
-            roi,
-            task.config.ensembles.gaussian_sigma_um,
-            task.config.ensembles.threshold_sbr,
-            task.config.voxel_spacing_xyz_um,
-        )
+        if (
+            round_spec.cohort == "golgi"
+            and task.config.golgi.segmentation_method == "plane-median-otsu"
+        ):
+            from cyclic_stability.golgi_segmentation import (
+                otsu_component_member,
+                write_native_otsu_diagnostics,
+            )
+
+            members = (
+                otsu_component_member(
+                    raw_target,
+                    roi,
+                    task.config.voxel_spacing_xyz_um,
+                    task.config.golgi.minimum_component_volume_um3,
+                ),
+            )
+            signal_diagnostics.extend(
+                write_native_otsu_diagnostics(
+                    output_dir / "native-signal-diagnostics",
+                    round_spec.acquisition_round,
+                    members[0],
+                    roi,
+                )
+            )
+        else:
+            members = threshold_ensemble(
+                raw_target,
+                roi,
+                task.config.ensembles.gaussian_sigma_um,
+                task.config.ensembles.threshold_sbr,
+                task.config.voxel_spacing_xyz_um,
+            )
         signal_rows.extend(
             {
                 field: dict(value) if isinstance(value, Mapping) else value
@@ -1185,7 +1212,7 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
                 dict(row) for row in result.component_qc_rows
             ),
         },
-        diagnostics=(*qc.overlay_paths, *result.diagnostics),
+        diagnostics=(*qc.overlay_paths, *result.diagnostics, *signal_diagnostics),
     )
 
 
