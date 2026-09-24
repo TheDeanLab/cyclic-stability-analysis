@@ -792,6 +792,7 @@ def _support_threshold_ensemble(
                 roi & validity_mask,
                 config.voxel_spacing_xyz_um,
                 config.golgi.minimum_component_volume_um3,
+                smoothing_um=config.golgi.segmentation_smoothing_um,
             ),
         )
     background = _support_background(image, validity_mask)
@@ -1409,7 +1410,8 @@ def _write_diagnostics(
                         "method": member.threshold_method,
                         "threshold_above_plane_background": member.threshold_value,
                         "background_by_plane": member.plane_background.tolist(),
-                        "robust_noise_scale": member.background.scale,
+                        "robust_noise_scale": member.threshold_noise_scale,
+                        "raw_background_noise_scale": member.background.scale,
                         "minimum_threshold_noise_scales": 3.0,
                         "minimum_component_volume_expanded_um3": member.minimum_component_volume_um3,
                         "minimum_component_voxels": minimum_voxels,
@@ -1425,7 +1427,10 @@ def _write_diagnostics(
                                 member.mask_zyx & consensus.foreground_mask_zyx
                             )
                         ),
-                        "smoothing": "none",
+                        "smoothing": "normalized Gaussian in eligible ROI"
+                        if member.sigma_um
+                        else "none",
+                        "smoothing_sigma_um": member.sigma_um,
                         "connectivity": 26,
                         "summary_policy": "single prespecified mask; no mask union or parameter median",
                     }

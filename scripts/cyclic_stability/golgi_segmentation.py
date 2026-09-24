@@ -9,7 +9,7 @@ from typing import cast
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import label
+from scipy.ndimage import gaussian_filter, label
 from skimage.filters import threshold_otsu
 
 from cyclic_stability.images import BackgroundSummary
@@ -35,14 +35,19 @@ def otsu_component_member(
     roi: NDArray[np.bool_],
     spacing_xyz_um: tuple[float, float, float],
     minimum_volume_um3: float,
+    *,
+    smoothing_um: float | None = None,
 ) -> MaskMember:
     """Return one prespecified mask plus every removed small component.
 
     Background is the median of the eligible exterior ROI in each Z plane.
     Otsu uses the clipped background-corrected ROI histogram at 1 intensity-unit
     bin width, including zeros. Thresholding, exclusion and 26-connected size
-    filtering all operate in 3D. No smoothing, hole filling or component ranking
-    changes the topology. Volume units match the supplied physical voxel spacing.
+    filtering all operate in 3D. No hole filling or component ranking is applied.
+    Optional normalized Gaussian smoothing uses only eligible ROI voxels after
+    plane-offset subtraction. Its residual plane medians are added to the saved
+    background before original-intensity integration.
+    Volume units match the supplied physical voxel spacing.
     """
     source = np.asarray(image)
     domain = validated_binary_mask(roi, "Golgi ROI")
@@ -60,20 +65,58 @@ def otsu_component_member(
         raise ValueError("Golgi spacing must contain three finite positive values")
     if not math.isfinite(minimum_volume_um3) or minimum_volume_um3 <= 0:
         raise ValueError("minimum component volume must be finite and positive")
+    if smoothing_um is not None and (
+        not math.isfinite(smoothing_um) or smoothing_um <= 0
+    ):
+        raise ValueError("Golgi smoothing must be finite and positive or None")
+    full_shape = source.shape
+    # Crop only to the ROI's exact bounding box; normalized convolution uses
+    # constant zero weights outside it, so this preserves full-grid results.
+    bounds = []
+    for axis in range(3):
+        indices = np.flatnonzero(
+            domain.any(axis=tuple(a for a in range(3) if a != axis))
+        )
+        bounds.append(slice(int(indices[0]), int(indices[-1]) + 1))
+    region = tuple(bounds)
+    source = source[region]
+    domain = domain[region]
     backgrounds = np.zeros(source.shape[0], dtype=np.float64)
     corrected = np.zeros(source.shape, dtype=np.float32)
-    deviations = []
     active_planes = []
     for z in range(source.shape[0]):
         values = source[z][domain[z]].astype(np.float64)
         if values.size:
             active_planes.append(z)
             backgrounds[z] = np.median(values)
-            deviations.append(np.abs(values - backgrounds[z]))
-            corrected[z] = np.maximum(source[z].astype(np.float64) - backgrounds[z], 0)
+            corrected[z] = source[z].astype(np.float64) - backgrounds[z]
+    if smoothing_um is not None:
+        sigmas = tuple(smoothing_um / spacing for spacing in spacing_xyz_um[::-1])
+        corrected[~domain] = 0
+        weights = gaussian_filter(domain.astype(np.float32), sigmas, mode="constant")
+        corrected = gaussian_filter(corrected, sigmas, mode="constant")
+        np.divide(corrected, weights, out=corrected, where=weights > 0)
+        del weights
+    deviations = []
+    threshold_deviations = []
+    for z in active_planes:
+        if smoothing_um is not None:
+            # Remove any residual median shift introduced by smoothing a sparse
+            # asymmetric signal. Record the exact resulting background for raw
+            # intensity integration; never integrate the smoothed image.
+            offset = float(np.median(corrected[z][domain[z]]))
+            corrected[z] -= offset
+            backgrounds[z] += offset
+        deviations.append(
+            np.abs(source[z][domain[z]].astype(np.float64) - backgrounds[z])
+        )
+        threshold_deviations.append(np.abs(corrected[z][domain[z]]))
+    scale = float(1.4826 * np.median(np.concatenate(deviations)))
+    threshold_scale = float(1.4826 * np.median(np.concatenate(threshold_deviations)))
+    del deviations, threshold_deviations
+    np.maximum(corrected, 0, out=corrected)
     values = corrected[domain]
     maximum = float(values.max())
-    scale = float(1.4826 * np.median(np.concatenate(deviations)))
     if maximum > 1_000_000:
         raise ValueError("1-unit Otsu histogram requires intensities below 1,000,000")
     # Degenerate input is an explicit unmeasured mask, never perfect agreement.
@@ -85,10 +128,14 @@ def otsu_component_member(
         threshold = float(
             threshold_otsu(hist=(histogram, (edges[:-1] + edges[1:]) / 2))
         )
-        if not math.isfinite(scale) or scale <= 0 or threshold < 3.0 * scale:
+        if (
+            not math.isfinite(threshold_scale)
+            or threshold_scale <= 0
+            or threshold < 3.0 * threshold_scale
+        ):
             raise ValueError(
                 "Otsu foreground is indistinguishable from background: "
-                f"threshold={threshold:g}, robust noise scale={scale:g}; "
+                f"threshold={threshold:g}, robust noise scale={threshold_scale:g}; "
                 "requires threshold >= 3 noise scales"
             )
         foreground = (corrected > threshold) & domain
@@ -109,16 +156,27 @@ def otsu_component_member(
         int(np.count_nonzero(values)),
         int(domain.sum()),
     )
+    if source.shape != full_shape:
+        full_mask = np.zeros(full_shape, dtype=bool)
+        full_mask[region] = mask
+        mask = full_mask
+        full_rejected = np.zeros(full_shape, dtype=bool)
+        full_rejected[region] = rejected
+        rejected = full_rejected
+        full_backgrounds = np.zeros(full_shape[0], dtype=np.float64)
+        full_backgrounds[region[0]] = backgrounds
+        backgrounds = full_backgrounds
     for array in (mask, rejected, backgrounds):
         array.setflags(write=False)
     return MaskMember(
         mask,
-        0.0,
+        smoothing_um or 0.0,
         None,
         background,
         spacing_xyz_um,
         "nonempty" if np.any(mask) else "empty",
         threshold_method="plane-median-otsu",
+        threshold_noise_scale=threshold_scale,
         threshold_value=threshold,
         minimum_component_volume_um3=minimum_volume_um3,
         plane_background=backgrounds,
@@ -128,7 +186,13 @@ def otsu_component_member(
 
 
 def write_native_otsu_diagnostics(
-    output_dir: Path, round_number: int, member: MaskMember, roi: NDArray[np.bool_]
+    output_dir: Path,
+    round_number: int,
+    member: MaskMember,
+    roi: NDArray[np.bool_],
+    *,
+    nuclear_exclusion: NDArray[np.bool_],
+    outer_distance_um: float,
 ) -> tuple[Path, Path]:
     """Save the exact native masks and backgrounds used for signal integration."""
     if (
@@ -138,6 +202,17 @@ def write_native_otsu_diagnostics(
         or member.rejected_mask_zyx is None
     ):
         raise ValueError("native Otsu diagnostics require a complete Otsu member")
+    roi = validated_binary_mask(roi, "native structure ROI")
+    nuclear_exclusion = validated_binary_mask(
+        nuclear_exclusion, "native DAPI exclusion"
+    )
+    if (
+        roi.shape != member.mask_zyx.shape
+        or nuclear_exclusion.shape != roi.shape
+        or np.any(roi & nuclear_exclusion)
+        or np.any(member.mask_zyx & ~roi)
+    ):
+        raise ValueError("native Otsu masks must share geometry and exclude DAPI")
     output_dir.mkdir(parents=True, exist_ok=True)
     masks = output_dir / f"round-{round_number}-segmentation.npz"
     metadata = output_dir / f"round-{round_number}-segmentation.json"
@@ -145,7 +220,8 @@ def write_native_otsu_diagnostics(
         masks,
         retained_mask_zyx=member.mask_zyx,
         rejected_small_components_zyx=member.rejected_mask_zyx,
-        nuclear_exclusion_mask_zyx=~roi,
+        nuclear_exclusion_mask_zyx=nuclear_exclusion,
+        structure_roi_zyx=roi,
         background_by_plane=member.plane_background,
         spacing_xyz_um=member.spacing_xyz_um,
     )
@@ -156,20 +232,27 @@ def write_native_otsu_diagnostics(
         json.dumps(
             {
                 "acquisition_round": round_number,
-                "coordinate_space": "native acquisition; full extranuclear field",
+                "coordinate_space": "native acquisition; DAPI-defined perinuclear ROI",
+                "perinuclear_outer_distance_um": outer_distance_um,
                 "method": member.threshold_method,
                 "threshold_above_plane_background": member.threshold_value,
                 "background_by_plane": member.plane_background.tolist(),
-                "robust_noise_scale": member.background.scale,
+                "robust_noise_scale": member.threshold_noise_scale,
+                "raw_background_noise_scale": member.background.scale,
                 "minimum_threshold_noise_scales": 3.0,
                 "minimum_component_volume_expanded_um3": member.minimum_component_volume_um3,
                 "minimum_component_voxels": minimum_voxels,
                 "component_sizes_voxels": member.component_sizes_voxels,
                 "retained_voxels": int(member.mask_zyx.sum()),
                 "removed_voxels": int(member.rejected_mask_zyx.sum()),
-                "nuclear_overlap_voxels": int(np.count_nonzero(member.mask_zyx & ~roi)),
+                "nuclear_overlap_voxels": int(
+                    np.count_nonzero(member.mask_zyx & nuclear_exclusion)
+                ),
                 "connectivity": 26,
-                "smoothing": "none",
+                "smoothing": "normalized Gaussian in eligible ROI"
+                if member.sigma_um
+                else "none",
+                "smoothing_sigma_um": member.sigma_um,
                 "intensity_policy": "sum max(original intensity - plane background, 0) / exposure_ms",
             },
             indent=2,

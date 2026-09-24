@@ -29,6 +29,7 @@ class MaskMember:
     mask_status: Literal["nonempty", "empty"]
     threshold_method: str = "sbr"
     threshold_value: float | None = None
+    threshold_noise_scale: float | None = None
     minimum_component_volume_um3: float | None = None
     plane_background: NDArray[np.float64] | None = None
     rejected_mask_zyx: NDArray[np.bool_] | None = None

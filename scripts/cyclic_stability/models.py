@@ -56,6 +56,7 @@ class GolgiConfig:
     perinuclear_outer_distance_um: float
     segmentation_method: str = "sbr"
     minimum_component_volume_um3: float = 0.1
+    segmentation_smoothing_um: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

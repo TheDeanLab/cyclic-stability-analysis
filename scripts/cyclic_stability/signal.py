@@ -53,6 +53,15 @@ def raw_structure_roi(
     This shared Task 4 helper deliberately never receives a target image.  A
     per-round consensus call avoids cross-round native-grid assumptions.
     """
+    return raw_structure_domains(cohort, raw_dapi_zyx, config)[0]
+
+
+def raw_structure_domains(
+    cohort: str, raw_dapi_zyx: NDArray[np.generic], config: AnalysisConfig
+) -> tuple[NDArray[np.bool_], NDArray[np.bool_]]:
+    """Return native target-independent ROI and complete DAPI exclusion mask."""
+    from scipy.ndimage import distance_transform_edt
+
     from cyclic_stability.nuclear import _segmented_dapi_foreground_mask
 
     # Raw-target retention needs a stable DAPI spatial reference, not a
@@ -65,9 +74,18 @@ def raw_structure_roi(
         config.nuclear,
     )
     if cohort == "lamin":
-        return mask
+        return mask, mask
+    if cohort == "golgi" and config.golgi.segmentation_method == "plane-median-otsu":
+        exterior_distance = distance_transform_edt(
+            ~mask, sampling=config.voxel_spacing_xyz_um[::-1]
+        )
+        roi = (~mask) & (
+            exterior_distance <= config.golgi.perinuclear_outer_distance_um
+        )
+        roi.setflags(write=False)
+        return roi, mask
     if cohort in {"golgi", "lamp1"}:
-        return ~mask
+        return ~mask, mask
     raise ValueError(f"unsupported cohort for raw signal ROI: {cohort}")
 
 
@@ -188,4 +206,10 @@ def measure_signal(
     return tuple(rows)
 
 
-__all__ = ["PERCENTILES", "SignalRow", "measure_signal", "raw_structure_roi"]
+__all__ = [
+    "PERCENTILES",
+    "SignalRow",
+    "measure_signal",
+    "raw_structure_roi",
+    "raw_structure_domains",
+]

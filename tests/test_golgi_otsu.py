@@ -186,3 +186,96 @@ def test_nonconstant_quantized_noise_with_zero_mad_fails_admission():
         otsu_component_member(
             image, np.ones(image.shape, bool), (0.1083, 0.1083, 0.3), 0.1
         )
+
+
+def test_native_otsu_domain_is_dapi_only_and_perinuclear(analysis_config, monkeypatch):
+    from cyclic_stability.signal import raw_structure_roi
+    from scipy.ndimage import distance_transform_edt
+
+    nucleus = np.zeros((9, 25, 25), bool)
+    nucleus[3:6, 10:15, 10:15] = True
+    monkeypatch.setattr(
+        nuclear, "_segmented_dapi_foreground_mask", lambda *args: nucleus
+    )
+    config = replace(
+        analysis_config,
+        voxel_spacing_xyz_um=(0.5, 0.5, 0.5),
+        golgi=replace(
+            analysis_config.golgi,
+            segmentation_method="plane-median-otsu",
+            perinuclear_outer_distance_um=1.0,
+        ),
+    )
+    roi = raw_structure_roi("golgi", np.zeros(nucleus.shape), config)
+    expected = (~nucleus) & (
+        distance_transform_edt(~nucleus, sampling=(0.5, 0.5, 0.5)) <= 1.0
+    )
+    np.testing.assert_array_equal(roi, expected)
+    assert not roi[:, 0, :].any()
+    legacy = raw_structure_roi("golgi", np.zeros(nucleus.shape), analysis_config)
+    np.testing.assert_array_equal(legacy, ~nucleus)
+
+
+def test_smoothing_cannot_leak_excluded_signal_and_preserves_plane_offsets():
+    image, roi = example()
+    roi[:, :3, :] = False
+    kwargs = dict(smoothing_um=0.5)
+    a = otsu_component_member(image, roi, (1.0, 1.0, 1.0), 3.0, **kwargs)
+    changed = image.copy()
+    changed[~roi] = 100_000
+    offsets = np.arange(image.shape[0]) * 37
+    b = otsu_component_member(
+        changed + offsets[:, None, None], roi, (1.0, 1.0, 1.0), 3.0, **kwargs
+    )
+    np.testing.assert_array_equal(a.mask_zyx, b.mask_zyx)
+    np.testing.assert_allclose(b.plane_background - a.plane_background, offsets)
+    assert a.sigma_um == 0.5
+    assert a.threshold_noise_scale > 0
+
+
+def test_smoothing_noise_control_is_not_measured():
+    image = np.random.default_rng(23).normal(100, 2, (32, 64, 64))
+    with pytest.raises(ValueError, match="indistinguishable from background"):
+        otsu_component_member(
+            image,
+            np.ones(image.shape, bool),
+            (0.1083, 0.1083, 0.3),
+            0.1,
+            smoothing_um=0.1083,
+        )
+
+
+def test_roi_crop_restoration_preserves_original_geometry():
+    image, roi = example()
+    a = otsu_component_member(image, roi, (1.0, 1.0, 1.0), 3.0, smoothing_um=0.5)
+    pad = ((2, 3), (4, 5), (6, 7))
+    padded_image = np.pad(image, pad, constant_values=10000)
+    padded_roi = np.pad(roi, pad, constant_values=False)
+    b = otsu_component_member(
+        padded_image, padded_roi, (1.0, 1.0, 1.0), 3.0, smoothing_um=0.5
+    )
+    np.testing.assert_array_equal(b.mask_zyx, np.pad(a.mask_zyx, pad))
+    np.testing.assert_array_equal(b.rejected_mask_zyx, np.pad(a.rejected_mask_zyx, pad))
+    np.testing.assert_allclose(b.plane_background[2:-3], a.plane_background)
+
+
+def test_native_saved_roi_is_distinct_from_nuclear_exclusion(tmp_path):
+    import json
+
+    from cyclic_stability.golgi_segmentation import write_native_otsu_diagnostics
+
+    image, roi = example()
+    nucleus = np.zeros(image.shape, bool)
+    nucleus[0, 0, 0] = True
+    roi[0] = False  # Most of this excluded plane is outside the ROI, not nuclear.
+    member = otsu_component_member(image, roi, (1.0, 1.0, 1.0), 3.0, smoothing_um=0.5)
+    masks, metadata = write_native_otsu_diagnostics(
+        tmp_path, 1, member, roi, nuclear_exclusion=nucleus, outer_distance_um=18.0
+    )
+    with np.load(masks) as saved:
+        np.testing.assert_array_equal(saved["nuclear_exclusion_mask_zyx"], nucleus)
+        np.testing.assert_array_equal(saved["structure_roi_zyx"], roi)
+    info = json.loads(metadata.read_text())
+    assert info["smoothing_sigma_um"] == 0.5
+    assert info["robust_noise_scale"] == member.threshold_noise_scale
+    assert info["raw_background_noise_scale"] == member.background.scale

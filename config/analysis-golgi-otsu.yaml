@@ -26,6 +26,7 @@ nuclear:
   maximum_face_contact_fraction: 0.10
 golgi:
   segmentation_method: plane-median-otsu
+  segmentation_smoothing_um: 0.1083
   minimum_component_volume_um3: 0.1
   perinuclear_outer_distance_um: 18.0
 lysosome:

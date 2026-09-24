@@ -169,6 +169,14 @@ def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
         "raw_structure_roi",
         lambda *_args: np.ones((3, 3, 3), dtype=bool),
     )
+    monkeypatch.setattr(
+        signal_module,
+        "raw_structure_domains",
+        lambda *_args: (
+            np.ones((3, 3, 3), dtype=bool),
+            np.zeros((3, 3, 3), dtype=bool),
+        ),
+    )
     monkeypatch.setattr(morphology, "threshold_ensemble", lambda *_args: ())
     signal_row = SignalRow(
         "golgi",

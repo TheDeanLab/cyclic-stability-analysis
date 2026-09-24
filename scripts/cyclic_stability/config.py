@@ -285,7 +285,11 @@ def _parse_scientific_config(
         "golgi",
         {"perinuclear_outer_distance_um"},
         optional_keys=frozenset(
-            {"segmentation_method", "minimum_component_volume_um3"}
+            {
+                "segmentation_method",
+                "minimum_component_volume_um3",
+                "segmentation_smoothing_um",
+            }
         ),
     )
     if golgi_data.get("segmentation_method", "sbr") not in {"sbr", "plane-median-otsu"}:
@@ -381,6 +385,14 @@ def _parse_scientific_config(
                 "golgi.perinuclear_outer_distance_um",
             ),
             segmentation_method=golgi_data.get("segmentation_method", "sbr"),
+            segmentation_smoothing_um=(
+                _number(
+                    golgi_data["segmentation_smoothing_um"],
+                    "golgi.segmentation_smoothing_um",
+                )
+                if "segmentation_smoothing_um" in golgi_data
+                else None
+            ),
             minimum_component_volume_um3=_number(
                 golgi_data.get("minimum_component_volume_um3", 0.1),
                 "golgi.minimum_component_volume_um3",

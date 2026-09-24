@@ -1108,7 +1108,11 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
     from cyclic_stability.nuclear import analyze_lamin_cell
     from cyclic_stability.provenance import channel_tiff_paths
     from cyclic_stability.registration_qc import analyze_registration_qc
-    from cyclic_stability.signal import measure_signal, raw_structure_roi
+    from cyclic_stability.signal import (
+        measure_signal,
+        raw_structure_domains,
+        raw_structure_roi,
+    )
 
     if task.preflight is None:
         raise ValueError("production task lacks validated preflight snapshot")
@@ -1156,7 +1160,6 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
         paths = dict(channel_tiff_paths(round_spec))
         raw_dapi = load_volume(paths["dapi"])
         raw_target = load_volume(paths["target"])
-        roi = raw_structure_roi(round_spec.cohort, raw_dapi, task.config)
         if (
             round_spec.cohort == "golgi"
             and task.config.golgi.segmentation_method == "plane-median-otsu"
@@ -1166,12 +1169,16 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
                 write_native_otsu_diagnostics,
             )
 
+            roi, nuclear_exclusion = raw_structure_domains(
+                round_spec.cohort, raw_dapi, task.config
+            )
             members = (
                 otsu_component_member(
                     raw_target,
                     roi,
                     task.config.voxel_spacing_xyz_um,
                     task.config.golgi.minimum_component_volume_um3,
+                    smoothing_um=task.config.golgi.segmentation_smoothing_um,
                 ),
             )
             signal_diagnostics.extend(
@@ -1180,9 +1187,12 @@ def default_marker_analyzer(task: CellTask, output_dir: Path) -> TaskOutput:
                     round_spec.acquisition_round,
                     members[0],
                     roi,
+                    nuclear_exclusion=nuclear_exclusion,
+                    outer_distance_um=task.config.golgi.perinuclear_outer_distance_um,
                 )
             )
         else:
+            roi = raw_structure_roi(round_spec.cohort, raw_dapi, task.config)
             members = threshold_ensemble(
                 raw_target,
                 roi,
