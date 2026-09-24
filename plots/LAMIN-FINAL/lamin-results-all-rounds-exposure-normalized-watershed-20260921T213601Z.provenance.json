@@ -1,0 +1,350 @@
+{
+  "run_dir": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/full-lamin-watershed-20260921/20260921T213601Z",
+  "source_task_table": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/full-lamin-watershed-20260921/20260921T213601Z/compact-tasks.csv",
+  "completed_cells": [
+    "Cell1",
+    "Cell2",
+    "Cell3",
+    "Cell4",
+    "Cell5"
+  ],
+  "failed_cells": [],
+  "quantitative_comparison_set": "all-acquisition-rounds",
+  "source_comparison_sets": [
+    "matched-settings",
+    "round-1-exposure-sensitivity"
+  ],
+  "acquisition_rounds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "sample_sizes": [
+    {
+      "endpoint": "lamin_surface_coverage",
+      "acquisition_round": 1,
+      "n": 11
+    },
+    {
+      "endpoint": "lamin_surface_coverage",
+      "acquisition_round": 2,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_surface_coverage",
+      "acquisition_round": 3,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_surface_coverage",
+      "acquisition_round": 4,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_surface_coverage",
+      "acquisition_round": 5,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_continuity",
+      "acquisition_round": 1,
+      "n": 11
+    },
+    {
+      "endpoint": "lamin_continuity",
+      "acquisition_round": 2,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_continuity",
+      "acquisition_round": 3,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_continuity",
+      "acquisition_round": 4,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_continuity",
+      "acquisition_round": 5,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_fwhm_median",
+      "acquisition_round": 1,
+      "n": 11
+    },
+    {
+      "endpoint": "lamin_fwhm_median",
+      "acquisition_round": 2,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_fwhm_median",
+      "acquisition_round": 3,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_fwhm_median",
+      "acquisition_round": 4,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_fwhm_median",
+      "acquisition_round": 5,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_integrated_ridge_intensity_median",
+      "acquisition_round": 1,
+      "n": 11
+    },
+    {
+      "endpoint": "lamin_integrated_ridge_intensity_median",
+      "acquisition_round": 2,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_integrated_ridge_intensity_median",
+      "acquisition_round": 3,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_integrated_ridge_intensity_median",
+      "acquisition_round": 4,
+      "n": 15
+    },
+    {
+      "endpoint": "lamin_integrated_ridge_intensity_median",
+      "acquisition_round": 5,
+      "n": 15
+    }
+  ],
+  "acquisition_settings_source": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/full-lamin-watershed-20260921/20260921T213601Z/config/correspondence.csv",
+  "acquisition_settings": [
+    {
+      "cell_id": "Cell1",
+      "acquisition_round": 2,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell1",
+      "acquisition_round": 3,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell1",
+      "acquisition_round": 4,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell1",
+      "acquisition_round": 5,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell2",
+      "acquisition_round": 1,
+      "target_exposure_ms": 150,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell2",
+      "acquisition_round": 2,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell2",
+      "acquisition_round": 3,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell2",
+      "acquisition_round": 4,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell2",
+      "acquisition_round": 5,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell3",
+      "acquisition_round": 1,
+      "target_exposure_ms": 150,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell3",
+      "acquisition_round": 2,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell3",
+      "acquisition_round": 3,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell3",
+      "acquisition_round": 4,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell3",
+      "acquisition_round": 5,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell4",
+      "acquisition_round": 2,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell4",
+      "acquisition_round": 3,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell4",
+      "acquisition_round": 4,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell4",
+      "acquisition_round": 5,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell5",
+      "acquisition_round": 1,
+      "target_exposure_ms": 150,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell5",
+      "acquisition_round": 2,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell5",
+      "acquisition_round": 3,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell5",
+      "acquisition_round": 4,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    },
+    {
+      "cell_id": "Cell5",
+      "acquisition_round": 5,
+      "target_exposure_ms": 200,
+      "target_laser_percent": 40
+    }
+  ],
+  "intensity_normalization": {
+    "formula": "(I_round / exposure_ms_round) / (I_round2 / exposure_ms_round2)",
+    "reference_acquisition_round": 2,
+    "assumption": "linear detector response; matched target laser power"
+  },
+  "qc_decisions_source": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/full-lamin-watershed-20260921/20260921T213601Z/config/qc-decisions.csv",
+  "qc_exclusions_preserved": true,
+  "quantitative_endpoints": [
+    "lamin_surface_coverage",
+    "lamin_continuity",
+    "lamin_fwhm_median",
+    "lamin_integrated_ridge_intensity_median"
+  ],
+  "summary_statistic": "mean",
+  "aggregate_rows_excluded": true,
+  "included_nuclei": [
+    {
+      "cell_id": "Cell1",
+      "nucleus_id": "N001"
+    },
+    {
+      "cell_id": "Cell2",
+      "nucleus_id": "N001"
+    },
+    {
+      "cell_id": "Cell2",
+      "nucleus_id": "N002"
+    },
+    {
+      "cell_id": "Cell2",
+      "nucleus_id": "N003"
+    },
+    {
+      "cell_id": "Cell2",
+      "nucleus_id": "N004"
+    },
+    {
+      "cell_id": "Cell3",
+      "nucleus_id": "N001"
+    },
+    {
+      "cell_id": "Cell3",
+      "nucleus_id": "N002"
+    },
+    {
+      "cell_id": "Cell3",
+      "nucleus_id": "N003"
+    },
+    {
+      "cell_id": "Cell4",
+      "nucleus_id": "N001"
+    },
+    {
+      "cell_id": "Cell4",
+      "nucleus_id": "N002"
+    },
+    {
+      "cell_id": "Cell4",
+      "nucleus_id": "N003"
+    },
+    {
+      "cell_id": "Cell5",
+      "nucleus_id": "N001"
+    },
+    {
+      "cell_id": "Cell5",
+      "nucleus_id": "N002"
+    },
+    {
+      "cell_id": "Cell5",
+      "nucleus_id": "N003"
+    },
+    {
+      "cell_id": "Cell5",
+      "nucleus_id": "N004"
+    }
+  ],
+  "confidence_interval": {
+    "method": "percentile bootstrap over QC-included nuclei per round",
+    "level": 0.95,
+    "replicates": 10000,
+    "seed": 20260829
+  }
+}

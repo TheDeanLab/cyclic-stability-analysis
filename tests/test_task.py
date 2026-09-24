@@ -62,6 +62,41 @@ def _artifact_task(
     )
 
 
+def test_build_tasks_requires_registered_tiffs_but_not_original_nd2(
+    analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Downstream target analysis must not be blocked by archival ND2 relocation."""
+    from cyclic_stability import provenance
+
+    cell = analysis_config.cell("golgi", "Cell1")
+    paths: dict[int, tuple[tuple[str, Path], ...]] = {}
+    for round_spec in cell.rounds:
+        directory = tmp_path / f"round-{round_spec.acquisition_round}"
+        directory.mkdir()
+        paths[round_spec.acquisition_round] = tuple(
+            (name, directory / f"{name}.tif") for name in ("target", "tubulin", "dapi")
+        )
+        for _name, path in paths[round_spec.acquisition_round]:
+            path.write_bytes(b"registered-source")
+    monkeypatch.setattr(
+        provenance,
+        "channel_tiff_paths",
+        lambda round_spec: paths[round_spec.acquisition_round],
+    )
+    unavailable_nd2 = tuple(
+        replace(round_spec, nd2_path=tmp_path / "relocated" / "missing.nd2")
+        for round_spec in cell.rounds
+    )
+
+    tasks = task_module.build_tasks(
+        analysis_config,
+        ("golgi",),
+        cells=(replace(cell, rounds=unavailable_nd2),),
+    )
+
+    assert len(tasks) == 1
+
+
 def test_default_analyzer_publishes_target_blind_nuclear_component_qc(
     analysis_config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
@@ -337,7 +372,6 @@ def test_preflight_replaces_parent_symlink_aliases_before_producer_reads(
         (root / "raw").mkdir(parents=True)
         (root / "registered").mkdir()
         for relative in (
-            "source.nd2",
             "dataset.yaml",
             "execution.yaml",
             "registered/dapi.tif",
@@ -407,11 +441,9 @@ def test_preflight_replaces_parent_symlink_aliases_before_producer_reads(
         alias.symlink_to(root_b, target_is_directory=True)
         raw_target = dict(provenance.channel_tiff_paths(canonical_round))["target"]
         observed["payloads"] = (
-            canonical_round.nd2_path.read_text(encoding="utf-8"),
             raw_target.read_text(encoding="utf-8"),
             canonical_round.dataset_manifest.read_text(encoding="utf-8"),
             canonical_round.execution_profile.read_text(encoding="utf-8"),
-            config_round.nd2_path.read_text(encoding="utf-8"),
             canonical_artifact.registered_target.read_text(encoding="utf-8"),
             canonical_artifact.completion_record_paths[0].read_text(encoding="utf-8"),
         )
@@ -429,18 +461,15 @@ def test_preflight_replaces_parent_symlink_aliases_before_producer_reads(
 
     assert record.status == "complete"
     assert observed["payloads"] == (
-        "source.nd2-A\n",
         "round_2_647_lamin.tif-A\n",
         "dataset.yaml-A\n",
         "execution.yaml-A\n",
-        "source.nd2-A\n",
         "registered/target.tif-A\n",
         "registered/target.tif.complete.json-A\n",
     )
     canonical_round = observed["round"]
     config_round = observed["config_round"]
     canonical_artifact = observed["artifact"]
-    assert canonical_round.nd2_path == root_a / "source.nd2"
     assert canonical_round.tiff_directory == root_a / "raw"
     assert canonical_round.dataset_manifest == root_a / "dataset.yaml"
     assert canonical_round.execution_profile == root_a / "execution.yaml"

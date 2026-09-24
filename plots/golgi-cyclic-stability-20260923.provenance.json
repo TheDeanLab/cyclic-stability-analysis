@@ -1,10 +1,6 @@
 {
   "run_dirs": [
-    "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/golgi-cell1-raw-roi-20260829",
-    "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/golgi-cell2-raw-roi-20260829",
-    "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/golgi-cell3-raw-roi-20260829",
-    "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/golgi-cell4-raw-roi-20260829",
-    "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/golgi-cell5-raw-roi-20260829"
+    "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/20260923-golgi-v2"
   ],
   "cell_ids": [
     "Cell1",

@@ -38,12 +38,7 @@ from cyexm.workflow.models import WorkflowStatus
 from cyexm.workflow.status import inspect_workflow_status
 
 from cyclic_stability.models import AnalysisConfig, CellSpec, RoundSpec
-from cyclic_stability.provenance import (
-    ChannelMatch,
-    attested_pretransform_channels,
-    channel_tiff_paths,
-    compare_nd2_export,
-)
+from cyclic_stability.provenance import ChannelMatch, channel_tiff_paths
 from cyclic_stability.task import ContentIdentity, RetainedContent
 
 type StatusInspector = Callable[[str | Path, str], WorkflowStatus]
@@ -870,28 +865,16 @@ def resolve_round_artifacts(
 
 
 def validate_cell_inputs(cell: CellSpec) -> CellValidationReport:
-    """Validate exact source correspondence and Cy-ExM provenance for one cell."""
-    per_round = tuple(
-        (round_spec, compare_nd2_export(round_spec)) for round_spec in cell.rounds
-    )
-    source_matches = tuple(
-        match for _round_spec, matches in per_round for match in matches
-    )
-    mismatched = [
-        match.channel
-        for round_spec, matches in per_round
-        for match in matches
-        if not match.exact
-        and match.channel not in attested_pretransform_channels(round_spec)
-    ]
-    if mismatched:
-        raise InputValidationError(
-            f"ND2/TIFF exact source correspondence failed for: {', '.join(mismatched)}"
-        )
+    """Validate the registered Cy-ExM artifacts consumed by one downstream cell.
+
+    Downstream stability analyses operate solely on the registered TIFF channels,
+    transforms, and completion records.  Original ND2 files are archival source
+    material and are intentionally not opened or required for this stage.
+    """
     return CellValidationReport(
         cohort=cell.cohort,
         cell_id=cell.cell_id,
-        source_matches=source_matches,
+        source_matches=(),
         rounds=tuple(resolve_round_artifacts(round_spec) for round_spec in cell.rounds),
     )
 

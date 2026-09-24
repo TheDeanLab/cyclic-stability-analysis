@@ -49,14 +49,14 @@ BOOTSTRAP_SEED = 20_260_829
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse the five per-cell run roots and requested output stem."""
+    """Parse Golgi run roots and the requested output stem."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--run-dir",
         type=Path,
         action="append",
         required=True,
-        help="One completed per-cell Golgi run root; provide exactly five times.",
+        help="Either one consolidated five-cell cohort root or five per-cell run roots.",
     )
     parser.add_argument("--output-stem", type=Path, required=True)
     return parser.parse_args()
@@ -86,6 +86,24 @@ def _completed_task(run_dir: Path) -> tuple[str, Path]:
     return cell_id, attempt_dir
 
 
+def _completed_tasks(run_dir: Path) -> list[tuple[str, Path]]:
+    """Return every terminal-selected completed Golgi task below one run root."""
+    candidates: list[tuple[str, Path]] = []
+    for terminal_path in sorted((run_dir / "tasks").glob("golgi-*/terminal.json")):
+        terminal = json.loads(terminal_path.read_text(encoding="utf-8"))
+        if terminal.get("status") != "complete":
+            continue
+        attempt_id = terminal.get("attempt_id")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError(f"completed terminal lacks an attempt ID: {terminal_path}")
+        task_dir = terminal_path.parent
+        attempt_dir = task_dir / "attempts" / attempt_id
+        if not attempt_dir.is_dir():
+            raise FileNotFoundError(attempt_dir)
+        candidates.append((task_dir.name.removeprefix("golgi-"), attempt_dir))
+    return candidates
+
+
 def _raw_signal_summary(raw_signal: pd.DataFrame) -> pd.DataFrame:
     """Collapse the nine segmentation settings to one raw-signal value per cell/round."""
     measured = raw_signal.loc[
@@ -112,8 +130,18 @@ def read_completed_cells(run_dirs: list[Path]) -> pd.DataFrame:
     }
     tables: list[pd.DataFrame] = []
     seen_cells: set[str] = set()
-    for run_dir in run_dirs:
-        cell_id, attempt_dir = _completed_task(run_dir)
+    if len(run_dirs) == 1:
+        completed = _completed_tasks(run_dirs[0])
+    elif len(run_dirs) == 5:
+        completed = [_completed_task(run_dir) for run_dir in run_dirs]
+    else:
+        raise ValueError(
+            "expected one consolidated cohort root or five per-cell Golgi run roots; "
+            f"received {len(run_dirs)}"
+        )
+    if len(completed) != 5:
+        raise ValueError(f"expected five completed Golgi tasks; found {len(completed)}")
+    for cell_id, attempt_dir in completed:
         if cell_id in seen_cells:
             raise ValueError(f"cell appears in more than one run directory: {cell_id}")
         seen_cells.add(cell_id)

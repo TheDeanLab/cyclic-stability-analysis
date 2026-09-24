@@ -25,12 +25,12 @@ ENDPOINTS = (
     (
         "lamin_integrated_ridge_intensity_median",
         "Integrated ridge intensity",
-        "relative to round 2",
+        "exposure-normalized, relative to round 2",
         True,
     ),
 )
 STATUS_COLORS = {"complete": "#1b9e77", "failed": "#d95f02"}
-ROUND_COLORS = {2: "#355c7d", 3: "#6c5b7b", 4: "#c06c84", 5: "#f67280"}
+ROUND_COLORS = {1: "#438078", 2: "#355c7d", 3: "#6c5b7b", 4: "#c06c84", 5: "#f67280"}
 SUMMARY_COLOR = "#2563eb"
 BOOTSTRAP_REPLICATES = 10_000
 BOOTSTRAP_SEED = 20_260_829
@@ -88,17 +88,50 @@ def completed_summary(run_dir: Path, tasks: pd.DataFrame) -> pd.DataFrame:
     summary = pd.concat(tables, ignore_index=True)
     return summary.loc[
         summary["qc_included"].eq(True)
-        & summary["comparison_set"].eq("matched-settings")
+        & summary["comparison_set"].isin(
+            ["matched-settings", "round-1-exposure-sensitivity"]
+        )
         & summary["endpoint"].isin([value[0] for value in ENDPOINTS])
         & summary["nucleus_id"].str.fullmatch(r"N[0-9]+", na=False)
     ].copy()
 
 
+def acquisition_settings(run_dir: Path, summary: pd.DataFrame) -> pd.DataFrame:
+    """Read exposures from the immutable run configuration, validating every key."""
+    settings = pd.read_csv(run_dir / "config" / "correspondence.csv")
+    settings = settings.loc[
+        settings["cohort"].eq("lamin"),
+        ["cell_id", "acquisition_round", "target_exposure_ms", "target_laser_percent"],
+    ]
+    keys = summary[["cell_id", "acquisition_round"]].drop_duplicates()
+    settings = keys.merge(
+        settings, on=["cell_id", "acquisition_round"], how="left", validate="one_to_one"
+    )
+    exposure = settings["target_exposure_ms"]
+    if not (np.isfinite(exposure) & exposure.gt(0)).all():
+        raise ValueError("missing or invalid target exposure in run configuration")
+    if (
+        settings["target_laser_percent"].isna().any()
+        or settings["target_laser_percent"].nunique() != 1
+    ):
+        raise ValueError("exposure normalization requires matched target laser power")
+    return settings
+
+
 def normalize_intensity(table: pd.DataFrame) -> pd.DataFrame:
-    baseline = table.loc[table["acquisition_round"].eq(2)].set_index(
+    """Normalize intensity per millisecond to the same nucleus in round 2."""
+    normalized = table.copy()
+    normalized["value"] = normalized["value"] / normalized["target_exposure_ms"]
+    baseline = normalized.loc[normalized["acquisition_round"].eq(2)].set_index(
         ["cell_id", "nucleus_id"]
     )["value"]
-    normalized = table.copy()
+    if (
+        baseline.index.has_duplicates
+        or not (np.isfinite(baseline) & baseline.gt(0)).all()
+    ):
+        raise ValueError(
+            "round-2 intensity baselines must be unique, finite and positive"
+        )
     keys = list(zip(normalized["cell_id"], normalized["nucleus_id"], strict=True))
     normalized["value"] = [
         value / baseline[key]
@@ -132,6 +165,23 @@ def bootstrap_mean_ci(table: pd.DataFrame) -> pd.DataFrame:
 def render(run_dir: Path, output_stem: Path) -> None:
     tasks = task_table(run_dir)
     summary = completed_summary(run_dir, tasks)
+    settings = acquisition_settings(run_dir, summary)
+    summary = summary.merge(
+        settings, on=["cell_id", "acquisition_round"], validate="many_to_one"
+    )
+    counts = (
+        summary.drop_duplicates(["cell_id", "nucleus_id", "acquisition_round"])
+        .groupby("acquisition_round")
+        .size()
+    )
+    exposure_by_round = settings.groupby("acquisition_round")[
+        "target_exposure_ms"
+    ].unique()
+    exposure_note = "; ".join(
+        f"R{r}: {'/'.join(f'{v:g}' for v in values)} ms"
+        for r, values in exposure_by_round.items()
+    )
+    endpoint_counts = []
 
     plt.rcParams.update(
         {
@@ -157,7 +207,7 @@ def render(run_dir: Path, output_stem: Path) -> None:
     figure.text(
         0.01,
         0.935,
-        "Matched-settings comparison; points are QC-included nuclei and lines link "
+        "Acquisition rounds 1–5; points are QC-included nuclei and lines link "
         "the same nucleus across rounds.",
         ha="left",
         color="#3f3f46",
@@ -223,6 +273,14 @@ def render(run_dir: Path, output_stem: Path) -> None:
                 zorder=2,
             )
         aggregate = bootstrap_mean_ci(data)
+        endpoint_counts.extend(
+            {
+                "endpoint": endpoint,
+                "acquisition_round": int(row.acquisition_round),
+                "n": int(row.n),
+            }
+            for row in aggregate.itertuples()
+        )
         axis.fill_between(
             aggregate["acquisition_round"],
             aggregate["ci_low"],
@@ -242,12 +300,14 @@ def render(run_dir: Path, output_stem: Path) -> None:
         axis.set_title(title)
         axis.set_xlabel("Acquisition round")
         axis.set_ylabel(unit)
-        axis.set_xticks([2, 3, 4, 5])
+        axis.set_xticks([1, 2, 3, 4, 5])
         axis.grid(axis="y", color="#e4e4e7", linewidth=0.8)
         axis.text(
             0.02,
             0.96,
-            "grey: nucleus; blue: mean with 95% CI",
+            "grey: nucleus; blue: mean with 95% CI\n"
+            + "n = "
+            + ", ".join(str(n) for n in aggregate["n"]),
             transform=axis.transAxes,
             va="top",
             fontsize=8,
@@ -271,9 +331,15 @@ def render(run_dir: Path, output_stem: Path) -> None:
         f"{cohort_scope_note(tasks)}\n\n"
         f"Quantitative panels use {len(included)} QC-included nuclei from "
         f"{len(tasks.loc[tasks.status.eq('complete')])}/5 completed cells.\n\n"
-        "Round 1 is intentionally omitted from the matched-settings panels because "
-        "its exposure is handled separately by the analysis configuration.\n\n"
-        f"Run: {run_dir.name}",
+        "Nuclei by round: "
+        + ", ".join(f"R{r}={n}" for r, n in counts.items())
+        + "\n\n"
+        + exposure_note
+        + "\n"
+        "Intensity is normalized by exposure, then to round 2.\n"
+        "Assumes linear detector response; signal detectability may differ.\n"
+        "Existing registration QC exclusions are retained.\n\n"
+        + f"Run: {run_dir.name}",
         transform=axes[1, 2].transAxes,
         va="top",
         fontsize=10,
@@ -291,7 +357,21 @@ def render(run_dir: Path, output_stem: Path) -> None:
         "source_task_table": str((run_dir / "compact-tasks.csv").resolve()),
         "completed_cells": tasks.loc[tasks.status.eq("complete"), "cell_id"].tolist(),
         "failed_cells": tasks.loc[tasks.status.eq("failed"), "cell_id"].tolist(),
-        "quantitative_comparison_set": "matched-settings",
+        "quantitative_comparison_set": "all-acquisition-rounds",
+        "source_comparison_sets": sorted(summary["comparison_set"].unique().tolist()),
+        "acquisition_rounds": sorted(int(r) for r in counts.index),
+        "sample_sizes": endpoint_counts,
+        "acquisition_settings_source": str(
+            (run_dir / "config/correspondence.csv").resolve()
+        ),
+        "acquisition_settings": settings.to_dict(orient="records"),
+        "intensity_normalization": {
+            "formula": "(I_round / exposure_ms_round) / (I_round2 / exposure_ms_round2)",
+            "reference_acquisition_round": 2,
+            "assumption": "linear detector response; matched target laser power",
+        },
+        "qc_decisions_source": str((run_dir / "config/qc-decisions.csv").resolve()),
+        "qc_exclusions_preserved": True,
         "quantitative_endpoints": [item[0] for item in ENDPOINTS],
         "summary_statistic": "mean",
         "aggregate_rows_excluded": True,

@@ -958,7 +958,6 @@ def _preflight_task(task: CellTask) -> CellTask:
             artifacts.completion_records
         ):
             raise ValueError("validated artifact record paths are incomplete")
-        canonical_nd2 = snapshot_path(round_spec.nd2_path)
         canonical_manifest = snapshot_path(round_spec.dataset_manifest)
         profile_identity = getattr(artifacts, "execution_profile_identity", None)
         if profile_identity is None:
@@ -1054,7 +1053,6 @@ def _preflight_task(task: CellTask) -> CellTask:
         canonical_rounds.append(
             replace(
                 round_spec,
-                nd2_path=canonical_nd2,
                 tiff_directory=canonical_tiff_directory,
                 dataset_manifest=canonical_manifest,
                 execution_profile=canonical_profile,
@@ -1570,7 +1568,6 @@ def build_tasks(
         for round_spec in sorted(
             cell.rounds, key=lambda value: value.acquisition_round
         ):
-            FileIdentity.from_path(round_spec.nd2_path)
             for _, path in channel_tiff_paths(round_spec):
                 FileIdentity.from_path(path)
         tasks.append(
