@@ -30,8 +30,8 @@
 - [x] Implement the small segmentation core, opt-in configuration, shared native/registered use, DAPI normalization, exclusion mask, and explicit diagnostics.
 - [x] Run focused tests, formatting/lint/type checks where useful, broader relevant tests, and one fresh code review. Fix findings before launch.
 - [x] Run a bounded full registered Cell2 segmentation smoke (including weak round 1), inspect it, and verify all five DAPI pilot cases.
-- [ ] Commit validated implementation/configuration. Launch the full five-field workflow with two workers/four native threads into a new result root.
-- [ ] Monitor terminal records to completion, audit required outputs and mask exclusion, regenerate plots, inspect final masks/figures, publish code/results, and distinguish artifact completion from scientific quality.
+- [x] Commit validated implementation/configuration. Launch the full five-field workflow with two workers/four native threads into a new result root.
+- [x] Monitor terminal records to completion, audit required outputs and mask exclusion, regenerate plots, inspect final masks/figures, publish code/results, and distinguish artifact completion from scientific quality.
 
 ## Review focus
 
@@ -53,3 +53,7 @@
 - Plan amendment: verify all five native Cell2 rounds and the four other weak native round-1 volumes, plus the 25 registered volumes under the final smoothing before retrying. Preserve v3 as failed; use a new v4 root. The first smoke already verified the unchanged registration and registered-morphology plumbing. Final full cohort still requires terminal completion, visual review, and exact mask audits.
 
 - Final prelaunch gate: all 25 registered volumes and nine native volumes passed with zero nuclear overlap. All five registered review sheets and native field sheets were visually inspected. Focused integration suite: 156 passed; final geometry/diagnostic checks: 21 passed. Fresh reviewer found no actionable issues; formatting/lint passed and new-core static analysis had zero errors. Native pilot includes every Cell2 round and round 1 from the other four fields. Production will rebuild all nuclear masks; four registered pilot fields intentionally reused old ROIs to isolate segmentation behavior.
+
+- Production v4 (8b47049) completed 5/5 fields with zero failed tasks at 2026-09-24 18:39 UTC. Registered nuclear counts: 3, 1, 2, 1, 2; all five nuclear inventories and registered rounds 1/2/5 visually inspected. Final native audit, plotting and review are completing separately. Native DAPI projections in some rounds retain basal foreground; conservative exclusion and its measurement implications are explicitly documented.
+
+- Final acceptance: all 530 output hashes and terminal record/manifest identities verified; 50 masks passed component/ROI/exclusion audits with zero nuclear overlap. All five native rounds-1/2/5 review sheets inspected; final PNG and rasterized PDF inspected. Summary, caption, methods, audit and provenance published in `plots/GOLGI-OTSU-20260924/`; full report and per-field links in `results/20260924-golgi-otsu-v4/README.md`.

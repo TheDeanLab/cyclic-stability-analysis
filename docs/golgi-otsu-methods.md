@@ -35,3 +35,9 @@ Each registered diagnostic archive contains one retained mask per round, removed
 Legacy endpoint names ending in `_median` are retained for table compatibility: morphology summaries now summarize **one prespecified mask**. Gradient similarity still summarizes its original three smoothing scales, and surface-agreement endpoints still use their configured tolerances. The one-mask `golgi-threshold-robustness.csv` is an endpoint export, not an uncertainty estimate. Full parameter sensitivity is in the separate study.
 
 Puncta removed by size are not proven background; some may be genuine small Golgi fragments. Mask volume remains threshold-sensitive: changing the corrected Otsu threshold by ±20% changes measured volume appreciably. These outputs quantify technical image stability, not biological replication or demonstrated organelle specificity. Review the preserved removed components, nuclear inventories, and image support alongside summary plots.
+
+## Production review
+
+The v4 five-field rerun completed under commit `8b47049`. Registered nuclear inventories accepted 3, 1, 2, 1, and 2 nuclei, reproducing the pilot correction of the previously merged Cell1/Cell3 objects. Representative registered rounds 1, 2, and 5 were visually reviewed in every field.
+
+Some individual native DAPI volumes retain broad basal foreground in maximum projection, including Cell1/Cell3 rounds 2/5 and Cell2 round 5. Their multi-round registered consensus is cleaner. Native exclusion deliberately retains this foreground conservatively; the zero-overlap audit therefore establishes exclusion from the saved DAPI mask, not ground-truth nuclear accuracy, and some cytoplasm may be excluded. Inspect same-Z panels and the saved 3D masks before interpreting native integrated intensity. Complete per-field review notes and numerical audits are in `results/20260924-golgi-otsu-v4/review/`.

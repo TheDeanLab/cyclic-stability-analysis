@@ -1,0 +1,82 @@
+{
+  "Cell2": {
+    "registered_rounds_visually_inspected": [
+      1,
+      2,
+      5
+    ],
+    "nuclear_inventory_overview_inspected": true,
+    "accepted_nuclei": 1,
+    "rejected_components": 1,
+    "notes": "Registered and native bright Golgi retained; same-Z nuclear exclusion visually appropriate. Native R5 MIP has a conservative basal DAPI halo, unlike the cleaner registered consensus. Ten exact masks and output hashes independently passed audit.",
+    "native_rounds_visually_inspected": [
+      1,
+      2,
+      5
+    ]
+  },
+  "Cell1": {
+    "registered_rounds_visually_inspected": [
+      1,
+      2,
+      5
+    ],
+    "nuclear_inventory_overview_inspected": true,
+    "accepted_nuclei": 3,
+    "rejected_components": 2,
+    "notes": "Registered consensus separates three nuclei. Native Golgi captures bright perinuclear structures; native DAPI R2/R5 includes broad basal foreground in projection, retained conservatively as an exclusion. Same-plane boundaries follow nuclei at the displayed Golgi-rich Z. Ten exact masks and output hashes passed audit; no claim of ground-truth nuclear specificity.",
+    "native_rounds_visually_inspected": [
+      1,
+      2,
+      5
+    ]
+  },
+  "Cell3": {
+    "registered_rounds_visually_inspected": [
+      1,
+      2,
+      5
+    ],
+    "nuclear_inventory_overview_inspected": true,
+    "accepted_nuclei": 2,
+    "rejected_components": 4,
+    "notes": "Two registered nuclei correctly separated. Native Golgi bright structures retained; native R2/R5 projected DAPI includes basal foreground, while displayed same-Z nuclear boundaries are cleaner. Ten masks and output hashes passed audit. Conservative native exclusion can omit some cytoplasm and is not ground-truth nuclear accuracy.",
+    "native_rounds_visually_inspected": [
+      1,
+      2,
+      5
+    ]
+  },
+  "Cell4": {
+    "registered_rounds_visually_inspected": [
+      1,
+      2,
+      5
+    ],
+    "nuclear_inventory_overview_inspected": true,
+    "accepted_nuclei": 1,
+    "rejected_components": 0,
+    "notes": "One registered DAPI-following nucleus. Native and registered masks retain the compact bright Golgi, including weak round 1; round-1 distributed puncta are conservatively filtered. Ten masks and output hashes passed audit with no nuclear overlap.",
+    "native_rounds_visually_inspected": [
+      1,
+      2,
+      5
+    ]
+  },
+  "Cell5": {
+    "registered_rounds_visually_inspected": [
+      1,
+      2,
+      5
+    ],
+    "nuclear_inventory_overview_inspected": true,
+    "accepted_nuclei": 2,
+    "rejected_components": 1,
+    "notes": "Two registered DAPI-following nuclei. Bright native Golgi structures retained around both nuclei; round-1 puncta conservatively filtered. Native R5 has small peripheral DAPI fragments, which remain excluded. Ten masks and output hashes passed audit with no nuclear overlap.",
+    "native_rounds_visually_inspected": [
+      1,
+      2,
+      5
+    ]
+  }
+}

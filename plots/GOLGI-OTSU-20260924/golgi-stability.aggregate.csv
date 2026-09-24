@@ -1,0 +1,31 @@
+endpoint,title,units,reference_normalized,acquisition_round,mean,ci_low,ci_high,n
+golgi_gradient_similarity_median,Gradient similarity,correlation,False,1,0.7795723746270316,0.6788507750443138,0.8657171568872076,5
+golgi_gradient_similarity_median,Gradient similarity,correlation,False,2,1.0,1.0,1.0,5
+golgi_gradient_similarity_median,Gradient similarity,correlation,False,3,0.9285731598862895,0.8890405724942457,0.9681057472783335,5
+golgi_gradient_similarity_median,Gradient similarity,correlation,False,4,0.9209091016842779,0.8248884234006303,0.9726847525976922,5
+golgi_gradient_similarity_median,Gradient similarity,correlation,False,5,0.9166297920319689,0.8315787107595097,0.964636466669982,5
+golgi_jaccard_median,Jaccard overlap,fraction,False,1,0.36116050774748487,0.2649806969487928,0.4491118653464552,5
+golgi_jaccard_median,Jaccard overlap,fraction,False,2,1.0,1.0,1.0,5
+golgi_jaccard_median,Jaccard overlap,fraction,False,3,0.5778638838812725,0.45540629615492767,0.6633795944277721,5
+golgi_jaccard_median,Jaccard overlap,fraction,False,4,0.6166541292689915,0.4971221242069169,0.6978515206542576,5
+golgi_jaccard_median,Jaccard overlap,fraction,False,5,0.5761627279121858,0.491783801027531,0.6399295008807808,5
+golgi_volume_um3_median,Golgi volume,µm³,False,1,678.6818984268,437.813660142,946.5629432705998,5
+golgi_volume_um3_median,Golgi volume,µm³,False,2,740.5872144245999,459.5153907312,1034.2699406460001,5
+golgi_volume_um3_median,Golgi volume,µm³,False,3,690.1787909826,409.58339480100005,970.7741871641999,5
+golgi_volume_um3_median,Golgi volume,µm³,False,4,683.3821338053999,430.31326956479995,936.450998046,5
+golgi_volume_um3_median,Golgi volume,µm³,False,5,645.0364045727999,396.37783755,900.1109090034,5
+golgi_compactness_median,Golgi compactness,fraction,False,1,0.00095294326694192,0.00064478423462438,0.00135203093919468,5
+golgi_compactness_median,Golgi compactness,fraction,False,2,0.0018350487962193799,0.00129217202676198,0.00237792556567678,5
+golgi_compactness_median,Golgi compactness,fraction,False,3,0.00195408846191148,0.00139989998291114,0.00250827694091182,5
+golgi_compactness_median,Golgi compactness,fraction,False,4,0.00197882324112512,0.00141778007688644,0.0025398664053638,5
+golgi_compactness_median,Golgi compactness,fraction,False,5,0.00198891679087908,0.00139288527010072,0.00258494831165744,5
+golgi_nuclear_distance_p50_um_median,Median perinuclear distance,µm,False,1,4.46483006477356,2.8253196239471436,6.235377216339112,5
+golgi_nuclear_distance_p50_um_median,Median perinuclear distance,µm,False,2,4.873350048065186,3.0169960498809814,6.9609424591064455,5
+golgi_nuclear_distance_p50_um_median,Median perinuclear distance,µm,False,3,5.089764332771301,3.0817981481552126,7.385979080200194,5
+golgi_nuclear_distance_p50_um_median,Median perinuclear distance,µm,False,4,5.161965799331665,3.0782554149627686,7.692076854705808,5
+golgi_nuclear_distance_p50_um_median,Median perinuclear distance,µm,False,5,5.223622226715088,2.7864022731781004,7.920076894760132,5
+raw_integrated_per_ms,Raw integrated Golgi signal,background-corrected counts / ms,False,1,86491.12940221802,50448.058560570506,128680.97758149248,5
+raw_integrated_per_ms,Raw integrated Golgi signal,background-corrected counts / ms,False,2,986532.7095368367,630637.6375814752,1362729.8785632178,5
+raw_integrated_per_ms,Raw integrated Golgi signal,background-corrected counts / ms,False,3,2611773.5065185553,1701892.1647283707,3632313.9559311643,5
+raw_integrated_per_ms,Raw integrated Golgi signal,background-corrected counts / ms,False,4,3206018.061511538,2308536.6565605975,4169804.801034108,5
+raw_integrated_per_ms,Raw integrated Golgi signal,background-corrected counts / ms,False,5,3277798.6262127077,2247046.697444378,4464783.907570299,5

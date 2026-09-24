@@ -1,0 +1,98 @@
+{
+  "run_dirs": [
+    "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/20260924-golgi-otsu-v4"
+  ],
+  "cell_ids": [
+    "Cell1",
+    "Cell2",
+    "Cell3",
+    "Cell4",
+    "Cell5"
+  ],
+  "summary_statistic": "mean across five acquisition fields",
+  "confidence_interval": {
+    "method": "percentile bootstrap over acquisition fields per round",
+    "level": 0.95,
+    "replicates": 10000,
+    "seed": 20260829
+  },
+  "within_cell_normalization": null,
+  "round_1_interpretation": "exposure-sensitivity condition",
+  "panels": [
+    {
+      "endpoint": "golgi_gradient_similarity_median",
+      "title": "Gradient similarity",
+      "units": "correlation",
+      "reference_normalized": false
+    },
+    {
+      "endpoint": "golgi_jaccard_median",
+      "title": "Jaccard overlap",
+      "units": "fraction",
+      "reference_normalized": false
+    },
+    {
+      "endpoint": "golgi_volume_um3_median",
+      "title": "Golgi volume",
+      "units": "\u00b5m\u00b3",
+      "reference_normalized": false
+    },
+    {
+      "endpoint": "golgi_compactness_median",
+      "title": "Golgi compactness",
+      "units": "fraction",
+      "reference_normalized": false
+    },
+    {
+      "endpoint": "golgi_nuclear_distance_p50_um_median",
+      "title": "Median perinuclear distance",
+      "units": "\u00b5m",
+      "reference_normalized": false
+    },
+    {
+      "endpoint": "raw_integrated_per_ms",
+      "title": "Raw integrated Golgi signal",
+      "units": "background-corrected counts / ms",
+      "reference_normalized": false
+    }
+  ],
+  "analysis_source_commit": "8b47049f917a5bd77937780d7e45d51eeb67144a",
+  "plotter_sha256": "026dc54ec9126aa39bd831cd33272f583c11a7072846e2782d9e39816d563572",
+  "source_record_identities": [
+    {
+      "path": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/20260924-golgi-otsu-v4/tasks/golgi-Cell1/attempts/a8abc1ef809c489e98e3f319cbc9652c/record.json",
+      "sha256": "a1519332a1a96c5c265f26877534cb737bca5fc280ad13b08d3fdc41fb7d8b19",
+      "st_mtime_ns": 1790269271675839000,
+      "st_size": 73525
+    },
+    {
+      "path": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/20260924-golgi-otsu-v4/tasks/golgi-Cell2/attempts/37e96092cc3b4c4faf343d56b1946f37/record.json",
+      "sha256": "33ad43df58fd437457033dceab92e36494094bfa5b03bbc2dcd62ba47ed6ec0e",
+      "st_mtime_ns": 1790268421352143000,
+      "st_size": 73525
+    },
+    {
+      "path": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/20260924-golgi-otsu-v4/tasks/golgi-Cell3/attempts/efdbaa95469c40fea05cb5119e9d0a24/record.json",
+      "sha256": "ffe7dfddeefe1babd6fc8be6145507961c8f73efa586897d050282e2852284d3",
+      "st_mtime_ns": 1790271699908036000,
+      "st_size": 73526
+    },
+    {
+      "path": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/20260924-golgi-otsu-v4/tasks/golgi-Cell4/attempts/de1a7841924d474283328b28912b0c9f/record.json",
+      "sha256": "5173220744a5bc0d5c8524a7f26f0a0ba3ed3101fff70263ead4ff83c39a7100",
+      "st_mtime_ns": 1790274003543241000,
+      "st_size": 73544
+    },
+    {
+      "path": "/endosome/archive/bioinformatics/Danuser_lab/Dean/publication/2025-Galecki/Resubmission/cyclic-stability-analysis/results/20260924-golgi-otsu-v4/tasks/golgi-Cell5/attempts/e40322a5cdc249e282ae8dcde0a0522b/record.json",
+      "sha256": "1f440607d8011616093909b860d83bbd889bf1694f3ab1c5846d176ed94f0bec",
+      "st_mtime_ns": 1790275157845004000,
+      "st_size": 73524
+    }
+  ],
+  "rendered_file_sha256": {
+    "golgi-stability.png": "5fd20017afa402cb49edcbd0c3e3f20e4edb94428ef3c9c3b5348a853d339993",
+    "golgi-stability.pdf": "d0277687abf8ce6f79983424bb9cc52bf7fcb5d77e29f33a51d3b1d63592c469",
+    "golgi-stability.aggregate.csv": "d0066ca533723819d90ed6dfc3141c68eaf87661d4b0e075947640624f36d89e"
+  }
+}

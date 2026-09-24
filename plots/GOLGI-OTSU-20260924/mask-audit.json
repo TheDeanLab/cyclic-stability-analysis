@@ -1,0 +1,106 @@
+{
+  "cells": [
+    {
+      "cell": "Cell1",
+      "attempt_id": "a8abc1ef809c489e98e3f319cbc9652c",
+      "output_hashes_verified": 106,
+      "software_identity": {
+        "analysis_commit": "8b47049f917a5bd77937780d7e45d51eeb67144a",
+        "analysis_tree_sha256": "9ffa0252bc46b629218c88fdfcd8c9301c8cd1ad2b7c529bfe7b8bcdabcf2b4f",
+        "cyexm_commit": "f6e0de36cd7f6b5e85f093884c2cf224225f4ec2",
+        "dependencies": {
+          "PyYAML": "6.0.3",
+          "nd2": "0.11.3",
+          "numpy": "2.4.6",
+          "psutil": "7.2.2",
+          "scikit-image": "0.26.0",
+          "scipy": "1.15.3",
+          "tifffile": "2026.8.16"
+        },
+        "python": "3.12.11"
+      }
+    },
+    {
+      "cell": "Cell2",
+      "attempt_id": "37e96092cc3b4c4faf343d56b1946f37",
+      "output_hashes_verified": 106,
+      "software_identity": {
+        "analysis_commit": "8b47049f917a5bd77937780d7e45d51eeb67144a",
+        "analysis_tree_sha256": "9ffa0252bc46b629218c88fdfcd8c9301c8cd1ad2b7c529bfe7b8bcdabcf2b4f",
+        "cyexm_commit": "f6e0de36cd7f6b5e85f093884c2cf224225f4ec2",
+        "dependencies": {
+          "PyYAML": "6.0.3",
+          "nd2": "0.11.3",
+          "numpy": "2.4.6",
+          "psutil": "7.2.2",
+          "scikit-image": "0.26.0",
+          "scipy": "1.15.3",
+          "tifffile": "2026.8.16"
+        },
+        "python": "3.12.11"
+      }
+    },
+    {
+      "cell": "Cell3",
+      "attempt_id": "efdbaa95469c40fea05cb5119e9d0a24",
+      "output_hashes_verified": 106,
+      "software_identity": {
+        "analysis_commit": "8b47049f917a5bd77937780d7e45d51eeb67144a",
+        "analysis_tree_sha256": "9ffa0252bc46b629218c88fdfcd8c9301c8cd1ad2b7c529bfe7b8bcdabcf2b4f",
+        "cyexm_commit": "f6e0de36cd7f6b5e85f093884c2cf224225f4ec2",
+        "dependencies": {
+          "PyYAML": "6.0.3",
+          "nd2": "0.11.3",
+          "numpy": "2.4.6",
+          "psutil": "7.2.2",
+          "scikit-image": "0.26.0",
+          "scipy": "1.15.3",
+          "tifffile": "2026.8.16"
+        },
+        "python": "3.12.11"
+      }
+    },
+    {
+      "cell": "Cell4",
+      "attempt_id": "de1a7841924d474283328b28912b0c9f",
+      "output_hashes_verified": 106,
+      "software_identity": {
+        "analysis_commit": "8b47049f917a5bd77937780d7e45d51eeb67144a",
+        "analysis_tree_sha256": "9ffa0252bc46b629218c88fdfcd8c9301c8cd1ad2b7c529bfe7b8bcdabcf2b4f",
+        "cyexm_commit": "f6e0de36cd7f6b5e85f093884c2cf224225f4ec2",
+        "dependencies": {
+          "PyYAML": "6.0.3",
+          "nd2": "0.11.3",
+          "numpy": "2.4.6",
+          "psutil": "7.2.2",
+          "scikit-image": "0.26.0",
+          "scipy": "1.15.3",
+          "tifffile": "2026.8.16"
+        },
+        "python": "3.12.11"
+      }
+    },
+    {
+      "cell": "Cell5",
+      "attempt_id": "e40322a5cdc249e282ae8dcde0a0522b",
+      "output_hashes_verified": 106,
+      "software_identity": {
+        "analysis_commit": "8b47049f917a5bd77937780d7e45d51eeb67144a",
+        "analysis_tree_sha256": "9ffa0252bc46b629218c88fdfcd8c9301c8cd1ad2b7c529bfe7b8bcdabcf2b4f",
+        "cyexm_commit": "f6e0de36cd7f6b5e85f093884c2cf224225f4ec2",
+        "dependencies": {
+          "PyYAML": "6.0.3",
+          "nd2": "0.11.3",
+          "numpy": "2.4.6",
+          "psutil": "7.2.2",
+          "scikit-image": "0.26.0",
+          "scipy": "1.15.3",
+          "tifffile": "2026.8.16"
+        },
+        "python": "3.12.11"
+      }
+    }
+  ],
+  "masks_audited": 50,
+  "nuclear_overlap_voxels": 0
+}
