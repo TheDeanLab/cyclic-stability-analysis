@@ -289,3 +289,22 @@ outlines. Subsequent pages contain the complete QC table with wrapped rejection
 reasons and repeated headers. Larger inventories add table pages without
 shrinking the images. Presentation-only redraws of completed runs belong in a
 separate output directory so the original artifact checksums remain valid.
+
+## Citation
+
+If you use this analysis code, please cite:
+
+Gałecki et al. *Unraveling Subcellular Ultrastructure with Cyclically Multiplexed
+Expansion Microscopy*. bioRxiv (2026), preprint.
+[doi:10.64898/2026.01.01.697161](https://doi.org/10.64898/2026.01.01.697161).
+
+Please also identify the software commit or release used. Citation metadata is
+available in [CITATION.cff](CITATION.cff).
+
+## License
+
+The original analysis code in this repository is available under the
+[MIT License](LICENSE). Dependencies retain their own licenses. In particular,
+[Cy-ExM](https://github.com/TheDeanLab/Cy-ExM) is publicly available under an
+[academic-research-use license](https://github.com/TheDeanLab/Cy-ExM/blob/f6e0de36cd7f6b5e85f093884c2cf224225f4ec2/LICENSE.md);
+the MIT license here does not change those terms.

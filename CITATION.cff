@@ -1,0 +1,45 @@
+cff-version: 1.2.0
+message: >-
+  If you use this analysis code, please cite the manuscript below and identify
+  the software commit or release used.
+type: software
+title: Cyclic stability analysis for Cy-ExM
+authors:
+  - family-names: Dean
+    given-names: Kevin M.
+    affiliation: The University of Texas Southwestern Medical Center
+repository-code: https://github.com/TheDeanLab/cyclic-stability-analysis
+license: MIT
+abstract: >-
+  Analysis of fluorescence and subcellular structure across repeated rounds
+  of cyclically multiplexed expansion microscopy, including Lamin, Golgi,
+  and LAMP1 measurements.
+preferred-citation:
+  type: article
+  title: >-
+    Unraveling Subcellular Ultrastructure with Cyclically Multiplexed
+    Expansion Microscopy
+  authors:
+    - family-names: Gałecki
+      given-names: Seweryn
+    - family-names: Chang
+      given-names: Bo-Jui
+    - family-names: Zhou
+      given-names: Felix
+    - family-names: Shen
+      given-names: Qionghua
+    - family-names: Stoddard
+      given-names: Daniel
+    - family-names: Chen
+      given-names: Bingying
+    - family-names: Nicastro
+      given-names: Daniela
+    - family-names: Fiolka
+      given-names: Reto
+    - family-names: Dean
+      given-names: Kevin M.
+  journal: bioRxiv
+  year: 2026
+  doi: 10.64898/2026.01.01.697161
+  url: https://pmc.ncbi.nlm.nih.gov/articles/PMC12776423/
+  notes: Preprint.
